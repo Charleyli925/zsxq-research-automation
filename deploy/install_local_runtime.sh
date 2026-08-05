@@ -144,11 +144,19 @@ fi
 
 FOREIGN_RUNNER_SOURCE="$RELEASE_ROOT/openclaw_tasks/zsxq_download/run.sh"
 FOREIGN_CRON_SOURCE="$RELEASE_ROOT/openclaw_tasks/zsxq_download/run.cron-safe.sh"
+FOREIGN_LAUNCHER_SOURCE="$RELEASE_ROOT/scripts/run_zsxq_task_via_codex.sh"
 DOMESTIC_RUNNER_SOURCE="$FOREIGN_RUNNER_SOURCE"
 DOMESTIC_CRON_SOURCE="$FOREIGN_CRON_SOURCE"
+DOMESTIC_LAUNCHER_SOURCE="$RELEASE_ROOT/scripts/run_zsxq_domestic_cicc_task_via_codex.sh"
 FOREIGN_TEMPLATE="$RELEASE_ROOT/deploy/launchd/zsxq-autodownload.plist.template"
 DOMESTIC_TEMPLATE="$RELEASE_ROOT/deploy/launchd/zsxq-domestic-cicc.plist.template"
-for source_path in "$FOREIGN_RUNNER_SOURCE" "$FOREIGN_CRON_SOURCE" "$FOREIGN_TEMPLATE" "$DOMESTIC_TEMPLATE"; do
+for source_path in \
+  "$FOREIGN_RUNNER_SOURCE" \
+  "$FOREIGN_CRON_SOURCE" \
+  "$FOREIGN_LAUNCHER_SOURCE" \
+  "$DOMESTIC_LAUNCHER_SOURCE" \
+  "$FOREIGN_TEMPLATE" \
+  "$DOMESTIC_TEMPLATE"; do
   [[ -f "$source_path" ]] || die "required release file is missing: $source_path"
 done
 
@@ -323,8 +331,8 @@ for task_dir in "$FOREIGN_TASK_DIR" "$DOMESTIC_TASK_DIR"; do
   install_link "$FOREIGN_RUNNER_SOURCE" "$task_dir/run.sh" "$backup_dir"
   install_link "$FOREIGN_CRON_SOURCE" "$task_dir/run.cron-safe.sh" "$backup_dir"
 done
-write_deployment_env "$FOREIGN_TASK_DIR" "foreign_download" "$FOREIGN_RUNNER_SOURCE" "zsxq_last_run_structured.json"
-write_deployment_env "$DOMESTIC_TASK_DIR" "domestic_cicc" "$DOMESTIC_RUNNER_SOURCE" "zsxq_domestic_cicc_last_run_structured.json"
+write_deployment_env "$FOREIGN_TASK_DIR" "foreign_download" "$FOREIGN_LAUNCHER_SOURCE" "zsxq_last_run_structured.json"
+write_deployment_env "$DOMESTIC_TASK_DIR" "domestic_cicc" "$DOMESTIC_LAUNCHER_SOURCE" "zsxq_domestic_cicc_last_run_structured.json"
 write_deployment_record
 
 if [[ "$SKIP_LAUNCHD" -ne 1 ]]; then

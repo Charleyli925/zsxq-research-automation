@@ -17,6 +17,8 @@ FOREIGN_TEMPLATE = ROOT / "deploy" / "launchd" / "zsxq-autodownload.plist.templa
 DOMESTIC_TEMPLATE = ROOT / "deploy" / "launchd" / "zsxq-domestic-cicc.plist.template"
 RUNNER = ROOT / "openclaw_tasks" / "zsxq_download" / "run.sh"
 CRON_WRAPPER = ROOT / "openclaw_tasks" / "zsxq_download" / "run.cron-safe.sh"
+FOREIGN_LAUNCHER = ROOT / "scripts" / "run_zsxq_task_via_codex.sh"
+DOMESTIC_LAUNCHER = ROOT / "scripts" / "run_zsxq_domestic_cicc_task_via_codex.sh"
 
 
 class LocalRuntimeDeploymentTests(unittest.TestCase):
@@ -108,6 +110,13 @@ class LocalRuntimeDeploymentTests(unittest.TestCase):
                 backup_root = task_dir / ".deployment-backups"
                 self.assertEqual(len(list(backup_root.rglob("run.sh"))), 1)
                 self.assertEqual(len(list(backup_root.rglob("run.cron-safe.sh"))), 1)
+
+            foreign_deployment_env = (foreign / "deployment.env").read_text(encoding="utf-8")
+            domestic_deployment_env = (domestic / "deployment.env").read_text(encoding="utf-8")
+            self.assertIn(f"CODEX_SCRIPT_PATH={shlex.quote(str(FOREIGN_LAUNCHER))}", foreign_deployment_env)
+            self.assertIn(f"CODEX_SCRIPT_PATH={shlex.quote(str(DOMESTIC_LAUNCHER))}", domestic_deployment_env)
+            self.assertNotIn(f"CODEX_SCRIPT_PATH={shlex.quote(str(RUNNER))}", foreign_deployment_env)
+            self.assertNotIn(f"CODEX_SCRIPT_PATH={shlex.quote(str(RUNNER))}", domestic_deployment_env)
 
             record = json.loads(
                 (tasks_root / ".deployment" / "investment-reports-automation.json").read_text(encoding="utf-8")
