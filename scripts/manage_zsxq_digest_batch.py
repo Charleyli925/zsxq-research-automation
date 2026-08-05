@@ -117,6 +117,7 @@ def parse_args() -> argparse.Namespace:
     lookup_publish_recovery_parser.add_argument("--records-file", required=True)
     lookup_publish_recovery_parser.add_argument("--batch-hash", required=True)
     lookup_publish_recovery_parser.add_argument("--summary-hash", required=True)
+    lookup_publish_recovery_parser.add_argument("--batch-file", default="")
 
     lookup_same_day_parser = subparsers.add_parser(
         "lookup-latest-same-day-doc",
@@ -1831,6 +1832,26 @@ def publish_record_files(batch: dict[str, Any]) -> list[dict[str, str]]:
     return files
 
 
+def publish_recovery_file_identity(files: list[dict[str, Any]]) -> str:
+    """Hash the durable file identity, excluding volatile publish-group metadata."""
+    normalized: list[dict[str, str]] = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        row = {
+            "path": str(item.get("path", "")).strip(),
+            "filename": str(item.get("filename", "")).strip(),
+            "report_id": str(item.get("report_id", "")).strip(),
+            "pdf_sha256": str(
+                item.get("pdf_sha256", "") or item.get("text_extract_cache_key", "")
+            ).strip(),
+        }
+        if any(row.values()):
+            normalized.append(row)
+    normalized.sort(key=lambda item: (item["path"], item["filename"], item["report_id"], item["pdf_sha256"]))
+    return sha256_json(normalized)
+
+
 def publish_record_report_date(record: dict[str, Any]) -> str:
     explicit = str(record.get("report_date", "")).strip()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", explicit):
@@ -1873,18 +1894,31 @@ def lookup_publish_record(records_file: Path, publish_key: str) -> int:
     return 0
 
 
-def lookup_publish_recovery(records_file: Path, batch_hash: str, summary_hash: str) -> int:
+def lookup_publish_recovery(
+    records_file: Path,
+    batch_hash: str,
+    summary_hash: str,
+    batch_file: Path | None = None,
+) -> int:
     batch_hash = str(batch_hash or "").strip()
     summary_hash = str(summary_hash or "").strip()
+    incoming_file_identity = ""
+    if batch_file is not None:
+        incoming_file_identity = publish_recovery_file_identity(publish_record_files(load_json(batch_file)))
     for record in reversed(iter_publish_records(records_file)):
         status = str(record.get("status", "")).strip()
-        if (
-            str(record.get("batch_hash", "")).strip() == batch_hash
-            and str(record.get("summary_hash", "")).strip() == summary_hash
-            and status in {"remote_written", "success"}
-            and str(record.get("doc_url", "")).strip()
-        ):
-            print(json.dumps({"found": True, **record}, ensure_ascii=False))
+        if status not in {"remote_written", "success"} or not str(record.get("doc_url", "")).strip():
+            continue
+        if str(record.get("summary_hash", "")).strip() != summary_hash:
+            continue
+        exact_batch_match = str(record.get("batch_hash", "")).strip() == batch_hash
+        file_identity_match = (
+            bool(incoming_file_identity)
+            and publish_recovery_file_identity(record.get("files", [])) == incoming_file_identity
+        )
+        if exact_batch_match or file_identity_match:
+            match_type = "batch_hash" if exact_batch_match else "file_identity"
+            print(json.dumps({"found": True, "recovery_match": match_type, **record}, ensure_ascii=False))
             return 0
     print(
         json.dumps(
@@ -2615,6 +2649,7 @@ def main() -> int:
             records_file=Path(args.records_file).expanduser().resolve(),
             batch_hash=args.batch_hash.strip(),
             summary_hash=args.summary_hash.strip(),
+            batch_file=Path(args.batch_file).expanduser().resolve() if args.batch_file else None,
         )
 
     if args.command == "lookup-latest-same-day-doc":

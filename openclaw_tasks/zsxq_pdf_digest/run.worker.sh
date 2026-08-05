@@ -110,6 +110,14 @@ PUBLISH_LARK_CLI_PARENT_POSITION="${PUBLISH_LARK_CLI_PARENT_POSITION:-my_library
 PUBLISH_LARK_CLI_DOC_URL_BASE="${PUBLISH_LARK_CLI_DOC_URL_BASE:-https://www.feishu.cn/docx}"
 PUBLISH_MAX_FILES_PER_DOC="${PUBLISH_MAX_FILES_PER_DOC:-20}"
 PUBLISH_LEGACY_RECORD_FILE_COUNT="${PUBLISH_LEGACY_RECORD_FILE_COUNT:-10}"
+PUBLISH_FETCH_VERIFY_ATTEMPTS="${PUBLISH_FETCH_VERIFY_ATTEMPTS:-4}"
+PUBLISH_FETCH_VERIFY_DELAY_SECONDS="${PUBLISH_FETCH_VERIFY_DELAY_SECONDS:-3}"
+if [[ ! "$PUBLISH_FETCH_VERIFY_ATTEMPTS" =~ ^[0-9]+$ || "$PUBLISH_FETCH_VERIFY_ATTEMPTS" -lt 1 || "$PUBLISH_FETCH_VERIFY_ATTEMPTS" -gt 8 ]]; then
+  PUBLISH_FETCH_VERIFY_ATTEMPTS=4
+fi
+if [[ ! "$PUBLISH_FETCH_VERIFY_DELAY_SECONDS" =~ ^[0-9]+$ || "$PUBLISH_FETCH_VERIFY_DELAY_SECONDS" -gt 30 ]]; then
+  PUBLISH_FETCH_VERIFY_DELAY_SECONDS=3
+fi
 PUBLISH_RECORDS_JSONL_VALUE="${PUBLISH_RECORDS_JSONL:-publish_records.jsonl}"
 if [[ "$PUBLISH_RECORDS_JSONL_VALUE" = /* ]]; then
   PUBLISH_RECORDS_JSONL_PATH="$PUBLISH_RECORDS_JSONL_VALUE"
@@ -3029,10 +3037,12 @@ lookup_publish_record() {
 lookup_publish_recovery() {
   local batch_hash="$1"
   local summary_hash="$2"
+  local chunk_json_path="$3"
   "$PYTHON_BIN" "$HELPER_PATH" lookup-publish-recovery \
     --records-file "$PUBLISH_RECORDS_JSONL_PATH" \
     --batch-hash "$batch_hash" \
-    --summary-hash "$summary_hash"
+    --summary-hash "$summary_hash" \
+    --batch-file "$chunk_json_path"
 }
 
 lookup_latest_same_day_doc() {
@@ -3438,35 +3448,43 @@ fetch_and_verify_lark_cli_doc_content() {
   local work_dir="$3"
   local fetch_output_path="$work_dir/lark-cli-docs.fetch.out.json"
   local fetch_error_path="$work_dir/lark-cli-docs.fetch.err.log"
+  local attempt=1 fetch_rc content_validation_output content_validation_rc
 
-  set +e
-  if [[ -n "${LARKSUITE_CLI_CONFIG_DIR:-}" ]]; then
-    LARKSUITE_CLI_CONFIG_DIR="$LARKSUITE_CLI_CONFIG_DIR" "$LARK_CLI_BIN" docs +fetch --api-version v2 --as "$PUBLISH_LARK_CLI_AS" --doc "$doc_url" --json > "$fetch_output_path" 2> "$fetch_error_path"
-  else
-    "$LARK_CLI_BIN" docs +fetch --api-version v2 --as "$PUBLISH_LARK_CLI_AS" --doc "$doc_url" --json > "$fetch_output_path" 2> "$fetch_error_path"
-  fi
-  local fetch_rc=$?
-  set -e
-  if [[ "$fetch_rc" -ne 0 ]]; then
-    local fetch_error
-    fetch_error="$(summarize_command_output "$fetch_output_path" "$fetch_error_path")"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] lark-cli docs +fetch 校验失败：${fetch_error}" >> "$LOG_PATH"
-    printf 'docs +fetch 校验失败：%s\n' "$fetch_error"
-    return 1
-  fi
+  while true; do
+    set +e
+    if [[ -n "${LARKSUITE_CLI_CONFIG_DIR:-}" ]]; then
+      LARKSUITE_CLI_CONFIG_DIR="$LARKSUITE_CLI_CONFIG_DIR" "$LARK_CLI_BIN" docs +fetch --api-version v2 --as "$PUBLISH_LARK_CLI_AS" --doc "$doc_url" --json > "$fetch_output_path" 2> "$fetch_error_path"
+    else
+      "$LARK_CLI_BIN" docs +fetch --api-version v2 --as "$PUBLISH_LARK_CLI_AS" --doc "$doc_url" --json > "$fetch_output_path" 2> "$fetch_error_path"
+    fi
+    fetch_rc=$?
+    set -e
+    if [[ "$fetch_rc" -ne 0 ]]; then
+      local fetch_error
+      fetch_error="$(summarize_command_output "$fetch_output_path" "$fetch_error_path")"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] lark-cli docs +fetch 校验失败：${fetch_error}" >> "$LOG_PATH"
+      printf 'docs +fetch 校验失败：%s\n' "$fetch_error"
+      return 1
+    fi
 
-  local content_validation_output
-  set +e
-  content_validation_output="$(verify_lark_cli_doc_content "$fetch_output_path" "$summary_markdown_path" "$doc_url" 2>&1)"
-  local content_validation_rc=$?
-  set -e
-  if [[ "$content_validation_rc" -ne 0 ]]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] lark-cli docs +fetch 正文校验失败：${content_validation_output}" >> "$LOG_PATH"
-    printf 'docs +fetch 正文校验失败：%s\n' "$content_validation_output"
-    return 1
-  fi
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${content_validation_output}" >> "$LOG_PATH"
-  return 0
+    set +e
+    content_validation_output="$(verify_lark_cli_doc_content "$fetch_output_path" "$summary_markdown_path" "$doc_url" 2>&1)"
+    content_validation_rc=$?
+    set -e
+    if [[ "$content_validation_rc" -eq 0 ]]; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${content_validation_output}" >> "$LOG_PATH"
+      return 0
+    fi
+    if [[ "$attempt" -ge "$PUBLISH_FETCH_VERIFY_ATTEMPTS" ]]; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] lark-cli docs +fetch 正文校验失败：${content_validation_output}" >> "$LOG_PATH"
+      printf 'docs +fetch 正文校验失败：%s\n' "$content_validation_output"
+      return 1
+    fi
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] lark-cli docs +fetch 正文尚未可见，${PUBLISH_FETCH_VERIFY_DELAY_SECONDS}s 后重试（${attempt}/${PUBLISH_FETCH_VERIFY_ATTEMPTS}）：${content_validation_output}" >> "$LOG_PATH"
+    sleep "$PUBLISH_FETCH_VERIFY_DELAY_SECONDS"
+    attempt=$((attempt + 1))
+  done
 }
 
 run_lark_cli_docs_publish() {
@@ -4515,7 +4533,7 @@ publish_ready_chunks() {
       publish_batch_hash="$(json_get_value "$publish_key_payload_path" "batch_hash")"
       publish_summary_hash="$(json_get_value "$publish_key_payload_path" "summary_hash")"
       set +e
-      lookup_publish_recovery "$publish_batch_hash" "$publish_summary_hash" > "$publish_recovery_lookup_path" 2>> "$LOG_PATH"
+      lookup_publish_recovery "$publish_batch_hash" "$publish_summary_hash" "$publish_group_json_path" > "$publish_recovery_lookup_path" 2>> "$LOG_PATH"
       LOOKUP_RECOVERY_RC=$?
       set -e
       if [[ "$LOOKUP_RECOVERY_RC" -ne 0 ]]; then

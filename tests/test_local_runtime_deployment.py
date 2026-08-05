@@ -155,6 +155,29 @@ class LocalRuntimeDeploymentTests(unittest.TestCase):
             self.assertEqual(canonical_result["status"], "failed")
             self.assertTrue(canonical_result["recovered_stale_result"])
 
+    def test_runner_refuses_nested_invocation_without_touching_task_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            task_dir = tmp / "task"
+            task_dir.mkdir()
+            (task_dir / "run.sh").symlink_to(RUNNER)
+
+            env = os.environ.copy()
+            env["ZSXQ_OUTER_RUNNER_ACTIVE"] = "1"
+            completed = subprocess.run(
+                ["bash", str(task_dir / "run.sh")],
+                cwd=task_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 75, completed.stderr)
+            self.assertIn("refusing nested ZSXQ outer-runner invocation", completed.stderr)
+            self.assertFalse((task_dir / "startup_debug.log").exists())
+            self.assertFalse((task_dir / "last_result.json").exists())
+
     def test_cron_wrapper_passes_task_directory_to_an_overridden_runner(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)

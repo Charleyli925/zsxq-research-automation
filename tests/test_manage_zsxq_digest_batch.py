@@ -721,6 +721,56 @@ class ManageZsxqDigestBatchTests(unittest.TestCase):
             self.assertEqual(recovery["status"], "remote_written")
             self.assertEqual(recovery["doc_url"], "https://www.feishu.cn/docx/recovery-demo")
 
+    def test_publish_recovery_matches_remote_write_after_group_metadata_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            first_batch_path = base / "first-batch.json"
+            retry_batch_path = base / "retry-batch.json"
+            summary_path = base / "summary.md"
+            records_path = base / "publish_records.jsonl"
+            files = [
+                {"path": "/tmp/a.pdf", "filename": "a.pdf", "report_id": "a", "pdf_sha256": "a-sha"},
+                {"path": "/tmp/b.pdf", "filename": "b.pdf", "report_id": "b", "pdf_sha256": "b-sha"},
+            ]
+            first_batch_path.write_text(
+                json.dumps({"new_pdf_count": 213, "chunk_index": 2, "chunk_total": 22, "files": files}),
+                encoding="utf-8",
+            )
+            retry_batch_path.write_text(
+                json.dumps({"new_pdf_count": 203, "chunk_index": 1, "chunk_total": 21, "files": files}),
+                encoding="utf-8",
+            )
+            summary_path.write_text("# A\n\n## 核心结论\n稳定的摘要正文锚点。", encoding="utf-8")
+            first = MODULE.build_publish_key_payload(first_batch_path, summary_path, "")
+            retry = MODULE.build_publish_key_payload(retry_batch_path, summary_path, "")
+            self.assertNotEqual(first["batch_hash"], retry["batch_hash"])
+
+            with redirect_stdout(io.StringIO()):
+                MODULE.append_publish_record(
+                    records_file=records_path,
+                    publish_key=first["publish_key"],
+                    batch_file=first_batch_path,
+                    summary_markdown=summary_path,
+                    target_doc_url="",
+                    doc_url="https://www.feishu.cn/docx/recovery-after-rebatch",
+                    mode="create",
+                    publisher="lark-cli",
+                    status="remote_written",
+                )
+
+            recovery_stream = io.StringIO()
+            with redirect_stdout(recovery_stream):
+                MODULE.lookup_publish_recovery(
+                    records_path,
+                    retry["batch_hash"],
+                    retry["summary_hash"],
+                    retry_batch_path,
+                )
+            recovery = json.loads(recovery_stream.getvalue())
+            self.assertTrue(recovery["found"])
+            self.assertEqual(recovery["recovery_match"], "file_identity")
+            self.assertEqual(recovery["doc_url"], "https://www.feishu.cn/docx/recovery-after-rebatch")
+
     def test_same_day_lookup_uses_conservative_legacy_capacity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = Path(tmp_dir)

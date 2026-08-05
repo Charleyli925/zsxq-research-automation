@@ -13,6 +13,15 @@ set -euo pipefail
 TASK_DIR="$(cd "${ZSXQ_RUNTIME_TASK_DIR:-$(dirname "$0")}" && pwd)"
 cd "$TASK_DIR"
 
+# The launcher deliberately exports this marker into the Codex child process.
+# If that child mistakes this outer runner for a task command, refuse the
+# nested invocation before it can start another launcher tree.
+if [[ "${ZSXQ_OUTER_RUNNER_ACTIVE:-}" == "1" ]]; then
+  printf '[ERROR] refusing nested ZSXQ outer-runner invocation\n' >&2
+  exit 75
+fi
+export ZSXQ_OUTER_RUNNER_ACTIVE=1
+
 STARTUP_DEBUG_LOG="$TASK_DIR/startup_debug.log"
 STATUS_JSON_PATH="$TASK_DIR/run_status.json"
 RUN_STARTED_AT="$(date '+%Y-%m-%dT%H:%M:%S%z')"

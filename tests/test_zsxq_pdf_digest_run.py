@@ -2174,6 +2174,7 @@ class ZsxqPdfDigestRunTests(unittest.TestCase):
             env["OPENCLAW_STUB_LOG"] = str(runtime_dir / "openclaw_calls.jsonl")
             env["LARK_CLI_STUB_DOCS_LOG"] = str(runtime_dir / "lark_docs_calls.jsonl")
             env["LARK_CLI_STUB_DOCS_EMPTY_FETCH"] = "1"
+            env["PUBLISH_FETCH_VERIFY_ATTEMPTS"] = "1"
 
             completed = subprocess.run(
                 ["bash", str(runtime_dir / "run.sh"), "--file", str(pdf_path)],
