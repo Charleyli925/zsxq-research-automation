@@ -1,0 +1,16 @@
+# 这些文件是任务运行时写出来的，不需要跟踪。
+.run.pid
+cron.log
+watch_state.json
+pending_batch.json
+last_result.json
+last_result.md
+last_usage_summary.json
+failure_backoff.json
+publish_records.jsonl
+last_preflight.json
+quarantine.json
+quarantine_report.md
+state/
+text_cache/
+summary_cache/

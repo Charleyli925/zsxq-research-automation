@@ -1,0 +1,27 @@
+{
+  "interest_topics": [
+    "artificial intelligence",
+    "semiconductors"
+  ],
+  "match_keywords": [
+    "AI",
+    "semiconductor"
+  ],
+  "exact_match_keywords": [
+    "Example Company"
+  ],
+  "region_keywords": [
+    "China",
+    "United States"
+  ],
+  "direct_topic_keywords": [
+    "AI infrastructure"
+  ],
+  "paired_topic_keywords": [
+    "market outlook"
+  ],
+  "exclude_keywords": [
+    "weekly advertisement"
+  ],
+  "notes": "Copy this file to config/local/interest_keywords.json and replace all sample values."
+}

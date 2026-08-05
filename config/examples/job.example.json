@@ -1,0 +1,25 @@
+{
+  "job_name": "investment_reports",
+  "group_name": "YOUR_GROUP_NAME",
+  "group_url": "https://wx.zsxq.com/group/YOUR_GROUP_ID",
+  "tag_name": "YOUR_TAG_NAME",
+  "tag_url": "https://wx.zsxq.com/tags/YOUR_TAG_SLUG/YOUR_TAG_ID",
+  "download_settings": {
+    "staging_dir": "~/Downloads",
+    "extra_staging_dirs": [],
+    "archive_root": "~/Library/Application Support/investment-reports-automation/ResearchLibrary/pdfs",
+    "allowed_extensions": [
+      ".pdf"
+    ],
+    "batch_dir_format": "%Y-%m-%d_%H-%M-%S__to__%Y-%m-%d_%H-%M-%S"
+  },
+  "research_library": {
+    "root": "~/Library/Application Support/investment-reports-automation/ResearchLibrary",
+    "pdf_root": "~/Library/Application Support/investment-reports-automation/ResearchLibrary/pdfs"
+  },
+  "automation_inputs": {
+    "keyword_file": "config/local/interest_keywords.json",
+    "runtime_prompt_file": "prompts/openclaw_runtime_prompt.md",
+    "state_file": ".runtime/state/zsxq_reports_state.json"
+  }
+}

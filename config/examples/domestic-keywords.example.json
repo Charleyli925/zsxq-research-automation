@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "interest_topics": [
+    "internet platforms",
+    "consumer"
+  ],
+  "standalone_keywords": [
+    "Example Broker",
+    "Example Company"
+  ],
+  "region_keywords": [
+    "China"
+  ],
+  "region_required_keywords": [
+    "internet",
+    "consumer"
+  ],
+  "exclude_keywords": [
+    "generic weekly report"
+  ],
+  "notes": "Copy to config/local/zsxq_domestic_cicc_keywords.json and replace samples."
+}

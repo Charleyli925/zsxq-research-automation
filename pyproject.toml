@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "investment-reports-automation"
+version = "0.1.0"
+description = "A source-controlled pipeline for collecting, processing, summarizing, and indexing investment reports."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "PyYAML>=6.0,<7"
+]
+
+[project.optional-dependencies]
+browser = [
+  "playwright>=1.50,<2"
+]
+pdf = [
+  "markitdown[pdf]==0.1.5"
+]
+dev = [
+  "pytest>=8,<9",
+  "playwright>=1.50,<2",
+  "markitdown[pdf]==0.1.5"
+]
+
+[tool.setuptools]
+py-modules = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
