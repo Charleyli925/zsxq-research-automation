@@ -115,8 +115,8 @@ def test_config_rejects_runtime_root_escapes_and_unknown_fields(tmp_path):
 def test_direct_codex_lark_and_grouping_config_is_typed_and_bounded(tmp_path):
     runtime_root = tmp_path / "runtime"
     profile_dir = tmp_path / "lark-profile"
-    library_root = tmp_path / "ResearchLibrary"
-    vault_root = tmp_path / "ResearchVault"
+    library_root = runtime_root / "projections" / "ResearchLibrary"
+    vault_root = runtime_root / "projections" / "ResearchVault"
     config_path = tmp_path / "direct.toml"
     config_path.write_text(
         f'''schema_version = 1
@@ -194,7 +194,7 @@ def test_research_library_projection_requires_one_runtime_owned_database(tmp_pat
     runtime_root = tmp_path / "runtime"
     legacy_root = tmp_path / "legacy"
     legacy_root.mkdir()
-    library_root = tmp_path / "ResearchLibrary"
+    library_root = runtime_root / "projections" / "ResearchLibrary"
     config_path = tmp_path / "pipeline.toml"
     _write_config(config_path, runtime_root, legacy_root)
 
@@ -213,6 +213,29 @@ def test_research_library_projection_requires_one_runtime_owned_database(tmp_pat
     )
     with pytest.raises(ConfigError, match="inside runtime.root"):
         load_pipeline_config(config_path)
+
+    external_root_path = tmp_path / "external-root.toml"
+    _write_config(external_root_path, runtime_root, legacy_root)
+    external_root_path.write_text(
+        external_root_path.read_text(encoding="utf-8")
+        + (
+            f'\n[pipeline]\nresearch_library_root = "{tmp_path / "ResearchLibrary"}"\n'
+            'research_library_database = "state/research_library.sqlite"\n'
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="pipeline.research_library_root must remain inside runtime.root"):
+        load_pipeline_config(external_root_path)
+
+    orphan_vault_path = tmp_path / "orphan-vault.toml"
+    _write_config(orphan_vault_path, runtime_root, legacy_root)
+    orphan_vault_path.write_text(
+        orphan_vault_path.read_text(encoding="utf-8")
+        + '\n[pipeline]\nobsidian_vault_root = "projections/ResearchVault"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="requires pipeline.research_library_root"):
+        load_pipeline_config(orphan_vault_path)
 
 
 def test_download_source_cft_startup_options_are_typed(tmp_path):

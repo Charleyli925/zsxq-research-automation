@@ -369,8 +369,10 @@ def _parse_pipeline_settings(root: Path, raw: Any) -> PipelineSettingsConfig:
         raise ConfigError("pipeline.doc_group_threshold must be at least pipeline.doc_group_size")
     if max_files < group_size:
         raise ConfigError("pipeline.max_files_per_document must be at least pipeline.doc_group_size")
-    research_library_root = _optional_absolute_path(
-        table.get("research_library_root"), field="pipeline.research_library_root"
+    research_library_root = _optional_within_root(
+        root,
+        table.get("research_library_root"),
+        field="pipeline.research_library_root",
     )
     research_library_database = _optional_within_root(
         root,
@@ -381,6 +383,13 @@ def _parse_pipeline_settings(root: Path, raw: Any) -> PipelineSettingsConfig:
         raise ConfigError(
             "pipeline.research_library_root and pipeline.research_library_database must be configured together"
         )
+    obsidian_vault_root = _optional_within_root(
+        root,
+        table.get("obsidian_vault_root"),
+        field="pipeline.obsidian_vault_root",
+    )
+    if obsidian_vault_root is not None and research_library_root is None:
+        raise ConfigError("pipeline.obsidian_vault_root requires pipeline.research_library_root")
     return PipelineSettingsConfig(
         extractor_version=extractor_version,
         summary_max_workers=workers,
@@ -389,9 +398,7 @@ def _parse_pipeline_settings(root: Path, raw: Any) -> PipelineSettingsConfig:
         max_files_per_document=max_files,
         research_library_root=research_library_root,
         research_library_database=research_library_database,
-        obsidian_vault_root=_optional_absolute_path(
-            table.get("obsidian_vault_root"), field="pipeline.obsidian_vault_root"
-        ),
+        obsidian_vault_root=obsidian_vault_root,
     )
 
 

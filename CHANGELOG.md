@@ -20,3 +20,8 @@ All notable changes will be documented here.
 - Kept the publish-stage lease recoverable until every local projection is
   complete, so a sidecar failure retries locally without writing the verified
   Feishu document a second time.
+- Required active ResearchLibrary and Obsidian projection roots to live inside
+  the runtime, with user-facing Documents locations represented by symlinks,
+  so launchd never depends on protected-folder TCC prompts.
+- Propagated partial processor outcomes into the top-level tick result instead
+  of allowing projection failures to appear as a successful scheduler run.

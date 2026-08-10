@@ -110,6 +110,31 @@ def test_process_stage_uses_existing_source_identity_and_respects_quota(tmp_path
     assert seen[0][1][0]["source_file_id"] == "source-file-1"
 
 
+def test_process_partial_result_is_visible_in_the_top_level_tick(tmp_path):
+    config = _config(tmp_path)
+    pdf = tmp_path / "report.pdf"
+    pdf.write_bytes(b"synthetic-pdf")
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        document = state.upsert_document("foreign", "source-file-1", filename=pdf.name, source_path=pdf)
+        state.record_artifact(document.id, kind="pdf", path=pdf, pdf_sha256="a" * 64, size_bytes=pdf.stat().st_size)
+
+    worker = PipelineWorker(
+        config,
+        process_runner=lambda source, rows: SimpleNamespace(
+            status="partial",
+            failures=("local projection failed",),
+        ),
+        download_runner=lambda request: SimpleNamespace(status="success", source=request.source),
+        outbox_runner=lambda max_items: (),
+    )
+
+    outcome = worker.run_stage("process")
+
+    assert outcome.status == "partial"
+    assert outcome.failures == ("process:foreign:partial:1",)
+
+
 def test_all_stage_drains_prior_outbox_before_process_overruns_budget(tmp_path):
     config = _config(tmp_path)
     pdf = tmp_path / "report.pdf"

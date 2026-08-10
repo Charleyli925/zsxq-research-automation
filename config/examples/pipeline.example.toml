@@ -84,12 +84,12 @@ summary_max_workers = 2
 doc_group_size = 10
 doc_group_threshold = 15
 max_files_per_document = 20
-# Optional durable local projections. The human-readable roots must be
-# absolute. Keep the SQLite index inside runtime.root so a background
-# LaunchAgent never needs TCC access to a database under ~/Documents.
-research_library_root = "/absolute/path/to/ResearchLibrary"
+# Optional durable local projections. Every active root stays inside
+# runtime.root so a background LaunchAgent never needs macOS TCC access to
+# ~/Documents. Human-facing Documents paths may symlink to these directories.
+research_library_root = "projections/ResearchLibrary"
 research_library_database = "state/research_library.sqlite"
-obsidian_vault_root = "/absolute/path/to/Obsidian/ResearchVault"
+obsidian_vault_root = "projections/ResearchVault"
 
 [publish_targets.daily_digest]
 kind = "lark"

@@ -244,6 +244,10 @@ class ProcessConfig:
                 "research_library_database",
                 _inside(root, self.research_library_database, field_name="research_library_database"),
             )
+        if (self.research_library_root is None) != (self.research_library_database is None):
+            raise ProcessError("research_library_root and research_library_database must be configured together")
+        if self.obsidian_vault_root is not None and self.research_library_root is None:
+            raise ProcessError("obsidian_vault_root requires research_library_root")
         preflight_path = self.preflight_path if self.preflight_path is not None else Path("last_preflight.json")
         object.__setattr__(self, "preflight_path", _inside(root, preflight_path, field_name="preflight_path"))
         # Prompt assets are copied as plain text into each isolated Codex work
@@ -254,9 +258,17 @@ class ProcessConfig:
         if self.lark_config_dir is not None:
             object.__setattr__(self, "lark_config_dir", _absolute(self.lark_config_dir))
         if self.research_library_root is not None:
-            object.__setattr__(self, "research_library_root", _absolute(self.research_library_root))
+            object.__setattr__(
+                self,
+                "research_library_root",
+                _inside(root, self.research_library_root, field_name="research_library_root"),
+            )
         if self.obsidian_vault_root is not None:
-            object.__setattr__(self, "obsidian_vault_root", _absolute(self.obsidian_vault_root))
+            object.__setattr__(
+                self,
+                "obsidian_vault_root",
+                _inside(root, self.obsidian_vault_root, field_name="obsidian_vault_root"),
+            )
         for field_name in ("source", "target", "extractor_version", "codex_command", "codex_model", "lark_command"):
             if not str(getattr(self, field_name)).strip():
                 raise ProcessError(f"{field_name} is required")
