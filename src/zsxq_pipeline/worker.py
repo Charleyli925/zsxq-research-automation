@@ -221,7 +221,10 @@ class PipelineWorker:
                     continue
                 processed += len(rows)
                 remaining -= len(rows)
-                if outcome.status not in {"success", "partial", "busy"}:
+                if outcome.status == "partial":
+                    failure_count = len(tuple(getattr(outcome, "failures", ()) or ()))
+                    failures.append(f"process:{source.name}:partial:{failure_count}")
+                elif outcome.status not in {"success", "busy"}:
                     failures.append(f"process:{source.name}:{outcome.status}")
 
         if "outbox" in stages and not self._expired(deadline):

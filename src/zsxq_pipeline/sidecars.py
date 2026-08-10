@@ -173,6 +173,19 @@ class ArtifactSidecars:
         count = payload.get("archived_count", 0)
         if isinstance(count, bool) or not isinstance(count, int):
             raise SidecarError("Obsidian archive returned no integer archived_count")
+        if count != len(files):
+            details = ""
+            try:
+                updated = json.loads(manifest_path.read_text(encoding="utf-8"))
+                errors = [
+                    str(item.get("obsidian_error", "")).strip()
+                    for item in updated.get("files", [])
+                    if isinstance(item, Mapping) and str(item.get("obsidian_error", "")).strip()
+                ]
+                details = f": {errors[0][:500]}" if errors else ""
+            except (OSError, json.JSONDecodeError):
+                pass
+            raise SidecarError(f"Obsidian archive completed {count} of {len(files)} notes{details}")
         return SidecarArchiveResult(archived_count=count, manifest_path=manifest_path)
 
     def _upsert_published_batch(self, manifest_path: Path, *, document_url: str) -> None:
