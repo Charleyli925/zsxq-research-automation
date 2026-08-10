@@ -13,7 +13,6 @@ from typing import Any
 
 from kb_common import (
     DEFAULT_CONFIG_ROOT,
-    DEFAULT_DB_PATH,
     DEFAULT_LIBRARY_ROOT,
     DEFAULT_VAULT_ROOT,
     NoteRecord,

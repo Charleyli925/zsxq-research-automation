@@ -84,6 +84,9 @@ summary_max_workers = 2
 doc_group_size = 10
 doc_group_threshold = 15
 max_files_per_document = 20
+# Optional durable local projections. Both paths must be absolute when set.
+research_library_root = "/absolute/path/to/ResearchLibrary"
+obsidian_vault_root = "/absolute/path/to/Obsidian/ResearchVault"
 
 [publish_targets.daily_digest]
 kind = "lark"

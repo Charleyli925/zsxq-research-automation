@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_PATH = REPO_ROOT / "openclaw_tasks" / "zsxq_pdf_digest" / "extract_pdf_text.py"
+SCRIPT_PATH = REPO_ROOT / "src" / "zsxq_pipeline" / "extractor_worker.py"
 SPEC = importlib.util.spec_from_file_location("extract_pdf_text", SCRIPT_PATH)
 assert SPEC is not None
 assert SPEC.loader is not None

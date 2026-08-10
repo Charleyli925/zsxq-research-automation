@@ -12,6 +12,7 @@ from zsxq_pipeline.extract import (
     ExtractionValidationError,
     ExtractorAdapter,
     classify_extraction_failure,
+    extractor_worker_path,
     record_extracted_text_artifact,
 )
 from zsxq_pipeline.model import ErrorCategory
@@ -79,6 +80,13 @@ def _manifest(tmp_path: Path) -> dict[str, object]:
             },
         ]
     }
+
+
+def test_default_extractor_is_package_owned():
+    path = extractor_worker_path()
+    assert path.name == "extractor_worker.py"
+    assert path.parent.name == "zsxq_pipeline"
+    assert path.is_file()
 
 
 def test_extractor_adapter_stages_manifest_and_keeps_content_failure_isolated(tmp_path):

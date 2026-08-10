@@ -10,6 +10,9 @@ The local TOML config is outside Git. Start from
 domestic logical run times, `Asia/Shanghai`, bounded tick quotas, and only
 placeholder paths/identities. Keep credentials, browser profiles, report
 content, and the real target chat outside the checkout.
+Set `pipeline.research_library_root` and `pipeline.obsidian_vault_root` to the
+existing writable absolute paths when those local projections are required;
+`doctor` fails closed if a configured destination is unavailable.
 
 ## Release install
 
@@ -85,6 +88,6 @@ zsxq-pipeline retry apply --config /absolute/path/to/pipeline.toml \
   --plan /absolute/path/to/retry-plan.json --expected-count 1 --apply
 ```
 
-The historical task wrappers remain migration evidence until the soak gate in
-the cutover runbook is complete. They are not part of the new installation
-path and must not run concurrently with the unified LaunchAgent.
+The historical task wrappers and multi-scheduler installer have been retired
+from the repository. Production rollback selects a prior unified release; it
+does not restore the former cron or per-source LaunchAgents.

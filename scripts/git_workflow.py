@@ -189,16 +189,12 @@ def select_test_targets(repo: Path, changed_paths: Iterable[str]) -> list[str]:
     for path in changed:
         if path in {"scripts/git_workflow.py", "scripts/check_repository_hygiene.py", "AGENTS.md", "docs/development-workflow.md"}:
             targets.add("tests/test_git_workflow.py")
-        elif path.startswith(("deploy/", "openclaw_tasks/zsxq_download/")):
-            targets.update({"tests/test_local_runtime_deployment.py", "tests/test_zsxq_download_launcher_runtime.py"})
-        elif path.startswith("openclaw_tasks/zsxq_pdf_digest/"):
-            targets.add("tests/test_zsxq_pdf_digest_run.py")
+        elif path.startswith("deploy/"):
+            targets.update({"tests/test_pipeline_installation.py", "tests/test_pipeline_cutover.py"})
         elif path in {
-            "scripts/run_zsxq_download_pipeline.py",
             "scripts/scan_zsxq_download_candidates.py",
             "scripts/download_zsxq_plan_file.py",
             "scripts/finalize_download_batch.py",
-            "scripts/zsxq_preflight.py",
             "src/zsxq_pipeline/browser.py",
             "src/zsxq_pipeline/download.py",
         }:
@@ -210,13 +206,12 @@ def select_test_targets(repo: Path, changed_paths: Iterable[str]) -> list[str]:
                     "tests/test_scan_zsxq_download_candidates.py",
                     "tests/test_download_zsxq_plan_file.py",
                     "tests/test_finalize_download_batch.py",
-                    "tests/test_zsxq_preflight.py",
                 }
             )
+        elif path in {"src/zsxq_pipeline/extract.py", "src/zsxq_pipeline/extractor_worker.py"}:
+            targets.update({"tests/test_pipeline_extract.py", "tests/test_extract_pdf_text.py"})
         elif path in {"src/zsxq_pipeline/cli.py", "src/zsxq_pipeline/config.py"}:
             targets.add("tests/test_pipeline_cli.py")
-        elif path == "scripts/zsxq_autodownload_result.py":
-            targets.add("tests/test_zsxq_autodownload_result.py")
         elif path.endswith((".py", ".sh")):
             candidate = f"tests/test_{Path(path).stem}.py"
             if (repo / candidate).is_file():

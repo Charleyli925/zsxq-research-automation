@@ -1,11 +1,10 @@
-"""The direct-Codex digest worker and its compatibility runtime boundary.
+"""The direct-Codex digest worker used by the unified pipeline.
 
 This module is deliberately the only orchestration layer that knows about
 extraction, summary artifacts, direct Lark publication, and notification
 delivery.  It does not invoke OpenClaw, load an agent registry, copy an auth
 profile, or inspect a model session.  The durable SQLite state remains the
-authority; JSON files in a task directory are compatibility projections for
-the existing cron wrapper and human operators.
+authority; JSON result files are operator-facing projections only.
 """
 
 from __future__ import annotations
@@ -13,12 +12,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import subprocess
 import sys
-import tempfile
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -70,7 +67,6 @@ from .summary import (
     SummaryCacheCorruptionError,
     SummaryError,
     SummaryJob,
-    SummaryModelFailure,
     SummaryStore,
     build_summary_inputs,
     identities_for_manifest,
@@ -138,15 +134,6 @@ def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int | None =
     return value
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name, "true" if default else "false").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    raise ProcessError(f"{name} must be true or false")
-
-
 def _read_text(path: Path, *, field_name: str) -> str:
     try:
         value = path.read_text(encoding="utf-8")
@@ -212,7 +199,6 @@ class ProcessConfig:
     summary_cache_root: Path
     work_root: Path
     batch_path: Path
-    watch_state_path: Path
     result_path: Path
     result_markdown_path: Path
     run_status_path: Path
@@ -230,10 +216,7 @@ class ProcessConfig:
     summary_max_workers: int = 2
     doc_group_size: int = 10
     doc_group_threshold: int = 15
-    watch_root: Path | None = None
-    watch_extra_roots: tuple[Path, ...] = ()
     max_files_per_document: int = 20
-    quiet_window_minutes: int = 15
     preflight_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -246,7 +229,6 @@ class ProcessConfig:
             "summary_cache_root",
             "work_root",
             "batch_path",
-            "watch_state_path",
             "result_path",
             "result_markdown_path",
             "run_status_path",
@@ -258,15 +240,10 @@ class ProcessConfig:
         preflight_path = self.preflight_path if self.preflight_path is not None else Path("last_preflight.json")
         object.__setattr__(self, "preflight_path", _inside(root, preflight_path, field_name="preflight_path"))
         # Prompt assets are copied as plain text into each isolated Codex work
-        # directory.  The built-in package assets live outside a mutable task
-        # runtime, so they cannot be constrained to runtime_root like caches
-        # and state files.  Explicit wrapper paths remain runtime-rooted in
-        # from_environment below.
+        # directory.  The built-in package assets live outside mutable runtime
+        # state, so they cannot be constrained to runtime_root like caches.
         object.__setattr__(self, "prompt_path", _absolute(self.prompt_path))
         object.__setattr__(self, "system_prompt_path", _absolute(self.system_prompt_path))
-        if self.watch_root is not None:
-            object.__setattr__(self, "watch_root", _absolute(self.watch_root))
-        object.__setattr__(self, "watch_extra_roots", tuple(_absolute(path) for path in self.watch_extra_roots))
         if self.lark_config_dir is not None:
             object.__setattr__(self, "lark_config_dir", _absolute(self.lark_config_dir))
         if self.research_library_root is not None:
@@ -282,98 +259,6 @@ class ProcessConfig:
             raise ProcessError("document grouping values are invalid")
         if int(self.max_files_per_document) < int(self.doc_group_size):
             raise ProcessError("max_files_per_document must be at least doc_group_size")
-        if int(self.quiet_window_minutes) < 0:
-            raise ProcessError("quiet_window_minutes must be non-negative")
-
-    @classmethod
-    def from_environment(cls, runtime_root: str | Path) -> "ProcessConfig":
-        """Build the compatibility configuration sourced by the thin shell wrapper."""
-
-        root = _absolute(runtime_root)
-
-        def runtime_path(name: str, default: str) -> Path:
-            return _inside(root, os.environ.get(name, default), field_name=name)
-
-        extras = tuple(
-            _absolute(value)
-            for value in os.environ.get("WATCH_EXTRA_ROOTS", "").split(":")
-            if value.strip()
-        )
-        watch_root_text = os.environ.get("WATCH_ROOT", "").strip()
-        prompt_candidate = os.environ.get("CODEX_PROMPT_PATH", "").strip()
-        system_candidate = os.environ.get("CODEX_SYSTEM_PROMPT_PATH", "").strip()
-        codex_model = os.environ.get("CODEX_MODEL", "").strip()
-        if not codex_model:
-            raise ProcessError("CODEX_MODEL is required; set it to the already approved summary model")
-        return cls(
-            runtime_root=root,
-            database=runtime_path("PIPELINE_DATABASE", "state/pipeline.sqlite3"),
-            source=os.environ.get("PIPELINE_SOURCE", "zsxq_digest").strip() or "zsxq_digest",
-            target=os.environ.get("PUBLISH_TARGET", "lark:zsxq_digest").strip() or "lark:zsxq_digest",
-            target_document=os.environ.get("PUBLISH_TARGET_DOCUMENT", "").strip(),
-            extractor_version=os.environ.get("EXTRACTOR_VERSION", "ocr-geometry-v2").strip() or "ocr-geometry-v2",
-            codex_command=os.environ.get("CODEX_BIN", "codex").strip() or "codex",
-            codex_model=codex_model,
-            codex_reasoning=(
-                os.environ.get("CODEX_REASONING", "").strip()
-                or os.environ.get("SUMMARY_AGENT_THINKING", "").strip()
-                or "medium"
-            ),
-            codex_timeout_seconds=_env_int("CODEX_TIMEOUT_SECONDS", 600),
-            codex_work_root=runtime_path("CODEX_WORK_ROOT", "work/codex"),
-            prompt_path=(
-                _inside(root, prompt_candidate, field_name="CODEX_PROMPT_PATH")
-                if prompt_candidate
-                else summary_prompt_path()
-            ),
-            system_prompt_path=(
-                _inside(root, system_candidate, field_name="CODEX_SYSTEM_PROMPT_PATH")
-                if system_candidate
-                else summary_system_prompt_path()
-            ),
-            text_cache_root=runtime_path("TEXT_CACHE_DIR", "text_cache"),
-            summary_cache_root=runtime_path("SUMMARY_CACHE_DIR", "summary_cache"),
-            work_root=runtime_path("PIPELINE_WORK_ROOT", "work"),
-            batch_path=runtime_path("BATCH_JSON", "pending_batch.json"),
-            watch_state_path=runtime_path("STATE_FILE", "watch_state.json"),
-            result_path=runtime_path("RESULT_JSON", "last_result.json"),
-            result_markdown_path=runtime_path("RESULT_MD", "last_result.md"),
-            run_status_path=runtime_path("RUN_STATUS_JSON", "run_status.json"),
-            usage_path=runtime_path("USAGE_JSON", "last_usage_summary.json"),
-            quarantine_path=runtime_path("QUARANTINE_JSON", "quarantine.json"),
-            notification_audit_path=runtime_path("NOTIFICATION_JSONL", "notification_messages.jsonl"),
-            research_library_root=(
-                _absolute(os.environ["RESEARCH_LIBRARY_ROOT"])
-                if os.environ.get("RESEARCH_LIBRARY_ROOT", "").strip()
-                else None
-            ),
-            obsidian_vault_root=(
-                _absolute(os.environ["OBSIDIAN_VAULT_ROOT"])
-                if os.environ.get("OBSIDIAN_VAULT_ROOT", "").strip()
-                else None
-            ),
-            lark_command=os.environ.get("LARK_CLI_BIN", "lark-cli").strip() or "lark-cli",
-            lark_config_dir=(
-                _absolute(os.environ["LARKSUITE_CLI_CONFIG_DIR"])
-                if os.environ.get("LARKSUITE_CLI_CONFIG_DIR", "").strip()
-                else None
-            ),
-            lark_timeout_seconds=_env_int("LARK_CLI_TIMEOUT_SECONDS", 90),
-            lark_parent_position=os.environ.get("PUBLISH_LARK_CLI_PARENT_POSITION", "my_library").strip() or "my_library",
-            target_chat_id=os.environ.get("TARGET_CHAT_ID", "").strip(),
-            notifications_enabled=_env_bool("LARK_CLI_NOTIFICATIONS", True),
-            summary_max_workers=_env_int("SUMMARY_WORKER_COUNT", 2, maximum=2),
-            doc_group_size=_env_int("DOC_GROUP_SIZE", 10),
-            doc_group_threshold=_env_int("DOC_GROUP_THRESHOLD", 15, minimum=0),
-            watch_root=_absolute(watch_root_text) if watch_root_text else None,
-            watch_extra_roots=extras,
-            max_files_per_document=_env_int(
-                "MAX_FILES_PER_DOCUMENT",
-                _env_int("PUBLISH_MAX_FILES_PER_DOC", 20),
-            ),
-            quiet_window_minutes=_env_int("QUIET_WINDOW_MINUTES", 15, minimum=0),
-            preflight_path=runtime_path("PREFLIGHT_JSON", "last_preflight.json"),
-        )
 
     @classmethod
     def from_pipeline_config(cls, config: PipelineConfig) -> "ProcessConfig":
@@ -403,15 +288,14 @@ class ProcessConfig:
             summary_cache_root=_inside(root, "summary_cache", field_name="summary_cache_root"),
             work_root=_inside(root, "work", field_name="work_root"),
             batch_path=_inside(root, "pending_batch.json", field_name="batch_path"),
-            watch_state_path=_inside(root, "watch_state.json", field_name="watch_state_path"),
             result_path=_inside(root, "last_result.json", field_name="result_path"),
             result_markdown_path=_inside(root, "last_result.md", field_name="result_markdown_path"),
             run_status_path=_inside(root, "run_status.json", field_name="run_status_path"),
             usage_path=_inside(root, "last_usage_summary.json", field_name="usage_path"),
             quarantine_path=_inside(root, "quarantine.json", field_name="quarantine_path"),
             notification_audit_path=_inside(root, "notification_messages.jsonl", field_name="notification_audit_path"),
-            research_library_root=None,
-            obsidian_vault_root=None,
+            research_library_root=config.pipeline.research_library_root,
+            obsidian_vault_root=config.pipeline.obsidian_vault_root,
             lark_command=config.lark.command,
             lark_config_dir=config.lark.config_dir,
             lark_timeout_seconds=config.lark.timeout_seconds,
@@ -427,20 +311,17 @@ class ProcessConfig:
 
 @dataclass(frozen=True, slots=True)
 class ProcessRequest:
-    """One CLI request, including explicitly supplied PDFs or a batch manifest."""
+    """One unified-worker request backed by a durable batch manifest."""
 
-    files: tuple[Path, ...] = ()
-    folders: tuple[Path, ...] = ()
     batch_file: Path | None = None
     dry_run: bool = False
     summary_only: bool = False
     no_notify: bool = False
     # The unified worker queues document notices during publication, then
     # drains the shared outbox once under its own bounded quota.  Existing
-    # standalone ``process`` callers retain immediate draining by default.
+    # direct maintenance/test callers retain immediate draining by default.
     defer_notification_drain: bool = False
     preflight_only: bool = False
-    include_existing: bool = False
 
     @property
     def local_only(self) -> bool:
@@ -457,10 +338,6 @@ class ProcessOutcome:
     cache_hits: int = 0
     published: int = 0
     quarantined: int = 0
-    # This is meaningful only for a scanner-generated batch.  It is derived
-    # from durable document stages rather than the user-facing run label, so a
-    # content quarantine can be acknowledged without replaying good PDFs.
-    ack_eligible: bool = False
     failures: tuple[str, ...] = ()
     notifications: tuple[NotificationDelivery, ...] = ()
     preflight: Mapping[str, Any] = field(default_factory=dict)
@@ -475,7 +352,6 @@ class ProcessOutcome:
             "cache_hits": self.cache_hits,
             "published": self.published,
             "quarantined": self.quarantined,
-            "ack_eligible": self.ack_eligible,
             "failures": list(self.failures),
             "notifications": [
                 {
@@ -601,7 +477,7 @@ class DigestProcessor:
                 outcome = ProcessOutcome("success", run_id, preflight=preflight)
                 self._write_outcome(outcome, phase="preflight")
                 return outcome
-            batch_path, scanner_batch = self._materialize_batch(request)
+            batch_path = self._materialize_batch(request)
             batch = self._load_batch(batch_path)
             files = batch["files"]
             if not files:
@@ -611,8 +487,6 @@ class DigestProcessor:
                 return outcome
             self._write_status(run_id, "running", "extract")
             outcome = self._run_batch(run_id, batch_path, batch, request)
-            if scanner_batch and outcome.ack_eligible and not request.local_only:
-                self._ack_scanner_batch()
             self._write_outcome(outcome, phase="complete")
             return outcome
         except Exception as exc:
@@ -630,7 +504,6 @@ class DigestProcessor:
         failures: list[str] = []
         quarantined = 0
         notifications: tuple[NotificationDelivery, ...] = ()
-        ack_eligible = False
         with PipelineState.open(self.config.database) as state:
             state.migrate()
             documents = self._register_documents(state, batch)
@@ -670,7 +543,6 @@ class DigestProcessor:
                 if self.config.notifications_enabled and not request.no_notify and not request.defer_notification_drain:
                     notifications = NotificationDrainer(state, self.notifier, clock=self.clock).drain()
                 export_notification_audit(state, self.config.notification_audit_path)
-                ack_eligible = self._scanner_ack_eligible(state, batch, documents)
         _write_json(self.config.usage_path, {"run_id": run_id, "usage": [dict(value) for value in self._usage]})
         status = "success" if not failures else ("partial" if (summaries or quarantined) else "failed")
         return ProcessOutcome(
@@ -682,7 +554,6 @@ class DigestProcessor:
             cache_hits=cache_hits,
             published=published,
             quarantined=quarantined,
-            ack_eligible=ack_eligible,
             failures=tuple(failures),
             notifications=notifications,
         )
@@ -708,102 +579,12 @@ class DigestProcessor:
         _write_json(self.config.usage_path, {"run_id": run_id, "usage": []})
         return deliveries
 
-    def _materialize_batch(self, request: ProcessRequest) -> tuple[Path, bool]:
-        if request.batch_file is not None:
-            payload = self._load_batch(_absolute(request.batch_file))
-            _write_json(self.config.batch_path, payload)
-            return self.config.batch_path, False
-        explicit = self._explicit_files(request.files, request.folders)
-        if explicit:
-            payload = self._batch_for_files(explicit)
-            _write_json(self.config.batch_path, payload)
-            return self.config.batch_path, False
-        self._scan_batch(include_existing=request.include_existing)
-        return self.config.batch_path, True
-
-    def _explicit_files(self, files: Iterable[Path], folders: Iterable[Path]) -> tuple[Path, ...]:
-        candidates = [_absolute(path) for path in files]
-        for folder in folders:
-            root = _absolute(folder)
-            if not root.is_dir():
-                raise ProcessError(f"folder does not exist: {root}")
-            candidates.extend(path.resolve() for path in root.rglob("*.pdf") if path.is_file())
-        unique: dict[str, Path] = {}
-        for path in candidates:
-            if not path.is_file():
-                raise ProcessError(f"PDF does not exist: {path}")
-            if path.suffix.lower() != ".pdf":
-                raise ProcessError(f"not a PDF: {path}")
-            unique[str(path)] = path
-        return tuple(unique[key] for key in sorted(unique))
-
-    def _batch_for_files(self, files: Sequence[Path]) -> dict[str, Any]:
-        generated = self.clock().isoformat()
-        return {
-            "generated_at": generated,
-            "root": "",
-            "new_pdf_count": len(files),
-            "files": [
-                {
-                    "path": str(path),
-                    "filename": path.name,
-                    "scan_root": str(path.parent),
-                    "pdf_sha256": sha256_file(path),
-                    "modified_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
-                    "report_id": "",
-                    "title": "",
-                    "batch_id": "manual",
-                }
-                for path in files
-            ],
-        }
-
-    def _scan_batch(self, *, include_existing: bool) -> None:
-        if self.config.watch_root is None:
-            raise ProcessError("provide --file, --folder, --batch-file, or configure WATCH_ROOT")
-        scanner = Path(__file__).resolve().parents[2] / "scripts" / "scan_new_zsxq_pdfs.py"
-        if not scanner.is_file():
-            raise ProcessError(f"scanner is unavailable: {scanner}")
-        argv = [
-            sys.executable,
-            str(scanner),
-            "--root",
-            str(self.config.watch_root),
-            "--state-file",
-            str(self.config.watch_state_path),
-            "--batch-file",
-            str(self.config.batch_path),
-            "--quiet-window-minutes",
-            str(self.config.quiet_window_minutes),
-        ]
-        for root in self.config.watch_extra_roots:
-            argv.extend(("--extra-root", str(root)))
-        if include_existing:
-            argv.append("--include-existing")
-        completed = subprocess.run(argv, capture_output=True, text=True, check=False, shell=False)
-        if completed.returncode != 0:
-            raise ProcessError(f"scanner failed: {(completed.stderr or completed.stdout).strip()[:800]}")
-
-    def _ack_scanner_batch(self) -> None:
-        if self.config.watch_root is None:
-            return
-        scanner = Path(__file__).resolve().parents[2] / "scripts" / "scan_new_zsxq_pdfs.py"
-        argv = [
-            sys.executable,
-            str(scanner),
-            "--root",
-            str(self.config.watch_root),
-            "--state-file",
-            str(self.config.watch_state_path),
-            "--batch-file",
-            str(self.config.batch_path),
-            "--ack-batch",
-        ]
-        for root in self.config.watch_extra_roots:
-            argv.extend(("--extra-root", str(root)))
-        completed = subprocess.run(argv, capture_output=True, text=True, check=False, shell=False)
-        if completed.returncode != 0:
-            raise ProcessError(f"scanner acknowledgement failed: {(completed.stderr or completed.stdout).strip()[:800]}")
+    def _materialize_batch(self, request: ProcessRequest) -> Path:
+        if request.batch_file is None:
+            raise ProcessError("the unified worker requires a durable batch manifest")
+        payload = self._load_batch(_absolute(request.batch_file))
+        _write_json(self.config.batch_path, payload)
+        return self.config.batch_path
 
     def _load_batch(self, path: Path) -> dict[str, Any]:
         try:
@@ -862,43 +643,6 @@ class DigestProcessor:
                 source_window_id=source_window_id,
             )
         return documents
-
-    def _scanner_ack_eligible(
-        self,
-        state: PipelineState,
-        batch: Mapping[str, Any],
-        documents: Mapping[str, Any],
-    ) -> bool:
-        """Return whether every scanned PDF reached a durable terminal boundary.
-
-        A scanner acknowledgement is intentionally all-or-nothing.  It is safe
-        only when each input either has a successful publication stage or was
-        explicitly quarantined for a content problem.  Notification/sidecar
-        retries do not affect this decision because they are downstream
-        projections and never revoke publication truth.
-        """
-
-        items = tuple(item for item in batch.get("files", ()) if isinstance(item, Mapping))
-        if not items:
-            return False
-        extraction_workflow = f"extract:{self.config.extractor_version}"
-        publish_workflow = f"publish:{self.config.target}:{self.config.target_document or 'new'}"
-        for item in items:
-            path = str(item.get("path", ""))
-            document = documents.get(path)
-            if document is None:
-                return False
-            extraction = state.get_stage_attempt(document.id, Stage.TEXT_EXTRACT, extraction_workflow)
-            if (
-                extraction is not None
-                and extraction.get("state") == StageState.QUARANTINED.value
-                and extraction.get("error_category") == ErrorCategory.CONTENT.value
-            ):
-                continue
-            publish = state.get_stage_attempt(document.id, Stage.PUBLISH, publish_workflow)
-            if publish is None or publish.get("state") != StageState.SUCCEEDED.value:
-                return False
-        return True
 
     def _claims(
         self,

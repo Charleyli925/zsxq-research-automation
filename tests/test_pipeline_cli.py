@@ -6,6 +6,7 @@ import pytest
 
 from zsxq_pipeline.cli import main
 from zsxq_pipeline.config import ConfigError, load_pipeline_config
+from zsxq_pipeline.process import ProcessConfig
 
 
 def _write_config(path, runtime_root, legacy_root) -> None:
@@ -114,6 +115,8 @@ def test_config_rejects_runtime_root_escapes_and_unknown_fields(tmp_path):
 def test_direct_codex_lark_and_grouping_config_is_typed_and_bounded(tmp_path):
     runtime_root = tmp_path / "runtime"
     profile_dir = tmp_path / "lark-profile"
+    library_root = tmp_path / "ResearchLibrary"
+    vault_root = tmp_path / "ResearchVault"
     config_path = tmp_path / "direct.toml"
     config_path.write_text(
         f'''schema_version = 1
@@ -148,6 +151,8 @@ summary_max_workers = 2
 doc_group_size = 10
 doc_group_threshold = 15
 max_files_per_document = 20
+research_library_root = "{library_root}"
+obsidian_vault_root = "{vault_root}"
 
 [publish_targets.daily]
 kind = "lark"
@@ -167,6 +172,11 @@ target_document = "daily-doc-logical-id"
     assert config.lark.notification_identity == "bot"
     assert config.pipeline.summary_max_workers == 2
     assert config.pipeline.max_files_per_document == 20
+    assert config.pipeline.research_library_root == library_root
+    assert config.pipeline.obsidian_vault_root == vault_root
+    process_config = ProcessConfig.from_pipeline_config(config)
+    assert process_config.research_library_root == library_root
+    assert process_config.obsidian_vault_root == vault_root
     assert config.publish_targets["daily"].target_document == "daily-doc-logical-id"
 
     config_path.write_text(

@@ -28,9 +28,10 @@ PR3 download canary plus PR4 direct-Codex/Lark canary.
    windows (eight total), plus one crash-recovery, Codex-unavailable, and
    Lark-unavailable exercise. Confirm no missed or duplicated PDF, summary,
    document, or notification.
-9. Only after soak, mark legacy runtimes read-only archive. Removing legacy
-   repository paths requires a separate reviewed change; it is not performed
-   by this cutover.
+9. Keep the production legacy runtime snapshot read-only through soak. The
+   repository entrypoints may be retired only in a separate reviewed change
+   after the unified canary has proved download, summary, publication, and
+   notification recovery; rollback continues through prior unified releases.
 
 ## Stop and rollback
 

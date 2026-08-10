@@ -10,8 +10,8 @@
 每 300 秒调用 `zsxq-pipeline tick`；它从 SQLite schedule cursor 和 checkpoint
 发现到期工作，再以独立 stage 运行下载、提取、摘要、发布和通知。下载在一个已
 授权的 Chrome for Testing CDP session 中生成 immutable plan、逐项下载并完成归档
-对账；不依赖 Agent、MCP 或动态 npm 包。`openclaw_tasks/` 仅是 cutover 前保留的
-迁移证据，不能与统一 scheduler 同时运行。
+对账；不依赖 Agent、MCP 或动态 npm 包。旧 task wrapper、旧 cron 和双
+LaunchAgent 安装入口已经从仓库移除，不能再形成第二套执行链。
 
 ## 1. 总体流向
 
@@ -115,9 +115,9 @@ idempotency key；消息失败只留在 notification outbox 里按退避重试�
 | `pipeline.sqlite3` | source/document identity、stage、publication、outbox | 是，事务状态真相 |
 | `text_cache/` | 复用已验证的正文 | 否，artifact 缓存 |
 | `summary_cache/` | 复用 JSON/Markdown 摘要 | 否，artifact 缓存 |
-| `run_status.json` | 兼容旧运维界面的实时状态导出 | 否，展示 |
+| `run_status.json` | 实时状态导出 | 否，展示 |
 | `last_result.json` / `.md` | 本轮结果导出 | 否，展示 |
-| `pending_batch.json` | 兼容扫描输入/本轮清单 | 否，输入记录 |
+| `pending_batch.json` | 本轮 SQLite 已登记文档的处理清单 | 否，输入记录 |
 | 飞书文档 / 群消息 | 远端展示和通知 | 否，需回写/校验 |
 
 publication 的唯一正确恢复顺序是 `intent -> remote_written -> success`。
@@ -138,8 +138,8 @@ publication 的唯一正确恢复顺序是 `intent -> remote_written -> success`
 | 查看 durable health | `zsxq-pipeline status --config /absolute/path/to/pipeline.toml --json` |
 | 计划并人工确认终态恢复 | `zsxq-pipeline retry plan ...` 然后 `retry apply --expected-count N --apply` |
 
-历史 task 目录只能用于 migration snapshot/rollback 证据。新安装和手工运行
-一律使用同一份 `pipeline.toml`，不得旁路成单独 cron 或 wrapper。
+新安装和手工运行一律使用同一份 `pipeline.toml`、同一把 runtime lock 和
+同一 SQLite；仓库不再提供单独 cron、旧 wrapper 或直连下载/摘要入口。
 
 ## 7. 故障处理原则
 

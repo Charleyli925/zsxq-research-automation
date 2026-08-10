@@ -422,16 +422,16 @@ def _candidate_paths(root: Path) -> list[Path]:
 
 
 def _extract_file_id(item: Mapping[str, Any]) -> str:
-    for field in ("source_file_id", "file_id", "report_id", "id"):
-        value = _safe_text(item.get(field))
+    for field_name in ("source_file_id", "file_id", "report_id", "id"):
+        value = _safe_text(item.get(field_name))
         if value:
             return value
     return ""
 
 
 def _extract_pdf_sha(item: Mapping[str, Any]) -> str | None:
-    for field in ("pdf_sha256", "file_sha256", "text_extract_cache_key", "sha256"):
-        digest = _valid_sha(item.get(field))
+    for field_name in ("pdf_sha256", "file_sha256", "text_extract_cache_key", "sha256"):
+        digest = _valid_sha(item.get(field_name))
         if digest:
             return digest
     return None
@@ -475,10 +475,10 @@ def _parse_run_manifest(collector: _Collector, path: Path, payload: Mapping[str,
     source = _source_hint(path, payload)
     window = (payload.get("window_start"), payload.get("window_end"))
     workflow = _safe_text(payload.get("workflow_version")) or "legacy-download"
-    for field in ("downloaded_entries", "satisfied_entries"):
-        for item in _as_list(payload.get(field)):
+    for field_name in ("downloaded_entries", "satisfied_entries"):
+        for item in _as_list(payload.get(field_name)):
             if not isinstance(item, dict):
-                collector.orphan(path, "download_manifest_entry", f"{field} contains a non-object")
+                collector.orphan(path, "download_manifest_entry", f"{field_name} contains a non-object")
                 continue
             document = _legacy_document_from_item(collector, path, item, source=source, window=window)
             if document is not None:
@@ -511,8 +511,8 @@ def _parse_run_manifest(collector: _Collector, path: Path, payload: Mapping[str,
 def _parse_watch_state(collector: _Collector, path: Path, payload: Mapping[str, Any]) -> None:
     source = _source_hint(path, payload)
     workflow = "legacy-digest"
-    for field, stage_state in (("known_files", None), ("pending_files", StageState.QUEUED)):
-        raw_entries = payload.get(field)
+    for field_name, stage_state in (("known_files", None), ("pending_files", StageState.QUEUED)):
+        raw_entries = payload.get(field_name)
         entries: Iterable[tuple[str, Any]]
         if isinstance(raw_entries, dict):
             entries = raw_entries.items()

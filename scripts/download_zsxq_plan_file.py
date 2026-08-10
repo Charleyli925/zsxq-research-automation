@@ -21,7 +21,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from zsxq_page_state import (  # noqa: E402
     DEFAULT_GROUP_NAME,
-    LOGIN_MARKERS,
+    LOGIN_MARKERS as LOGIN_MARKERS,
     wait_for_zsxq_page_state,
 )
 

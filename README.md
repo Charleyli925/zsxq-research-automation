@@ -36,17 +36,15 @@ SQLite-backed pipeline rather than PID files, cron quiet windows, or directory
 mtime. See [deployment.md](docs/deployment.md) and the
 [cutover runbook](docs/cutover-runbook.md).
 
-Merging code does not install it or retire any old scheduler. Production
-cutover needs a separate explicit release decision, idle check, canary, and
-soak period.
+Merging code does not install it. Production activation needs a separate
+explicit release decision and idle check; the repository no longer ships a
+second scheduler or legacy task wrapper.
 
 ## Repository layout
 
 - `scripts/`: download, reconciliation, report-processing, and knowledge-base tools
-- `openclaw_tasks/`: retained legacy migration evidence; not a new-runtime
-  installation dependency and never allowed to run alongside the unified job
 - `src/zsxq_pipeline/`: durable state, extraction, direct Codex summary, and
-  direct lark-cli publication adapters
+  direct lark-cli publication adapters, including the isolated OCR worker
 - `deploy/`: sanitized macOS LaunchAgent templates and release deployment tools
 - `config/examples/`: sanitized configuration examples
 - `tests/`: unit and workflow tests built around synthetic data
@@ -91,9 +89,8 @@ is only an existing lark-cli profile location, not a runtime dependency.
 
 ```bash
 python scripts/check_repository_hygiene.py
-bash -n scripts/*.sh
-bash -n openclaw_tasks/zsxq_download/*.sh
-bash -n openclaw_tasks/zsxq_pdf_digest/*.sh
+python -m compileall -q src scripts deploy
+ruff check src scripts deploy tests
 .venv/bin/python -m pytest -q
 ```
 
