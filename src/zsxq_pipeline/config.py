@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import tomllib
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class ConfigError(ValueError):
@@ -37,6 +39,11 @@ class SourceConfig:
     cft_start_url: str = ""
     cft_headless: bool = True
     cft_window_size: str = "1440,1200"
+    # Scheduling is opt-in per source.  An empty tuple keeps a source
+    # available for explicit ``download`` runs without making a periodic tick
+    # discover work for it.
+    schedule_times: tuple[str, ...] = ()
+    max_catchup_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +98,18 @@ class PipelineSettingsConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ScheduleConfig:
+    """Bounded one-shot scheduler policy shared by launchd and manual runs."""
+
+    timezone: str
+    tick_budget_seconds: int
+    download_quota: int
+    process_quota: int
+    outbox_quota: int
+    max_catchup_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
 class PublishTargetConfig:
     name: str
     kind: str
@@ -108,13 +127,19 @@ class PipelineConfig:
     schema_version: int
     runtime: RuntimeConfig
     sources: dict[str, SourceConfig]
-    schedule_timezone: str
+    schedule: ScheduleConfig
     model: ModelConfig
     publish_targets: dict[str, PublishTargetConfig]
     legacy: LegacyConfig
     codex: CodexConfig
     lark: LarkConfig
     pipeline: PipelineSettingsConfig
+
+    @property
+    def schedule_timezone(self) -> str:
+        """Compatibility alias retained for callers created before PR 5."""
+
+        return self.schedule.timezone
 
 
 def _as_mapping(value: Any, *, field: str) -> Mapping[str, Any]:
@@ -212,6 +237,30 @@ def _boolean(table: Mapping[str, Any], field: str, *, table_name: str, default: 
     return value
 
 
+def _schedule_times(table: Mapping[str, Any], *, table_name: str) -> tuple[str, ...]:
+    """Parse unique 24-hour ``HH:MM`` source slots without locale fallback."""
+
+    raw = table.get("schedule_times", [])
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError(f"{table_name}.schedule_times must be an array of HH:MM values")
+    slots: list[str] = []
+    for value in raw:
+        text = str(value).strip()
+        try:
+            parsed = datetime.strptime(text, "%H:%M")
+        except ValueError as exc:
+            raise ConfigError(f"{table_name}.schedule_times contains invalid time {text!r}; use HH:MM") from exc
+        canonical = parsed.strftime("%H:%M")
+        if canonical != text:
+            raise ConfigError(f"{table_name}.schedule_times contains invalid time {text!r}; use zero-padded HH:MM")
+        slots.append(canonical)
+    if len(set(slots)) != len(slots):
+        raise ConfigError(f"{table_name}.schedule_times must not contain duplicate slots")
+    return tuple(sorted(slots))
+
+
 def _parse_sources(root: Path, raw: Any) -> dict[str, SourceConfig]:
     table = _as_mapping(raw if raw is not None else {}, field="sources")
     result: dict[str, SourceConfig] = {}
@@ -235,6 +284,8 @@ def _parse_sources(root: Path, raw: Any) -> dict[str, SourceConfig]:
                 "cft_start_url",
                 "cft_headless",
                 "cft_window_size",
+                "schedule_times",
+                "max_catchup_seconds",
             },
         )
         result[source_name] = SourceConfig(
@@ -254,6 +305,19 @@ def _parse_sources(root: Path, raw: Any) -> dict[str, SourceConfig]:
             cft_start_url=str(source.get("cft_start_url") or "").strip(),
             cft_headless=_boolean(source, "cft_headless", table_name=f"sources.{source_name}", default=True),
             cft_window_size=str(source.get("cft_window_size") or "1440,1200").strip() or "1440,1200",
+            schedule_times=_schedule_times(source, table_name=f"sources.{source_name}"),
+            max_catchup_seconds=(
+                _positive_int(
+                    source,
+                    "max_catchup_seconds",
+                    table_name=f"sources.{source_name}",
+                    default=1,
+                    minimum=60,
+                    maximum=31 * 24 * 60 * 60,
+                )
+                if "max_catchup_seconds" in source
+                else None
+            ),
         )
     return result
 
@@ -306,6 +370,44 @@ def _parse_pipeline_settings(raw: Any) -> PipelineSettingsConfig:
         doc_group_size=group_size,
         doc_group_threshold=group_threshold,
         max_files_per_document=max_files,
+    )
+
+
+def _parse_schedule(raw: Any) -> ScheduleConfig:
+    table = _as_mapping(raw if raw is not None else {}, field="schedule")
+    _require_known(
+        table,
+        field="schedule",
+        allowed={
+            "timezone",
+            "tick_budget_seconds",
+            "download_quota",
+            "process_quota",
+            "outbox_quota",
+            "max_catchup_seconds",
+        },
+    )
+    timezone = str(table.get("timezone", "Asia/Shanghai")).strip() or "Asia/Shanghai"
+    try:
+        ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise ConfigError(f"schedule.timezone is not an IANA timezone: {timezone!r}") from exc
+    return ScheduleConfig(
+        timezone=timezone,
+        tick_budget_seconds=_positive_int(
+            table, "tick_budget_seconds", table_name="schedule", default=240, minimum=1, maximum=3600
+        ),
+        download_quota=_positive_int(table, "download_quota", table_name="schedule", default=2, maximum=20),
+        process_quota=_positive_int(table, "process_quota", table_name="schedule", default=20, maximum=200),
+        outbox_quota=_positive_int(table, "outbox_quota", table_name="schedule", default=50, maximum=500),
+        max_catchup_seconds=_positive_int(
+            table,
+            "max_catchup_seconds",
+            table_name="schedule",
+            default=3 * 24 * 60 * 60,
+            minimum=60,
+            maximum=31 * 24 * 60 * 60,
+        ),
     )
 
 
@@ -432,9 +534,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
     root = _absolute_runtime_root(runtime_raw.get("root"))
     runtime = RuntimeConfig(root=root, database=_within_root(root, runtime_raw.get("database"), field="runtime.database"))
 
-    schedule_raw = _as_mapping(raw.get("schedule", {}), field="schedule")
-    _require_known(schedule_raw, field="schedule", allowed={"timezone"})
-    schedule_timezone = str(schedule_raw.get("timezone", "Asia/Shanghai")).strip() or "Asia/Shanghai"
+    schedule = _parse_schedule(raw.get("schedule"))
 
     model, codex = _parse_model_and_codex(root, raw.get("model"), raw.get("codex"))
 
@@ -452,7 +552,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         schema_version=schema_version,
         runtime=runtime,
         sources=_parse_sources(root, raw.get("sources")),
-        schedule_timezone=schedule_timezone,
+        schedule=schedule,
         model=model,
         publish_targets=_parse_publish_targets(raw.get("publish_targets")),
         legacy=LegacyConfig(root=legacy_root),

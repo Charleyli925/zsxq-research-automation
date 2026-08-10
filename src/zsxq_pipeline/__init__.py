@@ -8,7 +8,7 @@ pipeline stages through the public state API.
 from __future__ import annotations
 
 __version__ = "0.1.0"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 from .model import SummaryIdentity
 

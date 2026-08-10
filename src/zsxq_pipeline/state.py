@@ -62,6 +62,8 @@ class UnknownDocumentError(StateError):
 
 
 _SHA256_LENGTH = 64
+
+
 def _json(value: Mapping[str, Any] | None) -> str:
     return json.dumps(canonical_json_value(dict(value or {})), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -102,6 +104,23 @@ def _timestamp(value: datetime | None) -> tuple[datetime, str, int]:
     instant = require_aware(value) if value is not None else utc_now()
     iso, epoch = to_iso_epoch(instant)
     return instant, iso, epoch
+
+
+def _stage_retry_fingerprint(row: Mapping[str, Any]) -> str:
+    """Bind a human-reviewed retry plan to one exact durable row state."""
+
+    fields = {
+        "attempt_count": int(row["attempt_count"]),
+        "document_id": int(row["document_id"]),
+        "error_category": str(row["error_category"] or ""),
+        "error_code": str(row["error_code"] or ""),
+        "id": int(row["id"]),
+        "state": str(row["state"]),
+        "updated_at_epoch": int(row["updated_at_epoch"]),
+        "workflow_version": str(row["workflow_version"]),
+    }
+    encoded = json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _row_document(row: sqlite3.Row) -> DocumentRecord:
@@ -319,6 +338,215 @@ class PipelineState:
             (normalized,),
         ).fetchone()
         return from_iso(str(row["window_end_iso"])) if row is not None else None
+
+    def get_schedule_cursor(self, source: str) -> datetime | None:
+        """Return the latest configured slot durably enqueued for ``source``.
+
+        This intentionally differs from :meth:`latest_source_checkpoint`.
+        A source window may be scheduled but still be waiting for browser work;
+        advancing this cursor prevents a second tick from creating another
+        window for the same missed slots, while the business checkpoint still
+        protects the actual source range until download reconciliation succeeds.
+        """
+
+        self._require_migrated()
+        normalized = str(source).strip()
+        if not normalized:
+            raise ValueError("source is required")
+        row = self._connection.execute(
+            "SELECT cursor_iso FROM schedule_cursors WHERE source = ?", (normalized,)
+        ).fetchone()
+        return from_iso(str(row["cursor_iso"])) if row is not None else None
+
+    def schedule_source_window(
+        self,
+        source: str,
+        window_start: datetime,
+        window_end: datetime,
+        *,
+        due_cursor: datetime,
+        truncated: bool,
+        now: datetime | None = None,
+    ) -> int:
+        """Atomically persist one scheduled window and advance its slot cursor.
+
+        The cursor update happens in the same short transaction *after* the
+        source-window upsert.  A process death before commit therefore leaves
+        neither partial state nor a silently skipped clock slot.
+        """
+
+        normalized = str(source).strip()
+        if not normalized:
+            raise ValueError("source is required")
+        _, start_iso, start_epoch = _timestamp(window_start)
+        _, end_iso, end_epoch = _timestamp(window_end)
+        _, cursor_iso, cursor_epoch = _timestamp(due_cursor)
+        if end_epoch < start_epoch:
+            raise ValueError("window_end must not be before window_start")
+        if cursor_epoch > end_epoch:
+            raise ValueError("due_cursor must not be after window_end")
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            prior = self._connection.execute(
+                "SELECT cursor_epoch FROM schedule_cursors WHERE source = ?", (normalized,)
+            ).fetchone()
+            if prior is not None and cursor_epoch < int(prior["cursor_epoch"]):
+                raise InvariantViolation(
+                    f"schedule cursor for {normalized!r} would move backward; refusing duplicate catch-up"
+                )
+            self._connection.execute(
+                """
+                INSERT INTO source_windows(
+                  source, window_start_iso, window_start_epoch, window_end_iso, window_end_epoch,
+                  status, checkpoint_eligible, created_at_iso, created_at_epoch, updated_at_iso, updated_at_epoch
+                ) VALUES (?, ?, ?, ?, ?, 'scheduled', 0, ?, ?, ?, ?)
+                ON CONFLICT(source, window_start_epoch, window_end_epoch) DO UPDATE SET
+                  status=CASE
+                    WHEN source_windows.status IN ('succeeded', 'partial', 'blocked', 'running') THEN source_windows.status
+                    ELSE 'scheduled'
+                  END,
+                  updated_at_iso=excluded.updated_at_iso,
+                  updated_at_epoch=excluded.updated_at_epoch
+                """,
+                (normalized, start_iso, start_epoch, end_iso, end_epoch, now_iso, now_epoch, now_iso, now_epoch),
+            )
+            row = self._connection.execute(
+                "SELECT id FROM source_windows WHERE source=? AND window_start_epoch=? AND window_end_epoch=?",
+                (normalized, start_epoch, end_epoch),
+            ).fetchone()
+            self._connection.execute(
+                """
+                INSERT INTO schedule_cursors(
+                  source, cursor_iso, cursor_epoch,
+                  last_window_start_iso, last_window_start_epoch,
+                  last_window_end_iso, last_window_end_epoch, truncated,
+                  created_at_iso, created_at_epoch, updated_at_iso, updated_at_epoch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source) DO UPDATE SET
+                  cursor_iso=excluded.cursor_iso,
+                  cursor_epoch=excluded.cursor_epoch,
+                  last_window_start_iso=excluded.last_window_start_iso,
+                  last_window_start_epoch=excluded.last_window_start_epoch,
+                  last_window_end_iso=excluded.last_window_end_iso,
+                  last_window_end_epoch=excluded.last_window_end_epoch,
+                  truncated=excluded.truncated,
+                  updated_at_iso=excluded.updated_at_iso,
+                  updated_at_epoch=excluded.updated_at_epoch
+                """,
+                (
+                    normalized,
+                    cursor_iso,
+                    cursor_epoch,
+                    start_iso,
+                    start_epoch,
+                    end_iso,
+                    end_epoch,
+                    int(bool(truncated)),
+                    now_iso,
+                    now_epoch,
+                    now_iso,
+                    now_epoch,
+                ),
+            )
+        assert row is not None
+        return int(row["id"])
+
+    def list_source_windows(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read scheduled work without consulting task directories or PID files."""
+
+        self._require_migrated()
+        requested = tuple(sorted({str(value).strip() for value in (statuses or ()) if str(value).strip()}))
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if requested:
+            clauses.append("status IN (" + ", ".join("?" for _ in requested) + ")")
+            parameters.extend(requested)
+        query = "SELECT * FROM source_windows"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY window_end_epoch, id"
+        if limit is not None:
+            if int(limit) < 1:
+                return []
+            query += " LIMIT ?"
+            parameters.append(int(limit))
+        rows = self._connection.execute(query, tuple(parameters)).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_documents_for_processing(
+        self,
+        source: str,
+        *,
+        extractor_workflow: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded, priority-ordered set of PDF-backed documents.
+
+        The processor owns the detailed workflow identities for summary and
+        publication.  This query only avoids feeding fully settled documents
+        back into every tick while prioritising extraction and downstream
+        recovery work that has not reached a durable terminal result.
+        """
+
+        self._require_migrated()
+        normalized = str(source).strip()
+        workflow = str(extractor_workflow).strip()
+        if not normalized or not workflow:
+            raise ValueError("source and extractor_workflow are required")
+        if int(limit) < 1:
+            return []
+        rows = self._connection.execute(
+            """
+            SELECT d.id, d.source, d.source_file_id, d.source_window_id, d.filename, d.source_path,
+                   a.pdf_sha256, a.canonical_path,
+                   extract.state AS extract_state,
+                   EXISTS(
+                     SELECT 1 FROM stage_attempts s
+                     WHERE s.document_id=d.id AND s.stage='summary'
+                   ) AS has_summary,
+                   EXISTS(
+                     SELECT 1 FROM stage_attempts s
+                     WHERE s.document_id=d.id AND s.stage='summary' AND s.state <> 'succeeded'
+                   ) AS has_unsettled_summary,
+                   EXISTS(
+                     SELECT 1 FROM stage_attempts p
+                     WHERE p.document_id=d.id AND p.stage='publish'
+                   ) AS has_publish,
+                   EXISTS(
+                     SELECT 1 FROM stage_attempts p
+                     WHERE p.document_id=d.id AND p.stage='publish' AND p.state <> 'succeeded'
+                   ) AS has_unsettled_publish
+            FROM documents d
+            JOIN artifacts a ON a.id=d.artifact_id AND a.kind='pdf'
+            LEFT JOIN stage_attempts extract
+              ON extract.document_id=d.id AND extract.stage='text_extract' AND extract.workflow_version=?
+            WHERE d.source=?
+              AND (
+                extract.id IS NULL OR extract.state <> 'succeeded'
+                OR NOT EXISTS(SELECT 1 FROM stage_attempts s0 WHERE s0.document_id=d.id AND s0.stage='summary')
+                OR EXISTS(SELECT 1 FROM stage_attempts s1 WHERE s1.document_id=d.id AND s1.stage='summary' AND s1.state <> 'succeeded')
+                OR NOT EXISTS(SELECT 1 FROM stage_attempts p0 WHERE p0.document_id=d.id AND p0.stage='publish')
+                OR EXISTS(SELECT 1 FROM stage_attempts p1 WHERE p1.document_id=d.id AND p1.stage='publish' AND p1.state <> 'succeeded')
+              )
+            ORDER BY
+              CASE
+                WHEN extract.id IS NULL OR extract.state <> 'succeeded' THEN 0
+                WHEN has_unsettled_summary THEN 1
+                WHEN has_unsettled_publish THEN 2
+                WHEN has_summary = 0 THEN 3
+                ELSE 4
+              END,
+              d.id
+            LIMIT ?
+            """,
+            (workflow, normalized, int(limit)),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def upsert_document(
         self,
@@ -975,6 +1203,123 @@ class PipelineState:
         ).fetchone()
         return dict(row) if row is not None else None
 
+    def plan_stage_retry(
+        self,
+        *,
+        stage: Stage | str,
+        workflow_version: str,
+        error_code: str,
+    ) -> list[dict[str, Any]]:
+        """Return exact terminal failure rows eligible for explicit recovery.
+
+        This is intentionally read-only.  An operator must preserve the
+        returned fingerprints in a retry plan and pass that plan to the
+        separate apply operation; no broad "retry all" mutation exists.
+        """
+
+        self._require_migrated()
+        normalized_stage = as_stage(stage).value
+        workflow = str(workflow_version).strip()
+        code = str(error_code).strip()
+        if not workflow or not code:
+            raise ValueError("workflow_version and error_code are required")
+        rows = self._connection.execute(
+            """
+            SELECT id, document_id, stage, workflow_version, state, error_category,
+                   error_code, error_detail, attempt_count, updated_at_epoch
+            FROM stage_attempts
+            WHERE stage=? AND workflow_version=? AND error_code=?
+              AND state IN ('blocked_auth', 'blocked_release', 'quarantined')
+            ORDER BY id
+            """,
+            (normalized_stage, workflow, code),
+        ).fetchall()
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            record = dict(row)
+            candidates.append(
+                {
+                    "attempt_id": int(record["id"]),
+                    "document_id": int(record["document_id"]),
+                    "stage": str(record["stage"]),
+                    "workflow_version": str(record["workflow_version"]),
+                    "state": str(record["state"]),
+                    "error_category": str(record["error_category"] or ""),
+                    "error_code": str(record["error_code"]),
+                    "attempt_count": int(record["attempt_count"]),
+                    "updated_at_epoch": int(record["updated_at_epoch"]),
+                    "fingerprint": _stage_retry_fingerprint(record),
+                }
+            )
+        return candidates
+
+    def apply_stage_retry_plan(
+        self,
+        candidates: Iterable[Mapping[str, Any]],
+        *,
+        plan_hash: str,
+        expected_count: int,
+        now: datetime | None = None,
+    ) -> int:
+        """Requeue exactly the reviewed candidates if none changed since plan.
+
+        The operation preserves succeeded rows by construction and rejects any
+        missing, added, or altered candidate before it writes the first row.
+        This makes a field fix recoverable without abusing the legacy import
+        API or converting unrelated terminal failures into automatic work.
+        """
+
+        normalized = tuple(dict(candidate) for candidate in candidates)
+        if int(expected_count) != len(normalized):
+            raise InvariantViolation("retry plan candidate count does not match --expected-count")
+        if not normalized:
+            return 0
+        digest = str(plan_hash).strip().lower()
+        if len(digest) != _SHA256_LENGTH or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError("plan_hash must be a SHA256 digest")
+        ids = [int(candidate.get("attempt_id", 0)) for candidate in normalized]
+        if len(set(ids)) != len(ids) or any(identifier <= 0 for identifier in ids):
+            raise InvariantViolation("retry plan contains invalid or duplicate stage attempt ids")
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            placeholders = ", ".join("?" for _ in ids)
+            rows = self._connection.execute(
+                "SELECT * FROM stage_attempts WHERE id IN (" + placeholders + ") ORDER BY id", tuple(sorted(ids))
+            ).fetchall()
+            if len(rows) != len(normalized):
+                raise InvariantViolation("a retry plan row no longer exists")
+            expected_by_id = {int(candidate["attempt_id"]): candidate for candidate in normalized}
+            for row in rows:
+                record = dict(row)
+                expected = expected_by_id[int(record["id"])]
+                if (
+                    str(record["state"]) not in {StageState.BLOCKED_AUTH.value, StageState.BLOCKED_RELEASE.value, StageState.QUARANTINED.value}
+                    or _stage_retry_fingerprint(record) != str(expected.get("fingerprint", ""))
+                    or int(record["document_id"]) != int(expected.get("document_id", -1))
+                    or str(record["stage"]) != str(expected.get("stage", ""))
+                    or str(record["workflow_version"]) != str(expected.get("workflow_version", ""))
+                ):
+                    raise InvariantViolation("a retry plan row changed after planning; create a new retry plan")
+            self._connection.execute(
+                """
+                UPDATE stage_attempts
+                SET state=?, error_category=NULL, error_code='manual_retry',
+                    error_detail=?, available_at_iso=NULL, available_at_epoch=NULL,
+                    lease_token=NULL, lease_expires_at_iso=NULL, lease_expires_at_epoch=NULL,
+                    updated_at_iso=?, updated_at_epoch=?
+                WHERE id IN ("""
+                + placeholders
+                + ")",
+                (
+                    StageState.QUEUED.value,
+                    f"requeued by verified retry plan {digest}",
+                    now_iso,
+                    now_epoch,
+                    *ids,
+                ),
+            )
+        return len(normalized)
+
     def requeue_succeeded_stage(
         self,
         document_id: int,
@@ -1570,10 +1915,44 @@ class PipelineState:
 
         self._require_migrated()
         _, now_iso, now_epoch = _timestamp(now)
-        source_rows = self._connection.execute("SELECT DISTINCT source FROM documents ORDER BY source").fetchall()
+        source_rows = self._connection.execute(
+            "SELECT source FROM documents UNION SELECT source FROM source_windows ORDER BY source"
+        ).fetchall()
         sources: dict[str, dict[str, Any]] = {
             str(row["source"]): {"stages": {}, "totals": _empty_counts()} for row in source_rows
         }
+        window_rows = self._connection.execute(
+            """
+            SELECT source, status, checkpoint_eligible, window_end_iso, window_end_epoch
+            FROM source_windows
+            ORDER BY source, window_end_epoch DESC, id DESC
+            """
+        ).fetchall()
+        for row in window_rows:
+            source = str(row["source"])
+            payload = sources.setdefault(source, {"stages": {}, "totals": _empty_counts()})
+            windows = payload.setdefault("windows", {"counts": {}, "latest": None, "latest_checkpoint": None})
+            status = str(row["status"])
+            counts = windows["counts"]
+            counts[status] = int(counts.get(status, 0)) + 1
+            if windows["latest"] is None:
+                windows["latest"] = {"status": status, "window_end": str(row["window_end_iso"])}
+            if bool(row["checkpoint_eligible"]) and windows["latest_checkpoint"] is None:
+                windows["latest_checkpoint"] = str(row["window_end_iso"])
+        cursor_rows = self._connection.execute(
+            """
+            SELECT source, cursor_iso, last_window_end_iso, truncated
+            FROM schedule_cursors ORDER BY source
+            """
+        ).fetchall()
+        for row in cursor_rows:
+            source = str(row["source"])
+            payload = sources.setdefault(source, {"stages": {}, "totals": _empty_counts()})
+            payload["schedule"] = {
+                "cursor": str(row["cursor_iso"]),
+                "last_window_end": str(row["last_window_end_iso"]),
+                "truncated": bool(row["truncated"]),
+            }
         rows = self._connection.execute(
             """
             SELECT documents.source, stage_attempts.stage, stage_attempts.state,
@@ -1628,6 +2007,7 @@ class PipelineState:
         allowed = {
             "runs",
             "source_windows",
+            "schedule_cursors",
             "documents",
             "artifacts",
             "stage_attempts",

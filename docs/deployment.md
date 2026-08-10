@@ -1,130 +1,81 @@
-# Private deployment
+# Unified local deployment
 
-## Prerequisites
+The production entrypoint is one user LaunchAgent that runs a finite
+`zsxq-pipeline tick` every 300 seconds. It is not a daemon: `RunAtLoad=true`
+provides one login-time wake-up and durable SQLite state decides what is due.
+There is no `KeepAlive` loop.
 
-- Python 3.11 or newer
-- Chrome for Testing with a dedicated authorized profile for the direct
-  plan-bound download path
-- `codex` CLI authenticated for the local user
-- `lark-cli` with the required local user and bot identities
-- optional PDF tools: `pdftotext`, `pdfinfo`, `tesseract`, `ocrmypdf`
+The local TOML config is outside Git. Start from
+`config/examples/pipeline.example.toml`; it contains the preserved foreign and
+domestic logical run times, `Asia/Shanghai`, bounded tick quotas, and only
+placeholder paths/identities. Keep credentials, browser profiles, report
+content, and the real target chat outside the checkout.
 
-Neither runtime needs an Agent, an agent registry, agent sessions, or agent
-credential directories. Historical task-directory names and the retained
-wrappers are scheduler compatibility only until unified-scheduler cutover.
+## Release install
 
-## Configuration
-
-1. Copy examples into `config/local/` as needed by the download tasks.
-2. Copy the two sanitized download config examples and the digest config
-   example to their respective actual task directories as `config.env`.
-3. Store secrets in Keychain or the owning CLI, never in either file.
-4. Set local paths and identities through the task config.
-5. Run a no-write preflight before enabling or resuming a scheduler.
-
-The digest configuration has these relevant groups:
-
-- local input/runtime: `RESEARCH_LIBRARY_ROOT`, `WATCH_ROOT`,
-  `PIPELINE_DATABASE`, `STATE_FILE`, `TEXT_CACHE_DIR`, `SUMMARY_CACHE_DIR`;
-- direct Codex summary: `CODEX_BIN`, `CODEX_MODEL`, `CODEX_REASONING`,
-  `CODEX_TIMEOUT_SECONDS`, `SUMMARY_WORKER_COUNT` (maximum two);
-- direct Lark publication: `LARK_CLI_BIN`, `LARKSUITE_CLI_CONFIG_DIR`,
-  `TARGET_CHAT_ID`, `LARK_CLI_NOTIFICATIONS`,
-  `PUBLISH_LARK_CLI_PARENT_POSITION`; and
-- deterministic grouping: `DOC_GROUP_SIZE`, `DOC_GROUP_THRESHOLD`,
-  `MAX_FILES_PER_DOCUMENT`.
-
-`CODEX_MODEL` 是必填的已审批模型值。部署模板有意不提供替代默认值，以免一次
-配置迁移在没有 review 的情况下升级模型；`CODEX_REASONING` 保持既有 `high`
-口径，除非单独批准改变。
-
-Documents always use lark-cli `user` identity; group notifications always use
-the `bot` identity. An existing profile directory whose name includes
-`openclaw` may remain in place; it is not a request to migrate credentials.
-
-## Release checkout
-
-Production should use a dedicated checkout:
+Production code must come from a clean detached reviewed SHA, never a
+developer checkout. The installer copies that release to
+`~/Library/Application Support/zsxq-research-automation/releases/<sha>/`,
+runs schema migration and `doctor`, writes a capability/config-hash manifest,
+and only then atomically changes `current`.
 
 ```bash
 git fetch --tags origin
 git checkout --detach <verified-tag-or-sha>
+
+python3 deploy/install_pipeline_runtime.py install \
+  --release-root "$PWD" \
+  --runtime-root "$HOME/Library/Application Support/zsxq-research-automation" \
+  --config "/absolute/path/to/pipeline.toml"
+
+# After reviewing the dry-run JSON and confirming every scheduler is idle:
+python3 deploy/install_pipeline_runtime.py install --apply \
+  --release-root "$PWD" \
+  --runtime-root "$HOME/Library/Application Support/zsxq-research-automation" \
+  --config "/absolute/path/to/pipeline.toml"
 ```
 
-Keep the development clone elsewhere. Record the deployed SHA before
-reloading a scheduler.
+The installer records SHA, schema version, Python, Playwright/Codex/lark/CFT
+capability booleans, and a configuration hash. It never copies or prints
+configuration content, auth profiles, reports, or credentials. A failed
+doctor leaves `current` and the active LaunchAgent unchanged.
 
-### Install the versioned local runtime
+`--cutover` is a separate explicit operation. Supply every old LaunchAgent,
+cron fragment, and legacy runtime root only after the runbook's idle/snapshot
+checks have passed; it backs them up before unloading/renaming them. Do not
+use `--skip-launchd` for a production cutover. `rollback --apply` only moves
+the code entrypoint back to the prior release; it never rewrites SQLite,
+artifacts, Lark documents, or notifications.
 
-The two download tasks and the PDF digest are one release deployment unit. Run
-the installer only from the clean, detached release checkout, after all three
-tasks are idle:
+## Operations
+
+All operational commands share the same validated config, runtime lock, and
+SQLite database:
 
 ```bash
-bash deploy/install_local_runtime.sh --dry-run
-bash deploy/install_local_runtime.sh --apply \
-  --foreign-label com.example.zsxq-autodownload \
-  --domestic-label com.example.zsxq-domestic-cicc
+zsxq-pipeline doctor --config /absolute/path/to/pipeline.toml
+zsxq-pipeline status --config /absolute/path/to/pipeline.toml --json
+zsxq-pipeline tick --config /absolute/path/to/pipeline.toml --budget-seconds 120
+zsxq-pipeline run-stage --config /absolute/path/to/pipeline.toml --stage process
+zsxq-pipeline outbox drain --config /absolute/path/to/pipeline.toml
 ```
 
-For an existing installation, pass the labels already used by its two
-LaunchAgents. Use `--digest-task-dir` when the cron task is outside the
-default `ZSXQ_pdf_digest` location. The installer refuses a dirty or branch
-checkout by default, does not touch `config.env`, and refuses the entire
-deployment if any one of the three task directories is active.
+`doctor` probes only configured local capabilities; it does not create a Lark
+document or run a summary. `tick` returns `busy` without mutating business
+state if another tick/manual stage owns the advisory lock.
 
-It links all three compatibility entrypoints to the same release checkout.
-The download wrapper calls the release-owned deterministic command; the digest
-wrapper calls the release-owned processing command. `config.env` supplies
-user-owned business configuration but cannot redirect either to another
-checkout. The Git-ignored sibling `deployment.env` remains release metadata
-generated by the installer; it must never contain a chat ID, credential,
-browser profile, or runtime state. Do not use the installer to deploy an
-unmerged branch, change a scheduler, or repair a backlog automatically.
-
-After an explicit release decision, use this sequence:
+For a resolved terminal failure, first create a narrow, reviewed retry plan
+matching one stage/workflow/error code, then apply exactly its expected row
+count. There is deliberately no broad "retry all" command:
 
 ```bash
-bash deploy/install_local_runtime.sh --dry-run
-# Verify the three task directories and SHA in the output, then ensure all are idle.
-bash deploy/install_local_runtime.sh --apply
-bash "${OPENCLAW_TASKS_ROOT}/ZSXQ_pdf_digest/run.sh" --preflight-only --no-notify
+zsxq-pipeline retry plan --config /absolute/path/to/pipeline.toml \
+  --stage publish --workflow-version publish:lark:new --error-code permission_grant_failed \
+  --output /absolute/path/to/retry-plan.json
+zsxq-pipeline retry apply --config /absolute/path/to/pipeline.toml \
+  --plan /absolute/path/to/retry-plan.json --expected-count 1 --apply
 ```
 
-## Capability preflight
-
-The following checks only display locally installed command help. They do not
-send a message, create a Lark document, or run a real Codex summary:
-
-```bash
-codex exec --help
-lark-cli docs +create --help
-lark-cli docs +update --help
-lark-cli docs +fetch --help
-lark-cli im +messages-send --help
-bash openclaw_tasks/zsxq_pdf_digest/run.sh --preflight-only --no-notify
-```
-
-Do not enable a schedule until local paths, PDF tools, Codex CLI capability,
-and the required Lark identities pass. A real Codex smoke and a real Lark
-canary require explicit separate authorization.
-
-## Resilient scheduling on macOS
-
-The download jobs are finite jobs, not daemons. Install them as user
-LaunchAgents with both their normal `StartCalendarInterval` and
-`RunAtLoad=true`. `RunAtLoad` gives each job one catch-up attempt after the
-user logs in following a restart or power loss. Do not set unconditional
-`KeepAlive=true`: a persistent source-side or login failure would otherwise
-create a hot restart loop.
-
-The PDF digest is checked every ten minutes. `run.cron-safe.sh` remains in
-place until the scheduler consolidation work; it preserves log rotation and
-overlap protection while delegating actual processing to the direct pipeline.
-After a restart, the next check rediscovers unacknowledged PDFs and can reuse
-their text/summary artifacts without rerunning the model.
-
-Schedulers only trigger work; they are not completion truth. Use durable state
-and verified publication transitions together with the compatibility result
-exports. See [runtime-recovery.md](runtime-recovery.md) for the recovery
-contract and operational checks.
+The historical task wrappers remain migration evidence until the soak gate in
+the cutover runbook is complete. They are not part of the new installation
+path and must not run concurrently with the unified LaunchAgent.

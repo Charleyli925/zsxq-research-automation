@@ -19,29 +19,28 @@ mandatory. See [development-workflow.md](development-workflow.md).
 
 A deployment records the exact tag or commit SHA it runs. Machine-specific
 configuration refers to that code but does not copy or fork it. The foreign
-download task, domestic-CICC task, and `ZSXQ_pdf_digest` are one deployment
-unit. Their compatibility wrappers, direct Python pipelines, extractor, and
-local sidecar adapters must resolve to the same release checkout.
+download, domestic-CICC, extraction, direct summary, publication, and
+notification stages are one deployment unit at `releases/<sha>/` with an
+atomically switched `current` symlink.
 
 Development and production checkouts are separate so a scheduler cannot
 execute an uncommitted edit.
 
-For each compatibility task, ownership is deliberately split:
+For the unified runtime, ownership is deliberately split:
 
-- `config.env` owns business configuration: chat ID, local data roots,
-  source IDs, browser endpoint/profile settings, identity selection,
-  model/runtime tuning, and scheduler-facing options. It cannot select an
-  alternative source checkout.
-- installer-generated `deployment.env` remains release metadata for the local
-  task installation. It cannot contain chat IDs, credentials, browser profile
-  paths, logs, state, or downloaded content.
-- `.deployment/investment-reports-automation.json` records the deployed Git
-  SHA, release root, task directories, and each task's scheduler type.
+- external `pipeline.toml` owns business configuration: chat ID, local data
+  roots, source IDs, browser endpoint/profile settings, identity selection,
+  model/runtime tuning, source slots, and bounded scheduler policy. It cannot
+  select an alternative source checkout.
+- `deployment-manifest.json` records the deployed SHA, pipeline schema,
+  executable capability booleans, prior release, and config SHA-256. It does
+  not contain config content, chat IDs, credentials, browser profile paths,
+  logs, state, or downloaded content.
 
-The wrappers resolve their own linked source path and put only that release's
-`src/` tree on `PYTHONPATH`; they do not snapshot a shell worker, interpret a
-browser prompt, or accept a source-root override from `config.env`. A release
-mismatch is a deployment fault, not a transient retry.
+The launchd entrypoint resolves only `current/scripts/run_zsxq_pipeline.py`
+and that release's `src/` tree. It does not snapshot a shell worker, interpret
+a browser prompt, or accept a development-source override from configuration.
+A release mismatch is a deployment fault, not a transient retry.
 
 ## Runtime state
 
@@ -53,11 +52,11 @@ Recovery audits may be appended to a retry ledger, but prior failure entries
 and `remote_written` publish records remain historical evidence. Never clear a
 ledger or delete a publish record merely to make work eligible again.
 
-For the direct digest pipeline, `pipeline.sqlite3` is the durable state
-authority. It separates source-document identity, PDF content identity, stage
+`pipeline.sqlite3` is the durable state authority. It separates schedule
+cursors/source windows, source-document identity, PDF content identity, stage
 state, publication state, and notification idempotency in one transaction
 boundary. Existing JSON/JSONL files and `processed_files.sqlite` remain
-compatibility/material views; `run_status.json` and `last_result.*` are
+migration/material views; `run_status.json` and `last_result.*` are
 operator-facing exports, not a second retry or completion authority.
 
 `zsxq-pipeline legacy plan` reads legacy files and records a SHA256 snapshot of
