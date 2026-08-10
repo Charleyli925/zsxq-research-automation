@@ -41,9 +41,9 @@ reloading a scheduler.
 
 ### Install the versioned local runtime
 
-The download task's scheduler wrapper and LaunchAgent templates live in this
-repository. Run the installer only from the clean, detached release checkout,
-after any currently-running download has finished:
+The two download tasks and the PDF digest are one release deployment unit. Run
+the installer only from the clean, detached release checkout, after all three
+tasks are idle:
 
 ```bash
 bash deploy/install_local_runtime.sh --dry-run
@@ -53,12 +53,33 @@ bash deploy/install_local_runtime.sh --apply \
 ```
 
 For an existing installation, pass the labels already used by its two
-LaunchAgents. The installer refuses a dirty or branch checkout by default,
-does not touch `config.env`, and writes a Git-ignored `deployment.env` beside
-each task to pin runtime code paths to the deployed SHA. It backs up any
-locally copied `run.sh` and `run.cron-safe.sh` before replacing them with
-links to the release checkout. Use `--skip-launchd` only when preparing a
-machine before the user LaunchAgent session is available.
+LaunchAgents. Use `--digest-task-dir` when the cron task is outside the
+default `ZSXQ_pdf_digest` location. The installer refuses a dirty or branch
+checkout by default, does not touch `config.env`, and refuses the entire
+deployment if any one of the three task directories is active.
+
+It writes a Git-ignored `deployment.env` beside each task. For the digest,
+that file contains only release-owned source paths (`AUTOMATION_ROOT`, helper,
+scanner, sidecars, and runtime guard); it must never contain a chat ID,
+credential, browser profile, or runtime state. The digest continues to use its
+existing cron schedule; the installer only links its `run.sh` and
+`run.cron-safe.sh` to the same release checkout as the download tasks. It
+backs up replaced local wrappers and writes the common SHA plus all three task
+directories to `.deployment/investment-reports-automation.json` under the
+tasks root. Use `--skip-launchd` only when preparing a machine before the user
+LaunchAgent session is available.
+
+After an explicit release decision, use this sequence:
+
+```bash
+bash deploy/install_local_runtime.sh --dry-run
+# Verify the three task directories and SHA in the output, then ensure all are idle.
+bash deploy/install_local_runtime.sh --apply
+bash "${OPENCLAW_TASKS_ROOT}/ZSXQ_pdf_digest/run.sh" --preflight-only --no-notify
+```
+
+Do not use this installer to deploy an unmerged branch, change a scheduler,
+or repair a backlog automatically.
 
 ## Preflight
 

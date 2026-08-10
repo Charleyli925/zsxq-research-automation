@@ -19,6 +19,8 @@ RUNNER = ROOT / "openclaw_tasks" / "zsxq_download" / "run.sh"
 CRON_WRAPPER = ROOT / "openclaw_tasks" / "zsxq_download" / "run.cron-safe.sh"
 FOREIGN_LAUNCHER = ROOT / "scripts" / "run_zsxq_task_via_codex.sh"
 DOMESTIC_LAUNCHER = ROOT / "scripts" / "run_zsxq_domestic_cicc_task_via_codex.sh"
+DIGEST_RUNNER = ROOT / "openclaw_tasks" / "zsxq_pdf_digest" / "run.sh"
+DIGEST_CRON_WRAPPER = ROOT / "openclaw_tasks" / "zsxq_pdf_digest" / "run.cron-safe.sh"
 
 
 class LocalRuntimeDeploymentTests(unittest.TestCase):
@@ -47,6 +49,7 @@ class LocalRuntimeDeploymentTests(unittest.TestCase):
             tasks_root = tmp / "tasks"
             foreign = self.make_task(tasks_root, "ZSXQ_autodownload")
             domestic = self.make_task(tasks_root, "ZSXQ_国内研报_中金公司")
+            digest = self.make_task(tasks_root, "ZSXQ_pdf_digest")
             completed = subprocess.run(
                 [
                     "bash",
@@ -69,6 +72,7 @@ class LocalRuntimeDeploymentTests(unittest.TestCase):
             self.assertIn("dry run complete", completed.stdout)
             self.assertEqual((foreign / "run.sh").read_text(encoding="utf-8"), "old runner\n")
             self.assertEqual((domestic / "run.cron-safe.sh").read_text(encoding="utf-8"), "old cron wrapper\n")
+            self.assertEqual((digest / "run.sh").read_text(encoding="utf-8"), "old runner\n")
 
     def test_apply_links_release_wrappers_and_keeps_private_config(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
@@ -76,6 +80,7 @@ class LocalRuntimeDeploymentTests(unittest.TestCase):
             tasks_root = tmp / "tasks"
             foreign = self.make_task(tasks_root, "ZSXQ_autodownload")
             domestic = self.make_task(tasks_root, "ZSXQ_国内研报_中金公司")
+            digest = self.make_task(tasks_root, "ZSXQ_pdf_digest")
             completed = subprocess.run(
                 [
                     "bash",
@@ -111,6 +116,36 @@ class LocalRuntimeDeploymentTests(unittest.TestCase):
                 self.assertEqual(len(list(backup_root.rglob("run.sh"))), 1)
                 self.assertEqual(len(list(backup_root.rglob("run.cron-safe.sh"))), 1)
 
+            self.assertTrue((digest / "run.sh").is_symlink())
+            self.assertEqual((digest / "run.sh").resolve(), DIGEST_RUNNER.resolve())
+            self.assertTrue((digest / "run.cron-safe.sh").is_symlink())
+            self.assertEqual((digest / "run.cron-safe.sh").resolve(), DIGEST_CRON_WRAPPER.resolve())
+            digest_deployment_env = (digest / "deployment.env").read_text(encoding="utf-8")
+            self.assertNotIn("private-chat-id", digest_deployment_env)
+            self.assertNotIn("TARGET_CHAT_ID", digest_deployment_env)
+            self.assertNotIn("CODEX_SCRIPT_PATH", digest_deployment_env)
+            expected_digest_keys = {
+                "AUTOMATION_ROOT",
+                "HELPER_SCRIPT_PATH",
+                "SCANNER_SCRIPT_PATH",
+                "RESEARCH_LIBRARY_INDEX_SCRIPT_PATH",
+                "MARKITDOWN_SCRIPT_PATH",
+                "CLEAN_MARKDOWN_SCRIPT_PATH",
+                "OBSIDIAN_ARCHIVE_SCRIPT_PATH",
+                "OBSIDIAN_INDEX_SCRIPT_PATH",
+                "RUNTIME_GUARD_SCRIPT_PATH",
+            }
+            actual_digest_keys = {
+                line.split("=", 1)[0]
+                for line in digest_deployment_env.splitlines()
+                if line and not line.startswith("#")
+            }
+            self.assertEqual(actual_digest_keys, expected_digest_keys)
+            self.assertTrue(all(str(ROOT) in line for line in digest_deployment_env.splitlines() if "=" in line))
+            digest_backup_root = digest / ".deployment-backups"
+            self.assertEqual(len(list(digest_backup_root.rglob("run.sh"))), 1)
+            self.assertEqual(len(list(digest_backup_root.rglob("run.cron-safe.sh"))), 1)
+
             foreign_deployment_env = (foreign / "deployment.env").read_text(encoding="utf-8")
             domestic_deployment_env = (domestic / "deployment.env").read_text(encoding="utf-8")
             self.assertIn(f"CODEX_SCRIPT_PATH={shlex.quote(str(FOREIGN_LAUNCHER))}", foreign_deployment_env)
@@ -123,6 +158,53 @@ class LocalRuntimeDeploymentTests(unittest.TestCase):
             )
             self.assertEqual(record["tasks"]["foreign_download"]["label"], "com.test.foreign")
             self.assertEqual(record["tasks"]["domestic_cicc"]["label"], "com.test.domestic")
+            self.assertEqual(record["tasks"]["pdf_digest"]["task_dir"], str(digest.resolve()))
+            self.assertEqual(record["tasks"]["pdf_digest"]["scheduler"], "cron")
+
+    def test_apply_refuses_when_any_runtime_task_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            tasks_root = tmp / "tasks"
+            task_dirs = {
+                "foreign": self.make_task(tasks_root, "ZSXQ_autodownload"),
+                "domestic": self.make_task(tasks_root, "ZSXQ_国内研报_中金公司"),
+                "digest": self.make_task(tasks_root, "ZSXQ_pdf_digest"),
+            }
+            for name, active_task in task_dirs.items():
+                with self.subTest(task=name):
+                    canonical_task = active_task.resolve()
+                    process = subprocess.Popen(
+                        [sys.executable, "-c", "import time; time.sleep(30)", str(canonical_task / "run.sh")]
+                    )
+                    try:
+                        (active_task / ".run.pid").write_text(str(process.pid) + "\n", encoding="utf-8")
+                        completed = subprocess.run(
+                            [
+                                "bash",
+                                str(INSTALLER),
+                                "--apply",
+                                "--allow-dirty",
+                                "--allow-branch",
+                                "--skip-launchd",
+                                "--tasks-root",
+                                str(tasks_root),
+                                "--foreign-label",
+                                "com.test.foreign",
+                                "--domestic-label",
+                                "com.test.domestic",
+                            ],
+                            cwd=ROOT,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                    finally:
+                        process.terminate()
+                        process.wait(timeout=10)
+                        (active_task / ".run.pid").unlink(missing_ok=True)
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn(str(canonical_task), completed.stderr)
+                    self.assertFalse((active_task / "deployment.env").exists())
 
     def test_runner_creates_current_failure_result_when_launcher_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:

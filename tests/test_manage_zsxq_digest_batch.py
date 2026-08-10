@@ -964,6 +964,229 @@ class ManageZsxqDigestBatchTests(unittest.TestCase):
             self.assertEqual([item["filename"] for item in eligible["files"]], ["new.pdf"])
             self.assertEqual(next(iter(json.loads(ledger_path.read_text())["entries"].values()))["failure_count"], 1)
 
+    def test_contract_version_describes_publish_recovery_argument_boundary(self) -> None:
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            result = MODULE.contract_version()
+
+        self.assertEqual(result, 0)
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["contract_version"], "zsxq-digest-batch/v1")
+        self.assertIn(
+            "--batch-file",
+            payload["commands"]["lookup-publish-recovery"]["arguments"],
+        )
+
+    def test_release_contract_mismatch_is_blocked_without_next_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            pdf = base / "blocked.pdf"
+            pdf.write_bytes(b"blocked")
+            batch_path = base / "batch.json"
+            ledger_path = base / "ledger.json"
+            eligible_path = base / "eligible.json"
+            batch_path.write_text(
+                json.dumps({"files": [{"path": str(pdf), "filename": pdf.name}]}),
+                encoding="utf-8",
+            )
+
+            with redirect_stdout(io.StringIO()):
+                MODULE.record_stage_retry(
+                    batch_path,
+                    ledger_path,
+                    stage="publish",
+                    run_at="2026-08-10T12:00:00+08:00",
+                    workflow_version="legacy-release",
+                    error_code_override="release_contract_mismatch",
+                    error_type_override="release_contract_mismatch",
+                    retryable_override="false",
+                    message_override="unrecognized arguments: --batch-file",
+                )
+
+            entry = next(iter(json.loads(ledger_path.read_text(encoding="utf-8"))["entries"].values()))
+            self.assertEqual(entry["status"], "blocked_release")
+            self.assertFalse(entry["retryable"])
+            self.assertIsNone(entry["next_retry_at"])
+
+            stream = io.StringIO()
+            with redirect_stdout(stream):
+                MODULE.filter_stage_retries(
+                    batch_path,
+                    ledger_path,
+                    eligible_path,
+                    stage="any",
+                    run_at="2026-08-10T12:10:00+08:00",
+                    workflow_version="legacy-release",
+                )
+            status = json.loads(stream.getvalue())
+            self.assertEqual(status["eligible_count"], 0)
+            self.assertTrue(status["all_deferred_terminal_blocked"])
+            self.assertEqual(status["terminal_blocked_count"], 1)
+
+    def test_recover_stage_retries_is_preview_first_atomic_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            batch_path = base / "batch.json"
+            ledger_path = base / "ledger.json"
+            files = []
+            for name in ("legacy-a.pdf", "legacy-b.pdf"):
+                pdf = base / name
+                pdf.write_bytes(name.encode("utf-8"))
+                files.append({"path": str(pdf), "filename": name})
+            batch_path.write_text(json.dumps({"files": files}), encoding="utf-8")
+
+            for attempt in range(4):
+                with redirect_stdout(io.StringIO()):
+                    MODULE.record_stage_retry(
+                        batch_path,
+                        ledger_path,
+                        stage="publish",
+                        run_at=f"2026-08-10T12:{attempt:02d}:00+08:00",
+                        workflow_version="legacy-workflow",
+                        error_code_override="publish_failed",
+                        error_type_override="transient_failure",
+                        retryable_override="true",
+                        message_override="lark-cli docs 发布失败：发布恢复记录查询失败",
+                    )
+
+            before = ledger_path.read_bytes()
+            ledger = json.loads(before)
+            entries = list(ledger["entries"].values())
+            self.assertEqual(len(entries), 2)
+            self.assertTrue(all(entry["status"] == "retry_exhausted" for entry in entries))
+            fingerprint = entries[0]["error_fingerprint"]
+
+            preview_stream = io.StringIO()
+            with redirect_stdout(preview_stream):
+                preview_result = MODULE.recover_stage_retries(
+                    ledger_path,
+                    stage="publish",
+                    error_code="publish_failed",
+                    from_workflow_version="legacy-workflow",
+                    to_workflow_version="release-v2",
+                    error_fingerprint=fingerprint,
+                    expected_count=2,
+                    run_at="2026-08-10T13:00:00+08:00",
+                    apply=False,
+                )
+            self.assertEqual(preview_result, 0)
+            preview = json.loads(preview_stream.getvalue())
+            self.assertEqual(preview["matched_count"], 2)
+            self.assertEqual(len(preview["target_entry_keys"]), 2)
+            self.assertEqual(ledger_path.read_bytes(), before)
+
+            fingerprint_mismatch_stream = io.StringIO()
+            with redirect_stdout(fingerprint_mismatch_stream):
+                fingerprint_mismatch_result = MODULE.recover_stage_retries(
+                    ledger_path,
+                    stage="publish",
+                    error_code="publish_failed",
+                    from_workflow_version="legacy-workflow",
+                    to_workflow_version="release-v2",
+                    error_fingerprint="0" * 64,
+                    expected_count=2,
+                    run_at="2026-08-10T13:00:00+08:00",
+                    apply=True,
+                )
+            self.assertEqual(fingerprint_mismatch_result, 2)
+            self.assertEqual(
+                json.loads(fingerprint_mismatch_stream.getvalue())["error"],
+                "expected_count_mismatch",
+            )
+            self.assertEqual(ledger_path.read_bytes(), before)
+
+            mismatch_stream = io.StringIO()
+            with redirect_stdout(mismatch_stream):
+                mismatch_result = MODULE.recover_stage_retries(
+                    ledger_path,
+                    stage="publish",
+                    error_code="publish_failed",
+                    from_workflow_version="legacy-workflow",
+                    to_workflow_version="release-v2",
+                    error_fingerprint=fingerprint,
+                    expected_count=3,
+                    run_at="2026-08-10T13:00:00+08:00",
+                    apply=True,
+                )
+            self.assertEqual(mismatch_result, 2)
+            self.assertEqual(json.loads(mismatch_stream.getvalue())["error"], "expected_count_mismatch")
+            self.assertEqual(ledger_path.read_bytes(), before)
+
+            apply_stream = io.StringIO()
+            with redirect_stdout(apply_stream):
+                apply_result = MODULE.recover_stage_retries(
+                    ledger_path,
+                    stage="publish",
+                    error_code="publish_failed",
+                    from_workflow_version="legacy-workflow",
+                    to_workflow_version="release-v2",
+                    error_fingerprint=fingerprint,
+                    expected_count=2,
+                    run_at="2026-08-10T13:00:00+08:00",
+                    apply=True,
+                )
+            self.assertEqual(apply_result, 0)
+            self.assertTrue(json.loads(apply_stream.getvalue())["ledger_written"])
+            after_apply = json.loads(ledger_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(after_apply["recovery_audit"]), 1)
+            original_entries = [
+                entry
+                for entry in after_apply["entries"].values()
+                if entry["workflow_version"] == "legacy-workflow"
+            ]
+            released_entries = [
+                entry
+                for entry in after_apply["entries"].values()
+                if entry["workflow_version"] == "release-v2"
+            ]
+            self.assertEqual(len(original_entries), 2)
+            self.assertTrue(all(entry["status"] == "retry_exhausted" for entry in original_entries))
+            self.assertEqual(len(released_entries), 2)
+            self.assertTrue(all(entry["status"] == "recovery_released" for entry in released_entries))
+            self.assertTrue(all(entry["failure_count"] == 0 for entry in released_entries))
+
+            eligible_path = base / "eligible-release-v2.json"
+            with redirect_stdout(io.StringIO()):
+                MODULE.filter_stage_retries(
+                    batch_path,
+                    ledger_path,
+                    eligible_path,
+                    stage="publish",
+                    run_at="2026-08-10T13:00:00+08:00",
+                    workflow_version="release-v2",
+                )
+            eligible = json.loads(eligible_path.read_text(encoding="utf-8"))
+            self.assertEqual([item["filename"] for item in eligible["files"]], ["legacy-a.pdf", "legacy-b.pdf"])
+
+            second_stream = io.StringIO()
+            with redirect_stdout(second_stream):
+                second_result = MODULE.recover_stage_retries(
+                    ledger_path,
+                    stage="publish",
+                    error_code="publish_failed",
+                    from_workflow_version="legacy-workflow",
+                    to_workflow_version="release-v2",
+                    error_fingerprint=fingerprint,
+                    expected_count=2,
+                    run_at="2026-08-10T13:05:00+08:00",
+                    apply=True,
+                )
+            self.assertEqual(second_result, 0)
+            self.assertTrue(json.loads(second_stream.getvalue())["already_applied"])
+            after_second_apply = json.loads(ledger_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(after_second_apply["recovery_audit"]), 1)
+            self.assertEqual(
+                len(
+                    [
+                        entry
+                        for entry in after_second_apply["entries"].values()
+                        if entry["workflow_version"] == "release-v2"
+                    ]
+                ),
+                2,
+            )
+
     def test_stage_retry_ledger_uses_fixed_5_10_20_minute_schedule(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             base = Path(tmp_dir)

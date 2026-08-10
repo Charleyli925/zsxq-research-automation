@@ -77,6 +77,7 @@ CLEAN_MARKDOWN_SCRIPT_PATH_RESOLVED="${ZSXQ_CLEAN_MARKDOWN_SCRIPT_PATH:-$CLEAN_M
 OBSIDIAN_ARCHIVE_SCRIPT_PATH_RESOLVED="${ZSXQ_OBSIDIAN_ARCHIVE_SCRIPT_PATH:-$OBSIDIAN_ARCHIVE_SCRIPT_SOURCE_PATH}"
 OBSIDIAN_INDEX_SCRIPT_PATH_RESOLVED="${ZSXQ_OBSIDIAN_INDEX_SCRIPT_PATH:-$OBSIDIAN_INDEX_SCRIPT_SOURCE_PATH}"
 RUNTIME_GUARD_SCRIPT_PATH_RESOLVED="${ZSXQ_RUNTIME_GUARD_SCRIPT_PATH:-$RUNTIME_GUARD_SCRIPT_SOURCE_PATH}"
+RELEASE_CONTRACT_ERROR="${ZSXQ_RELEASE_CONTRACT_ERROR:-}"
 RESEARCH_LIBRARY_ROOT="${RESEARCH_LIBRARY_ROOT:-$HOME/Library/Application Support/investment-reports-automation/ResearchLibrary}"
 OBSIDIAN_VAULT_ROOT="${OBSIDIAN_VAULT_ROOT:-$HOME/Library/Application Support/investment-reports-automation/ResearchVault}"
 OBSIDIAN_INDEX_RESULT_JSON_VALUE="${OBSIDIAN_INDEX_RESULT_JSON:-state/obsidian_index_update_last_result.json}"
@@ -978,7 +979,7 @@ finish_with_result() {
   local idempotency_seed="${4:-}"
   if [[ -f "$RESULT_MD_PATH" ]]; then
     case "$event_name" in
-      waiting-*|backoff-*|busy|dry-run|preflight-success|no-new)
+      waiting-*|backoff-*|busy|dry-run|preflight-success|no-new|blocked-release)
         ;;
       *)
         render_compact_terminal_result
@@ -1371,6 +1372,61 @@ resolve_stage_retry_for_batch() {
     --workflow-version "$WORKFLOW_RETRY_VERSION" >> "$LOG_PATH" 2>&1 || true
 }
 
+is_release_contract_mismatch() {
+  local raw="${1:-}"
+  local lowered=""
+  lowered="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  case "$lowered" in
+    *"unrecognized arguments"*|*"helper contract"*|*"contract-version"*|*"contract version"*|*"schema version"*|*"release_contract_mismatch"*)
+      return 0
+      ;;
+    *"lookup-publish-recovery"*)
+      if [[ "$lowered" == *"invalid choice"* || "$lowered" == *"required arguments"* || "$lowered" == *"missing"* ]]; then
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+finish_blocked_release() {
+  local batch_path="$1"
+  local new_pdf_count="$2"
+  local raw_error="$3"
+  local record_retry="${4:-true}"
+  local error_summary=""
+  error_summary="$(printf '%s' "$raw_error" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g' | cut -c1-600)"
+  if [[ -z "$error_summary" ]]; then
+    error_summary="release contract mismatch"
+  fi
+
+  if [[ -z "${WORKFLOW_RETRY_VERSION:-}" ]]; then
+    WORKFLOW_RETRY_VERSION="$(workflow_retry_version)"
+  fi
+  if [[ "$record_retry" == "true" && "$new_pdf_count" =~ ^[0-9]+$ && "$new_pdf_count" -gt 0 && -f "$batch_path" ]]; then
+    record_stage_retry_for_batch \
+      "$batch_path" \
+      "publish" \
+      "release_contract_mismatch" \
+      "release_contract_mismatch" \
+      "false" \
+      "$error_summary"
+  fi
+  clear_failure_backoff_state
+  {
+    printf '知识星球研报总结：⛔ 发布版本已阻塞\n'
+    printf '执行时间：%s\n' "$DISPLAY_RUN_AT"
+    printf '状态：blocked\n'
+    printf '结果：检测到 release helper / worker 合同不兼容，已停止本轮，不会自动重试\n'
+    printf '失败原因：%s\n' "$error_summary"
+    printf '待处理：%s 篇\n' "$new_pdf_count"
+    printf '日志位置：%s\n' "$LOG_PATH"
+  } > "$RESULT_MD_PATH"
+  write_result_json "blocked" "$error_summary" "$new_pdf_count" "" "1" "$batch_path" "[]" "blocked_release" "blocked_release"
+  complete_run_status "blocked" "blocked_release" "release helper contract mismatch" "1" "blocked_release" "$batch_path" "" "" "" "" "" "$new_pdf_count" "$new_pdf_count"
+  finish_with_result 1 "blocked-release" "text" "$batch_path"
+}
+
 build_workflow_fingerprint_manifest_json() {
   local manifest_path="${ZSXQ_WORKFLOW_FINGERPRINT_MANIFEST_PATH:-}"
   if [[ -n "$manifest_path" && -f "$manifest_path" ]]; then
@@ -1682,6 +1738,8 @@ def state_semantics(raw_status: str, raw_operational_state: str) -> tuple[str, s
         return "running", "healthy"
     if raw_status == "waiting":
         return "waiting", "healthy"
+    if raw_status == "blocked" or raw_operational_state == "blocked_release":
+        return "blocked", "blocked"
     if raw_status in {"failed", "env_failed"}:
         return "failed", "blocked"
     if raw_status == "partial_success":
@@ -1838,8 +1896,24 @@ start_heartbeat() {
   stop_heartbeat
   local heartbeat_args=("$@")
   (
+    heartbeat_sleep_pid=""
+    heartbeat_shutdown() {
+      # A background shell does not automatically forward TERM to its sleep
+      # child.  Kill and reap that child explicitly so a completed run does
+      # not leave inherited stdout/stderr descriptors open.
+      trap - TERM INT EXIT
+      if [[ -n "${heartbeat_sleep_pid:-}" ]]; then
+        kill "$heartbeat_sleep_pid" 2>/dev/null || true
+        wait "$heartbeat_sleep_pid" 2>/dev/null || true
+      fi
+      exit 0
+    }
+    trap heartbeat_shutdown TERM INT EXIT
     while true; do
-      sleep 15
+      sleep 15 &
+      heartbeat_sleep_pid=$!
+      wait "$heartbeat_sleep_pid" 2>/dev/null || true
+      heartbeat_sleep_pid=""
       write_run_status "${heartbeat_args[@]}" || true
     done
   ) &
@@ -1917,7 +1991,9 @@ deferred_retry_count = int(sys.argv[25]) if str(sys.argv[25]).strip() else 0
 if status == "partial_success" and summary_ready_count == 0 and published_count == 0 and quarantined_count == 0:
     status = "failed"
 
-if status in {"failed", "env_failed"}:
+if status == "blocked" or operational_state == "blocked_release":
+    run_outcome, pipeline_health = "blocked", "blocked"
+elif status in {"failed", "env_failed"}:
     run_outcome, pipeline_health = "failed", "blocked"
 elif status == "partial_success":
     run_outcome = "partial_success"
@@ -4490,7 +4566,7 @@ publish_ready_chunks() {
     publish_group_validation_path="$TEMP_DIR/${publish_group_name}.publish.validation.json"
 
     local publish_success publish_target_doc_url publish_mode publish_key_payload_path publish_record_lookup_path publish_key
-    local publish_batch_hash publish_summary_hash publish_recovery_lookup_path same_day_lookup_path
+    local publish_batch_hash publish_summary_hash publish_recovery_lookup_path publish_recovery_error_path same_day_lookup_path
     local resume_doc_url resume_mode publish_publisher publish_preflight_error same_day_lookup_allowed
     publish_success="false"
     publish_target_doc_url="$CURRENT_DOC_URL"
@@ -4501,6 +4577,7 @@ publish_ready_chunks() {
     publish_key_payload_path="$TEMP_DIR/${publish_group_name}.publish-key.json"
     publish_record_lookup_path="$TEMP_DIR/${publish_group_name}.publish-record.json"
     publish_recovery_lookup_path="$TEMP_DIR/${publish_group_name}.publish-recovery.json"
+    publish_recovery_error_path="$TEMP_DIR/${publish_group_name}.publish-recovery.error.txt"
     same_day_lookup_path="$TEMP_DIR/${publish_group_name}.same-day-doc.json"
     publish_key=""
     publish_batch_hash=""
@@ -4533,11 +4610,13 @@ publish_ready_chunks() {
       publish_batch_hash="$(json_get_value "$publish_key_payload_path" "batch_hash")"
       publish_summary_hash="$(json_get_value "$publish_key_payload_path" "summary_hash")"
       set +e
-      lookup_publish_recovery "$publish_batch_hash" "$publish_summary_hash" "$publish_group_json_path" > "$publish_recovery_lookup_path" 2>> "$LOG_PATH"
+      lookup_publish_recovery "$publish_batch_hash" "$publish_summary_hash" "$publish_group_json_path" > "$publish_recovery_lookup_path" 2> "$publish_recovery_error_path"
       LOOKUP_RECOVERY_RC=$?
       set -e
       if [[ "$LOOKUP_RECOVERY_RC" -ne 0 ]]; then
-        publish_preflight_error="发布恢复记录查询失败"
+        PUBLISH_RECOVERY_ERROR_TEXT="$(cat "$publish_recovery_error_path" 2>/dev/null || true)"
+        printf '%s\n' "$PUBLISH_RECOVERY_ERROR_TEXT" >> "$LOG_PATH"
+        publish_preflight_error="发布恢复记录查询失败：$(summarize_failure_text "$PUBLISH_RECOVERY_ERROR_TEXT")"
       elif [[ "$(json_get_value "$publish_recovery_lookup_path" "found")" == "True" ]]; then
         local recovery_status
         recovery_status="$(json_get_value "$publish_recovery_lookup_path" "status")"
@@ -4679,6 +4758,15 @@ publish_ready_chunks() {
     FAILURE_EXIT_CODE=1
     FATAL_ENV_FAILURE="true"
     FATAL_ENV_FAILURE_SUMMARY="$FAILURE_REASON"
+    PUBLISH_RETRY_ERROR_CODE="publish_failed"
+    PUBLISH_RETRY_ERROR_TYPE="transient_failure"
+    PUBLISH_RETRYABLE="true"
+    if is_release_contract_mismatch "$LARK_CLI_PUBLISH_OUTPUT"; then
+      FATAL_RELEASE_CONTRACT_MISMATCH="true"
+      PUBLISH_RETRY_ERROR_CODE="release_contract_mismatch"
+      PUBLISH_RETRY_ERROR_TYPE="release_contract_mismatch"
+      PUBLISH_RETRYABLE="false"
+    fi
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] 第 ${publish_index}/${publish_total} 组 lark-cli docs 发布失败：${LARK_CLI_PUBLISH_OUTPUT}" >> "$LOG_PATH"
 
     if [[ "$publish_success" != "true" ]]; then
@@ -4691,7 +4779,7 @@ publish_ready_chunks() {
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] 第 ${publish_index}/${publish_total} 个发布分组飞书发布最终失败：${FAILURE_REASON}" >> "$LOG_PATH"
       record_batch_index_status "$publish_group_json_path" "feishu_failed" "$FAILURE_REASON"
       record_batch_event "$publish_group_json_path" "feishu_failed" "$FAILURE_REASON" ""
-      record_stage_retry_for_batch "$publish_group_json_path" "publish" "publish_failed" "transient_failure" "true" "$FAILURE_REASON"
+      record_stage_retry_for_batch "$publish_group_json_path" "publish" "$PUBLISH_RETRY_ERROR_CODE" "$PUBLISH_RETRY_ERROR_TYPE" "$PUBLISH_RETRYABLE" "$FAILURE_REASON"
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] 本组本地摘要已保留：" >> "$LOG_PATH"
       printf '%s\n' "$publish_group_summary_markdown_path" >> "$LOG_PATH"
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] 本组失败文件：" >> "$LOG_PATH"
@@ -4825,6 +4913,10 @@ else
     --state-file "$STATE_PATH" \
     --batch-file "$BATCH_JSON_PATH" >> "$LOG_PATH"
   NEW_PDF_COUNT="$(extract_batch_count)"
+fi
+
+if [[ -n "$RELEASE_CONTRACT_ERROR" ]]; then
+  finish_blocked_release "$BATCH_JSON_PATH" "$NEW_PDF_COUNT" "$RELEASE_CONTRACT_ERROR"
 fi
 
 if [[ "$NEW_PDF_COUNT" -eq 0 ]]; then
@@ -4993,10 +5085,14 @@ if [[ "$MANUAL_MODE" != "true" ]]; then
     --workflow-version "$WORKFLOW_RETRY_VERSION" > "$FILTER_STATUS_JSON_PATH"
   DEFERRED_RETRY_FILE_COUNT="$(json_get_value "$FILTER_STATUS_JSON_PATH" "deferred_count")"
   FILE_RETRY_NEXT_AT="$(json_get_value "$FILTER_STATUS_JSON_PATH" "next_retry_at")"
+  FILE_RETRY_ALL_TERMINAL_BLOCKED="$(json_get_value "$FILTER_STATUS_JSON_PATH" "all_deferred_terminal_blocked")"
   cp "$FILTERED_BATCH_JSON_PATH" "$ORIGINAL_BATCH_JSON_PATH"
   NEW_PDF_COUNT="$(extract_batch_count "$ORIGINAL_BATCH_JSON_PATH")"
 
   if [[ "$NEW_PDF_COUNT" -eq 0 ]]; then
+    if [[ "$FILE_RETRY_ALL_TERMINAL_BLOCKED" == "True" && -z "$FILE_RETRY_NEXT_AT" ]]; then
+      finish_blocked_release "$ORIGINAL_BATCH_JSON_PATH" "$DISCOVERED_PDF_COUNT" "all pending files are retry_exhausted or blocked_release; manual release recovery is required" "false"
+    fi
     {
       printf '知识星球研报总结：当前无可执行文件\n'
       printf '执行时间：%s\n' "$DISPLAY_RUN_AT"
@@ -5087,6 +5183,7 @@ QUARANTINED_FILE_COUNT=0
 DRY_RUN_READY_FILE_COUNT=0
 FATAL_ENV_FAILURE="false"
 FATAL_ENV_FAILURE_SUMMARY=""
+FATAL_RELEASE_CONTRACT_MISMATCH="false"
 
 SUCCESSFUL_CHUNK_JSONS=()
 PUBLISH_READY_CHUNK_JSONS=()
@@ -5735,6 +5832,25 @@ if [[ "$ACK_CHUNK_COUNT" -gt 0 && "$DRY_RUN" != "true" ]]; then
 fi
 
 HANDLED_COUNT=$((PROCESSED_FILE_COUNT + QUARANTINED_FILE_COUNT))
+
+if [[ "$FATAL_RELEASE_CONTRACT_MISMATCH" == "true" ]]; then
+  REMAINING_COUNT=$((NEW_PDF_COUNT - HANDLED_COUNT))
+  if [[ "$REMAINING_COUNT" -lt 0 ]]; then
+    REMAINING_COUNT=0
+  fi
+  BLOCKED_RELEASE_SUMMARY="$(summarize_failure_text "${FATAL_ENV_FAILURE_SUMMARY:-release contract mismatch}")"
+  clear_failure_backoff_state
+  {
+    printf '知识星球研报总结：⛔ 发布版本已阻塞\n'
+    printf '执行时间：%s\n' "$DISPLAY_RUN_AT"
+    printf '结果：本地摘要已落地 %s 篇，已发布 %s 篇，剩余 %s 篇需要在修复 release 合同后人工确认恢复\n' "$SUMMARY_READY_FILE_COUNT" "$PROCESSED_FILE_COUNT" "$REMAINING_COUNT"
+    printf '失败原因：%s\n' "$BLOCKED_RELEASE_SUMMARY"
+    printf '日志位置：%s\n' "$LOG_PATH"
+  } > "$RESULT_MD_PATH"
+  write_result_json "blocked" "$BLOCKED_RELEASE_SUMMARY" "$NEW_PDF_COUNT" "$REPORT_DOC_URL" "$FAILURE_EXIT_CODE" "${PROCESSED_ACK_BATCH_PATH:-$ORIGINAL_BATCH_JSON_PATH}" "$REPORT_DOC_URLS_JSON" "blocked_release" "blocked_release"
+  complete_run_status "blocked" "blocked_release" "release contract mismatch blocked automatic retry" "$FAILURE_EXIT_CODE" "blocked_release" "${PROCESSED_ACK_BATCH_PATH:-$ORIGINAL_BATCH_JSON_PATH}" "" "" "" "" "" "$NEW_PDF_COUNT" "$REMAINING_COUNT"
+  finish_with_result "$FAILURE_EXIT_CODE" "blocked-release" "text" "${PROCESSED_ACK_BATCH_PATH:-$ORIGINAL_BATCH_JSON_PATH}"
+fi
 
 if [[ "$FATAL_ENV_FAILURE" == "true" ]]; then
   REMAINING_COUNT=$((NEW_PDF_COUNT - HANDLED_COUNT))

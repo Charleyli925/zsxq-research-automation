@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -107,6 +108,110 @@ class ZsxqPdfDigestRunTests(unittest.TestCase):
                 """
             ),
         )
+
+    def make_release_tree(self, base: Path, *, legacy_helper: bool = False) -> Path:
+        """Create a tiny release checkout for deployment-boundary tests."""
+
+        release = base / "release"
+        digest_dir = release / "openclaw_tasks" / "zsxq_pdf_digest"
+        script_dir = release / "scripts"
+        digest_dir.mkdir(parents=True)
+        script_dir.mkdir(parents=True)
+        for source in (
+            RUN_SCRIPT,
+            RUN_WORKER_SCRIPT,
+            ROOT / "openclaw_tasks" / "zsxq_pdf_digest" / "summary_prompt.md",
+            ROOT / "openclaw_tasks" / "zsxq_pdf_digest" / "summary_system_prompt.md",
+        ):
+            destination = digest_dir / source.name
+            shutil.copy2(source, destination)
+        for source in (
+            HELPER_SCRIPT,
+            SCANNER_SCRIPT,
+            ROOT / "scripts" / "research_library_index.py",
+            ROOT / "scripts" / "build_clean_markdown.py",
+            ROOT / "scripts" / "archive_to_obsidian.py",
+            ROOT / "scripts" / "update_obsidian_indexes.py",
+            ROOT / "scripts" / "zsxq_runtime_guard.py",
+            ROOT / "scripts" / "kb_common.py",
+            ROOT / "scripts" / "runtime_paths.py",
+        ):
+            shutil.copy2(source, script_dir / source.name)
+
+        self.write_file(
+            digest_dir / "extract_pdf_text.py",
+            """#!/usr/bin/env python3
+import argparse
+import json
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--preflight-only', action='store_true')
+parser.parse_args()
+print(json.dumps({'ok': True, 'checks': []}))
+""",
+        )
+        self.write_file(
+            script_dir / "convert_with_markitdown.py",
+            """#!/usr/bin/env python3
+import argparse
+import json
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--preflight-only', action='store_true')
+parser.parse_args()
+print(json.dumps({'ok': True, 'checks': []}))
+""",
+        )
+        if legacy_helper:
+            helper_path = script_dir / "manage_zsxq_digest_batch.py"
+            helper_source = helper_path.read_text(encoding="utf-8")
+            old_contract_branch = """    if args.command == \"contract-version\":
+        return contract_version()
+"""
+            self.assertIn(old_contract_branch, helper_source)
+            helper_path.write_text(
+                helper_source.replace(
+                    old_contract_branch,
+                    """    if args.command == \"contract-version\":
+        raise SystemExit(\"legacy helper does not support contract-version\")
+""",
+                ),
+                encoding="utf-8",
+            )
+        return release
+
+    def write_release_deployment_env(
+        self,
+        runtime_dir: Path,
+        release: Path,
+        *,
+        source_overrides: dict[str, Path] | None = None,
+    ) -> None:
+        paths: dict[str, Path] = {
+            "AUTOMATION_ROOT": release,
+            "HELPER_SCRIPT_PATH": release / "scripts" / "manage_zsxq_digest_batch.py",
+            "SCANNER_SCRIPT_PATH": release / "scripts" / "scan_new_zsxq_pdfs.py",
+            "RESEARCH_LIBRARY_INDEX_SCRIPT_PATH": release / "scripts" / "research_library_index.py",
+            "MARKITDOWN_SCRIPT_PATH": release / "scripts" / "convert_with_markitdown.py",
+            "CLEAN_MARKDOWN_SCRIPT_PATH": release / "scripts" / "build_clean_markdown.py",
+            "OBSIDIAN_ARCHIVE_SCRIPT_PATH": release / "scripts" / "archive_to_obsidian.py",
+            "OBSIDIAN_INDEX_SCRIPT_PATH": release / "scripts" / "update_obsidian_indexes.py",
+            "RUNTIME_GUARD_SCRIPT_PATH": release / "scripts" / "zsxq_runtime_guard.py",
+        }
+        if source_overrides:
+            paths.update(source_overrides)
+        content = "\n".join(f'{key}="{value}"' for key, value in paths.items()) + "\n"
+        self.write_file(runtime_dir / "deployment.env", content)
+
+    def initialize_release_git(self, release: Path) -> None:
+        for command in (
+            ["git", "init", "-q", str(release)],
+            ["git", "-C", str(release), "config", "user.email", "test@example.com"],
+            ["git", "-C", str(release), "config", "user.name", "Test User"],
+            ["git", "-C", str(release), "add", "."],
+            ["git", "-C", str(release), "commit", "-qm", "test release"],
+        ):
+            subprocess.run(command, check=True, capture_output=True, text=True)
 
     def create_openclaw_stub(self, bin_dir: Path) -> Path:
         bin_dir.mkdir(parents=True, exist_ok=True)
@@ -3541,6 +3646,7 @@ class ZsxqPdfDigestRunTests(unittest.TestCase):
             call_lines = (runtime_dir / "openclaw_calls.jsonl").read_text(encoding="utf-8").splitlines()
             calls = [json.loads(line) for line in call_lines if line.strip()]
             self.assertEqual(len(calls), 1)
+
             self.assertEqual(calls[0]["filename"], "token-failure-a.pdf")
 
             churned_auth_payload = {
@@ -3581,6 +3687,163 @@ class ZsxqPdfDigestRunTests(unittest.TestCase):
             call_lines = (runtime_dir / "openclaw_calls.jsonl").read_text(encoding="utf-8").splitlines()
             calls = [json.loads(line) for line in call_lines if line.strip()]
             self.assertEqual(len(calls), 1)
+
+    def test_release_contract_preflight_blocks_an_old_helper_before_summary_or_feishu(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            runtime_dir = base / "runtime_task"
+            runtime_dir.mkdir()
+            release = self.make_release_tree(base, legacy_helper=True)
+            self.initialize_release_git(release)
+            watch_root = base / "watch_root"
+            watch_root.mkdir()
+            (watch_root / "legacy-helper.pdf").write_bytes(b"%PDF-1.4\n%legacy\n")
+            download_task_dir = base / "download_task"
+            download_task_dir.mkdir()
+            bin_dir = base / "bin"
+            self.create_openclaw_stub(bin_dir)
+
+            self.write_runtime_config(
+                runtime_dir / "config.env",
+                watch_root=watch_root,
+                download_task_dir=download_task_dir,
+                quiet_window_minutes=0,
+            )
+            self.write_file(
+                runtime_dir / "watch_state.json",
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "known_files": {},
+                        "pending_files": {},
+                        "known_sha256s": {},
+                        "pending_sha256s": {},
+                    }
+                )
+                + "\n",
+            )
+            self.write_release_deployment_env(runtime_dir, release)
+            (runtime_dir / "run.sh").symlink_to(release / "openclaw_tasks" / "zsxq_pdf_digest" / "run.sh")
+
+            env = os.environ.copy()
+            env["HOME"] = str(base / "home")
+            env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+            env["OPENCLAW_STUB_LOG"] = str(runtime_dir / "openclaw_calls.jsonl")
+            completed = subprocess.run(
+                ["bash", str(runtime_dir / "run.sh"), "--no-notify"],
+                cwd=runtime_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+            result = json.loads((runtime_dir / "last_result.json").read_text(encoding="utf-8"))
+            status = json.loads((runtime_dir / "run_status.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["operational_state"], "blocked_release")
+            self.assertEqual(result["pipeline_health"], "blocked")
+            self.assertIn("contract-version", result["message"])
+            self.assertEqual(status["status"], "blocked")
+            self.assertEqual(status["phase"], "blocked_release")
+            self.assertIsNone(status["waiting_reason"])
+            self.assertIsNone(status["next_retry_at"])
+            ledger = json.loads((runtime_dir / "stage_retry_ledger.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(ledger["entries"]), 1)
+            entry = next(iter(ledger["entries"].values()))
+            self.assertEqual(entry["status"], "blocked_release")
+            self.assertEqual(entry["failure_count"], 1)
+            self.assertIsNone(entry["next_retry_at"])
+            self.assertFalse((runtime_dir / "openclaw_calls.jsonl").exists())
+            self.assertFalse((runtime_dir / "lark_docs_calls.jsonl").exists())
+
+    def test_all_terminal_stage_retries_report_blocked_not_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            runtime_dir = base / "runtime_task"
+            runtime_dir.mkdir()
+            release = self.make_release_tree(base)
+            watch_root = base / "watch_root"
+            watch_root.mkdir()
+            (watch_root / "terminal-retry.pdf").write_bytes(b"%PDF-1.4\n%terminal\n")
+            download_task_dir = base / "download_task"
+            download_task_dir.mkdir()
+            bin_dir = base / "bin"
+            self.create_openclaw_stub(bin_dir)
+
+            self.write_runtime_config(
+                runtime_dir / "config.env",
+                watch_root=watch_root,
+                download_task_dir=download_task_dir,
+                quiet_window_minutes=0,
+            )
+            self.write_file(
+                runtime_dir / "watch_state.json",
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "known_files": {},
+                        "pending_files": {},
+                        "known_sha256s": {},
+                        "pending_sha256s": {},
+                    }
+                )
+                + "\n",
+            )
+            self.write_release_deployment_env(runtime_dir, release)
+            (runtime_dir / "run.sh").symlink_to(release / "openclaw_tasks" / "zsxq_pdf_digest" / "run.sh")
+
+            env = os.environ.copy()
+            env["HOME"] = str(base / "home")
+            env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+            env["OPENCLAW_STUB_LOG"] = str(runtime_dir / "openclaw_calls.jsonl")
+            first = subprocess.run(
+                ["bash", str(runtime_dir / "run.sh"), "--no-notify"],
+                cwd=runtime_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
+            ledger_path = runtime_dir / "stage_retry_ledger.json"
+            self.assertTrue(
+                ledger_path.exists(),
+                first.stdout
+                + first.stderr
+                + "\n"
+                + (runtime_dir / "cron.log").read_text(encoding="utf-8", errors="replace"),
+            )
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(ledger["entries"]), 1)
+            for entry in ledger["entries"].values():
+                entry["status"] = "retry_exhausted"
+                entry["next_retry_at"] = None
+            ledger_path.write_text(json.dumps(ledger, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+            self.initialize_release_git(release)
+            second = subprocess.run(
+                ["bash", str(runtime_dir / "run.sh"), "--no-notify"],
+                cwd=runtime_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+
+            result = json.loads((runtime_dir / "last_result.json").read_text(encoding="utf-8"))
+            status = json.loads((runtime_dir / "run_status.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["phase"], "blocked_release")
+            self.assertEqual(result["pipeline_health"], "blocked")
+            self.assertEqual(status["status"], "blocked")
+            self.assertEqual(status["phase"], "blocked_release")
+            self.assertIsNone(status["waiting_reason"])
+            self.assertIsNone(status["next_retry_at"])
+            self.assertNotIn("waiting_file_retry", (runtime_dir / "last_result.json").read_text(encoding="utf-8"))
+            self.assertFalse((runtime_dir / "openclaw_calls.jsonl").exists())
 
 
 if __name__ == "__main__":

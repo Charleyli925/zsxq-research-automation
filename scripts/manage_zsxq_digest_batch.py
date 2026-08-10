@@ -38,6 +38,42 @@ except ModuleNotFoundError:  # pragma: no cover
 SUMMARY_PREFIX = "ZSXQ_SUMMARY_JSON:"
 SUMMARY_CACHE_VERSION = os.environ.get("ZSXQ_SUMMARY_CACHE_VERSION", "2026-03-28-v1").strip() or "2026-03-28-v1"
 MAX_SUMMARY_INPUT_LINE_CHARS = 1200
+CONTRACT_VERSION = "zsxq-digest-batch/v1"
+
+
+def contract_descriptor() -> dict[str, Any]:
+    """Return the small, stable interface surface the runtime validates.
+
+    This deliberately describes only commands called across the run.sh/worker
+    boundary.  It lets a newly deployed worker fail closed before it invokes a
+    helper from an older checkout with a subtly incompatible argparse schema.
+    """
+
+    return {
+        "schema_version": 1,
+        "contract_version": CONTRACT_VERSION,
+        "commands": {
+            "lookup-publish-recovery": {
+                "arguments": [
+                    "--records-file",
+                    "--batch-hash",
+                    "--summary-hash",
+                    "--batch-file",
+                ],
+            },
+            "record-stage-retry": {
+                "arguments": [
+                    "--batch-file",
+                    "--ledger-file",
+                    "--stage",
+                    "--workflow-version",
+                    "--error-code",
+                    "--error-type",
+                    "--retryable",
+                ],
+            },
+        },
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -209,6 +245,25 @@ def parse_args() -> argparse.Namespace:
     retry_status_parser.add_argument("--ledger-file", required=True)
     retry_status_parser.add_argument("--workflow-version", required=True)
 
+    subparsers.add_parser(
+        "contract-version",
+        help="Print the machine-readable helper contract used by run.sh preflight.",
+    )
+
+    recover_retry_parser = subparsers.add_parser(
+        "recover-stage-retries",
+        help="Preview or explicitly audit a release-scoped recovery of terminal stage retries.",
+    )
+    recover_retry_parser.add_argument("--ledger-file", required=True)
+    recover_retry_parser.add_argument("--stage", required=True)
+    recover_retry_parser.add_argument("--error-code", required=True)
+    recover_retry_parser.add_argument("--from-workflow-version", required=True)
+    recover_retry_parser.add_argument("--to-workflow-version", required=True)
+    recover_retry_parser.add_argument("--error-fingerprint", required=True)
+    recover_retry_parser.add_argument("--expected-count", type=int, required=True)
+    recover_retry_parser.add_argument("--run-at", required=True)
+    recover_retry_parser.add_argument("--apply", action="store_true")
+
     outbox_enqueue_parser = subparsers.add_parser(
         "notification-outbox-enqueue",
         help="Atomically enqueue one idempotent notification transition.",
@@ -316,11 +371,13 @@ def load_retry_ledger(path: Path) -> dict[str, Any]:
     entries = payload.get("entries") if isinstance(payload, dict) else {}
     if not isinstance(entries, dict):
         entries = {}
-    return {
-        "schema_version": 1,
-        "updated_at": str(payload.get("updated_at", "")).strip() if isinstance(payload, dict) else "",
-        "entries": entries,
-    }
+    result = dict(payload) if isinstance(payload, dict) else {}
+    result["schema_version"] = 1
+    result["updated_at"] = str(payload.get("updated_at", "")).strip() if isinstance(payload, dict) else ""
+    result["entries"] = entries
+    audits = result.get("recovery_audit")
+    result["recovery_audit"] = audits if isinstance(audits, list) else []
+    return result
 
 
 def retry_entry_key(file_sha256: str, stage: str, error_code: str, workflow_version: str) -> str:
@@ -347,6 +404,30 @@ def retry_delays(raw: str) -> list[int]:
         if value > 0:
             values.append(value)
     return values or [5, 10, 20]
+
+
+def normalize_retry_error_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def retry_error_fingerprint(
+    *,
+    stage: str,
+    error_code: str,
+    error_type: str,
+    message: str,
+) -> str:
+    """Build a deterministic, non-secret selector for one failure shape."""
+
+    payload = {
+        "stage": str(stage or "").strip(),
+        "error_code": str(error_code or "").strip(),
+        "error_type": str(error_type or "").strip(),
+        "message": normalize_retry_error_text(message),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def record_stage_retry(
@@ -397,7 +478,10 @@ def record_stage_retry(
         previous = entries.get(entry_key) if isinstance(entries.get(entry_key), dict) else {}
         failure_count = int(previous.get("failure_count", 0) or 0) + 1
         next_retry_at: str | None = None
-        if not retryable and error_type == "content_failure":
+        if error_type == "release_contract_mismatch" or error_code == "release_contract_mismatch":
+            status = "blocked_release"
+            retryable = False
+        elif not retryable and error_type == "content_failure":
             status = "needs_transform"
         elif not retryable:
             status = "needs_review"
@@ -417,6 +501,12 @@ def record_stage_retry(
             "error_code": error_code,
             "error_type": error_type,
             "message": message[:1000],
+            "error_fingerprint": retry_error_fingerprint(
+                stage=stage,
+                error_code=error_code,
+                error_type=error_type,
+                message=message,
+            ),
             "retryable": retryable,
             "status": status,
             "workflow_version": workflow_version,
@@ -547,6 +637,9 @@ def filter_stage_retries(
             continue
         status = str(entry.get("status", "")).strip()
         next_retry_raw = str(entry.get("next_retry_at") or "").strip()
+        if status == "recovery_released":
+            eligible.append(item)
+            continue
         if status == "retry_pending" and next_retry_raw:
             try:
                 if parse_datetime(next_retry_raw) <= now:
@@ -577,12 +670,20 @@ def filter_stage_retries(
         for item in deferred
         if str(item.get("next_retry_at") or "").strip()
     ]
+    terminal_blocked = [
+        item
+        for item in deferred
+        if item["status"] in {"retry_exhausted", "blocked_release"}
+        and not item.get("next_retry_at")
+    ]
     print(
         json.dumps(
             {
                 "eligible_count": len(eligible),
                 "deferred_count": len(deferred),
                 "next_retry_at": min(next_retry_values) if next_retry_values else None,
+                "terminal_blocked_count": len(terminal_blocked),
+                "all_deferred_terminal_blocked": bool(deferred) and len(terminal_blocked) == len(deferred),
                 "deferred": deferred,
             },
             ensure_ascii=False,
@@ -617,6 +718,213 @@ def stage_retry_status(ledger_file: Path, workflow_version: str) -> int:
             ensure_ascii=False,
         )
     )
+    return 0
+
+
+def contract_version() -> int:
+    print(json.dumps(contract_descriptor(), ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def recover_stage_retries(
+    ledger_file: Path,
+    *,
+    stage: str,
+    error_code: str,
+    from_workflow_version: str,
+    to_workflow_version: str,
+    error_fingerprint: str,
+    expected_count: int,
+    run_at: str,
+    apply: bool,
+) -> int:
+    """Safely release a verified legacy failure set after a code deployment.
+
+    The original retry entries remain intact.  A successful apply creates one
+    ``recovery_released`` entry per file under the target workflow version and
+    appends a durable audit record.  This gives the new workflow an explicit,
+    consumable release token without rewriting history.  Preview and count
+    mismatches are strictly read only; save_json performs the single atomic
+    write for an accepted apply.
+    """
+
+    stage = str(stage or "").strip()
+    error_code = str(error_code or "").strip()
+    from_workflow_version = str(from_workflow_version or "").strip()
+    to_workflow_version = str(to_workflow_version or "").strip()
+    error_fingerprint = str(error_fingerprint or "").strip().lower()
+    if not all((stage, error_code, from_workflow_version, to_workflow_version, error_fingerprint)):
+        raise SystemExit("stage, error code, workflow versions, and error fingerprint are required")
+    if not re.fullmatch(r"[0-9a-f]{64}", error_fingerprint):
+        raise SystemExit("error fingerprint must be a lowercase SHA-256 hex value")
+    if expected_count < 0:
+        raise SystemExit("expected count must be non-negative")
+    if from_workflow_version == to_workflow_version:
+        raise SystemExit("from and to workflow versions must differ for release recovery")
+
+    ledger = load_retry_ledger(ledger_file)
+    matching: list[dict[str, Any]] = []
+    for key, raw_entry in (ledger.get("entries") or {}).items():
+        if not isinstance(raw_entry, dict):
+            continue
+        entry = dict(raw_entry)
+        if str(entry.get("stage", "")).strip() != stage:
+            continue
+        if str(entry.get("error_code", "")).strip() != error_code:
+            continue
+        if str(entry.get("workflow_version", "")).strip() != from_workflow_version:
+            continue
+        actual_fingerprint = str(entry.get("error_fingerprint", "")).strip().lower()
+        if not actual_fingerprint:
+            actual_fingerprint = retry_error_fingerprint(
+                stage=str(entry.get("stage", "")),
+                error_code=str(entry.get("error_code", "")),
+                error_type=str(entry.get("error_type", "")),
+                message=str(entry.get("message", "")),
+            )
+        if actual_fingerprint != error_fingerprint:
+            continue
+        if str(entry.get("status", "")).strip() not in {"retry_exhausted", "blocked_release"}:
+            continue
+        entry["entry_key"] = str(entry.get("entry_key") or key)
+        matching.append(entry)
+
+    matching.sort(key=lambda item: str(item.get("entry_key", "")))
+    target_entries: list[dict[str, Any]] = []
+    for source_entry in matching:
+        target_entry_key = retry_entry_key(
+            str(source_entry.get("file_sha256", "")).strip(),
+            stage,
+            error_code,
+            to_workflow_version,
+        )
+        target_entries.append(
+            {
+                "entry_key": target_entry_key,
+                "file_sha256": str(source_entry.get("file_sha256", "")).strip(),
+                "path": str(source_entry.get("path", "")).strip(),
+                "filename": str(source_entry.get("filename", "")).strip(),
+                "stage": stage,
+                "error_code": error_code,
+                "error_type": str(source_entry.get("error_type", "")).strip(),
+                "message": str(source_entry.get("message", "")).strip()[:1000],
+                "error_fingerprint": error_fingerprint,
+                "retryable": True,
+                "status": "recovery_released",
+                "workflow_version": to_workflow_version,
+                "extractor_profile": source_entry.get("extractor_profile") or None,
+                "failure_count": 0,
+                "max_attempts": max(int(source_entry.get("max_attempts", 4) or 4), 1),
+                "first_failed_at": None,
+                "last_failed_at": None,
+                "next_retry_at": None,
+                "resolved_at": None,
+                "recovered_from_entry_key": source_entry["entry_key"],
+            }
+        )
+    recovery_key = hashlib.sha256(
+        json.dumps(
+            {
+                "stage": stage,
+                "error_code": error_code,
+                "from_workflow_version": from_workflow_version,
+                "to_workflow_version": to_workflow_version,
+                "error_fingerprint": error_fingerprint,
+                "entry_keys": [entry["entry_key"] for entry in matching],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    existing_audit = next(
+        (
+            item
+            for item in ledger.get("recovery_audit", [])
+            if isinstance(item, dict) and str(item.get("recovery_key", "")).strip() == recovery_key
+        ),
+        None,
+    )
+    entries = dict(ledger.get("entries") or {})
+    target_entry_keys = [entry["entry_key"] for entry in target_entries]
+    duplicate_target_keys = sorted(
+        {key for key in target_entry_keys if target_entry_keys.count(key) > 1}
+    )
+    target_conflicts = sorted({key for key in target_entry_keys if key in entries} | set(duplicate_target_keys))
+    payload = {
+        "mode": "apply" if apply else "preview",
+        "stage": stage,
+        "error_code": error_code,
+        "from_workflow_version": from_workflow_version,
+        "to_workflow_version": to_workflow_version,
+        "error_fingerprint": error_fingerprint,
+        "expected_count": expected_count,
+        "matched_count": len(matching),
+        "recovery_key": recovery_key,
+        "entry_keys": [entry["entry_key"] for entry in matching],
+        "target_entry_keys": target_entry_keys,
+        "duplicate_target_keys": duplicate_target_keys,
+        "target_conflicts": target_conflicts,
+        "already_applied": existing_audit is not None,
+        "ledger_written": False,
+    }
+    if not apply:
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if len(matching) != expected_count:
+        payload["error"] = "expected_count_mismatch"
+        print(json.dumps(payload, ensure_ascii=False))
+        return 2
+    if existing_audit is not None:
+        audited_targets = [
+            str(key).strip()
+            for key in existing_audit.get("target_entry_keys", [])
+            if str(key).strip()
+        ]
+        target_entries_intact = (
+            audited_targets == target_entry_keys
+            and all(
+                isinstance(entries.get(target_key), dict)
+                and str(entries[target_key].get("recovery_key", "")).strip() == recovery_key
+                and str(entries[target_key].get("recovered_from_entry_key", "")).strip()
+                == source_entry["entry_key"]
+                for target_key, source_entry in zip(target_entry_keys, matching)
+            )
+        )
+        if not target_entries_intact:
+            payload["error"] = "incomplete_or_conflicting_prior_recovery"
+            print(json.dumps(payload, ensure_ascii=False))
+            return 2
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if target_conflicts:
+        payload["error"] = "target_workflow_entry_conflict"
+        print(json.dumps(payload, ensure_ascii=False))
+        return 2
+
+    audit = {
+        "recovery_key": recovery_key,
+        "applied_at": run_at,
+        "stage": stage,
+        "error_code": error_code,
+        "from_workflow_version": from_workflow_version,
+        "to_workflow_version": to_workflow_version,
+        "error_fingerprint": error_fingerprint,
+        "expected_count": expected_count,
+        "matched_count": len(matching),
+        "entry_keys": [entry["entry_key"] for entry in matching],
+        "target_entry_keys": target_entry_keys,
+        "action": "release_to_new_workflow",
+    }
+    for entry in target_entries:
+        entry["recovery_key"] = recovery_key
+        entries[entry["entry_key"]] = entry
+    ledger["entries"] = entries
+    ledger["recovery_audit"] = [*ledger.get("recovery_audit", []), audit]
+    ledger["updated_at"] = run_at
+    save_json(ledger_file, ledger)
+    payload["ledger_written"] = True
+    print(json.dumps(payload, ensure_ascii=False))
     return 0
 
 
@@ -2584,6 +2892,9 @@ def materialize_summary_cache(
 def main() -> int:
     args = parse_args()
 
+    if args.command == "contract-version":
+        return contract_version()
+
     if args.command == "split":
         return split_batch(
             batch_file=Path(args.batch_file).expanduser().resolve(),
@@ -2769,6 +3080,19 @@ def main() -> int:
         return stage_retry_status(
             ledger_file=Path(args.ledger_file).expanduser().resolve(),
             workflow_version=args.workflow_version.strip(),
+        )
+
+    if args.command == "recover-stage-retries":
+        return recover_stage_retries(
+            ledger_file=Path(args.ledger_file).expanduser().resolve(),
+            stage=args.stage.strip(),
+            error_code=args.error_code.strip(),
+            from_workflow_version=args.from_workflow_version.strip(),
+            to_workflow_version=args.to_workflow_version.strip(),
+            error_fingerprint=args.error_fingerprint.strip(),
+            expected_count=args.expected_count,
+            run_at=args.run_at.strip(),
+            apply=bool(args.apply),
         )
 
     if args.command == "notification-outbox-enqueue":
