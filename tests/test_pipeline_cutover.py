@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from zsxq_pipeline.cli import _parser
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -29,3 +31,19 @@ def test_repository_hygiene_covers_unified_active_runtime_paths():
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_only_unified_execution_entrypoints_are_shipped():
+    parser = _parser()
+    command_action = next(action for action in parser._actions if getattr(action, "choices", None))
+    commands = set(command_action.choices)
+    assert "download" not in commands
+    assert "process" not in commands
+
+    assert not (ROOT / "openclaw_tasks" / "zsxq_download" / "run.sh").exists()
+    assert not (ROOT / "openclaw_tasks" / "zsxq_pdf_digest" / "run.sh").exists()
+    assert not (ROOT / "deploy" / "install_local_runtime.sh").exists()
+    assert not (ROOT / "scripts" / "run_zsxq_download_pipeline.py").exists()
+    assert [path.name for path in (ROOT / "deploy" / "launchd").glob("*.plist.template")] == [
+        "zsxq-pipeline.plist.template"
+    ]

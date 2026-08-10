@@ -37,9 +37,12 @@ OCR_DOCUMENT_TIMEOUT_SECONDS = int(os.environ.get("OCR_DOCUMENT_TIMEOUT_SECONDS"
 OCR_RENDER_TIMEOUT_SECONDS = int(os.environ.get("OCR_RENDER_TIMEOUT_SECONDS", "90"))
 OCR_TESSERACT_TIMEOUT_SECONDS = int(os.environ.get("OCR_TESSERACT_TIMEOUT_SECONDS", "120"))
 OCR_PDFINFO_TIMEOUT_SECONDS = int(os.environ.get("OCR_PDFINFO_TIMEOUT_SECONDS", "20"))
-# 这里故意不 resolve，这样脚本通过软链接运行时，默认运行目录还是任务目录。
-TASK_DIR = Path(os.path.abspath(__file__)).parent
-TEXT_CACHE_DIR = Path(os.environ.get("TEXT_EXTRACT_CACHE_DIR", str(TASK_DIR / "text_cache"))).expanduser()
+# The unified worker always supplies TEXT_EXTRACT_CACHE_DIR.  Isolated imports
+# and developer preflights fall back to the system temporary directory so they
+# can never write runtime artifacts into the source checkout.
+TEXT_CACHE_DIR = Path(
+    os.environ.get("TEXT_EXTRACT_CACHE_DIR", str(Path(tempfile.gettempdir()) / "zsxq-pipeline-text-cache"))
+).expanduser()
 
 
 def ensure_tmpdir() -> str:

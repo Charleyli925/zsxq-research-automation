@@ -19,13 +19,10 @@ zsxq-pipeline = "zsxq_pipeline.cli:main"
 browser = [
   "playwright>=1.50,<2"
 ]
-pdf = [
-  "markitdown[pdf]==0.1.5"
-]
 dev = [
   "pytest>=8,<9",
-  "playwright>=1.50,<2",
-  "markitdown[pdf]==0.1.5"
+  "ruff>=0.12,<1",
+  "playwright>=1.50,<2"
 ]
 
 [tool.setuptools]

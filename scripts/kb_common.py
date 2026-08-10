@@ -1685,7 +1685,7 @@ def render_theme_dashboard(theme: str, notes: list[NoteRecord], all_notes: list[
     subthemes = subtheme_distribution(notes)
     focus_terms = theme_focus_terms(theme)
     lines = [
-        f"## 最近新增",
+        "## 最近新增",
         *recent_report_lines(notes, 10, focus_terms),
         "",
         "## 高相关报告",
@@ -1707,7 +1707,7 @@ def render_theme_dashboard(theme: str, notes: list[NoteRecord], all_notes: list[
         *recent_report_lines(low_conf, 10),
         "",
         "## 全量检索入口",
-        f"- [[Reports.base|Reports Base]]",
+        "- [[Reports.base|Reports Base]]",
         f"- `python3 scripts/kb_search.py \"{theme}\" --theme \"{theme}\"`",
         "",
         f"## 自动收录报告（{len(notes)}）",

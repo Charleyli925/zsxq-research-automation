@@ -68,18 +68,23 @@ UNIFIED_RUNTIME_PATTERNS = {
     "development checkout absolute path": re.compile(r"/(?:Users|home)/[^/\s]+/(?:Developer|Documents)/", re.IGNORECASE),
 }
 
+RETIRED_RUNTIME_PATHS = {
+    Path("openclaw_tasks"),
+    Path("deploy/install_local_runtime.sh"),
+    Path("deploy/launchd/zsxq-autodownload.plist.template"),
+    Path("deploy/launchd/zsxq-domestic-cicc.plist.template"),
+    Path("scripts/run_zsxq_download_pipeline.py"),
+}
+
 
 def is_active_download_runtime(relative: Path) -> bool:
     rendered = relative.as_posix()
-    return rendered.startswith("openclaw_tasks/zsxq_download/") or rendered in {
+    return rendered in {
         "scripts/scan_zsxq_download_candidates.py",
         "scripts/download_zsxq_plan_file.py",
         "scripts/finalize_download_batch.py",
-        "scripts/zsxq_preflight.py",
-        "scripts/run_zsxq_download_pipeline.py",
         "src/zsxq_pipeline/browser.py",
         "src/zsxq_pipeline/download.py",
-        "deploy/install_local_runtime.sh",
     }
 
 
@@ -91,6 +96,9 @@ def is_active_unified_runtime(relative: Path) -> bool:
         "src/zsxq_pipeline/lock.py",
         "src/zsxq_pipeline/scheduler.py",
         "src/zsxq_pipeline/worker.py",
+        "src/zsxq_pipeline/process.py",
+        "src/zsxq_pipeline/extract.py",
+        "src/zsxq_pipeline/extractor_worker.py",
         "scripts/run_zsxq_pipeline.py",
         "deploy/install_pipeline_runtime.py",
         "deploy/launchd/zsxq-pipeline.plist.template",
@@ -122,8 +130,16 @@ def iter_repository_files(root: Path = ROOT) -> list[Path]:
 
 
 def main() -> int:
-    violations: list[str] = []
-    for path in iter_repository_files():
+    repository_files = iter_repository_files()
+    violations = [
+        f"{relative}: retired runtime entrypoint must not be restored"
+        for relative in sorted(RETIRED_RUNTIME_PATHS)
+        if any(
+            path.relative_to(ROOT) == relative or relative in path.relative_to(ROOT).parents
+            for path in repository_files
+        )
+    ]
+    for path in repository_files:
         relative = path.relative_to(ROOT)
         if path.name in FORBIDDEN_FILENAMES and not path.name.endswith(".example"):
             violations.append(f"{relative}: local environment file")

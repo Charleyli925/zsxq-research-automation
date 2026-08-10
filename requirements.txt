@@ -1,3 +1,2 @@
 PyYAML>=6.0,<7
 playwright>=1.50,<2
-markitdown[pdf]==0.1.5

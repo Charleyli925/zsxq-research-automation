@@ -1,16 +1,12 @@
-"""Bounded adapter around the existing PDF text extractor.
+"""Bounded adapter around the package-owned PDF text extractor.
 
-The OCR and quality-gate implementation is deliberately kept in
-``openclaw_tasks/zsxq_pdf_digest/extract_pdf_text.py`` for this migration.
-This module gives the new pipeline a typed, subprocess-only boundary around
-that implementation: the legacy script receives an isolated manifest copy,
-the original manifest is replaced atomically only after its output validates,
-and legacy error strings are converted into the state core's error categories.
+The OCR and quality-gate implementation runs as an isolated subprocess.  It
+receives a staging manifest, the original manifest is replaced atomically only
+after its output validates, and stable extractor errors are converted into the
+state core's error categories.
 
-It intentionally does *not* import the legacy extractor.  Importing it would
-make process-global environment and OCR settings part of the Python worker and
-would duplicate the exact OCR implementation that the migration is meant to
-reuse unchanged.
+It intentionally does *not* import the extractor worker.  Importing it would
+make process-global environment and OCR settings part of the scheduler process.
 """
 
 from __future__ import annotations
@@ -60,15 +56,10 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def legacy_extractor_path() -> Path:
-    """Return the source-controlled legacy extractor used during PR4.
+def extractor_worker_path() -> Path:
+    """Return the release-owned extractor worker shipped with the package."""
 
-    A caller may still pass an explicit path (notably release packaging and
-    tests), but silently looking up a task directory in ``$HOME`` would revive
-    the mutable OpenClaw deployment dependency that PR4 removes.
-    """
-
-    return _repo_root() / "openclaw_tasks" / "zsxq_pdf_digest" / "extract_pdf_text.py"
+    return Path(__file__).with_name("extractor_worker.py")
 
 
 def sha256_file(path: str | Path) -> str:
@@ -129,7 +120,7 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def classify_extraction_failure(error_type: object, *, default: ErrorCategory = ErrorCategory.INVARIANT) -> ErrorCategory:
-    """Translate the legacy extractor's stable failure families.
+    """Translate the extractor's stable failure families.
 
     The old shell worker called unavailable binaries and temporary-directory
     failures ``env_failure``.  In the state core those are release-contract
@@ -298,7 +289,7 @@ class ExtractorAdapter:
     ) -> None:
         if int(timeout_seconds) <= 0:
             raise ValueError("timeout_seconds must be positive")
-        self.script_path = Path(script_path) if script_path is not None else legacy_extractor_path()
+        self.script_path = Path(script_path) if script_path is not None else extractor_worker_path()
         self.python_executable = str(python_executable or sys.executable)
         self.timeout_seconds = int(timeout_seconds)
         self.environment = dict(environment or {})
@@ -450,7 +441,7 @@ __all__ = [
     "ExtractionValidationError",
     "ExtractorAdapter",
     "classify_extraction_failure",
-    "legacy_extractor_path",
+    "extractor_worker_path",
     "record_extracted_text_artifact",
     "sha256_file",
     "validate_extracted_manifest",

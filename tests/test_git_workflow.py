@@ -62,7 +62,6 @@ class GitWorkflowTests(unittest.TestCase):
                 "tests/test_pipeline_download.py",
                 "tests/test_pipeline_download_result.py",
                 "tests/test_scan_zsxq_download_candidates.py",
-                "tests/test_zsxq_preflight.py",
             ],
         )
         self.assertEqual(select_test_targets(ROOT, ["src/zsxq_pipeline/config.py"]), ["tests/test_pipeline_cli.py"])

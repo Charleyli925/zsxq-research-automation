@@ -18,6 +18,6 @@ only after those gates pass. `--cutover` is explicitly required before the
 installer unloads supplied legacy agents or disables supplied cron fragments.
 See `../docs/deployment.md` and `../docs/cutover-runbook.md`.
 
-`install_local_runtime.sh` and the two old launchd templates are retained only
-for pre-cutover migration/rollback evidence. Do not use them for a new unified
-installation and do not run them beside the new LaunchAgent.
+The retired multi-scheduler installer, task wrappers, and old LaunchAgent
+templates are no longer shipped. Rollback switches only between reviewed
+unified releases and never recreates the retired cron/LaunchAgent topology.

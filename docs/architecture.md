@@ -2,17 +2,16 @@
 
 ## 1. Download planning
 
-`zsxq-pipeline download` opens one authenticated Chrome for Testing CDP
-session, freezes a time window, and writes a versioned immutable allow-list
-under the runtime root. `scan_zsxq_download_candidates.py` remains a
-diagnostic-compatible scanner; keyword matching, duplicates, and source-state
-failures are still decided before download execution.
+For each claimed source window, `PipelineWorker` opens one authenticated Chrome
+for Testing CDP session and writes a versioned immutable allow-list under the
+runtime root. `scan_zsxq_download_candidates.py` supplies the deterministic
+scanner implementation; keyword matching, duplicates, and source-state
+failures are decided before download execution.
 
 ## 2. Plan-bound download
 
 `DownloadPipeline` uses that one browser session to visit each exact planned
-topic sequentially. `download_zsxq_plan_file.py` retains a one-file diagnostic
-CLI, while its page-level function waits for asynchronous state, fails closed
+topic sequentially. The page-level downloader waits for asynchronous state, fails closed
 on source content protection, validates PDF bytes, and atomically places the
 file in staging. No model, agent, browser MCP, or dynamic package installation
 is involved.

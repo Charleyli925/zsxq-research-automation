@@ -39,9 +39,8 @@ class SourceConfig:
     cft_start_url: str = ""
     cft_headless: bool = True
     cft_window_size: str = "1440,1200"
-    # Scheduling is opt-in per source.  An empty tuple keeps a source
-    # available for explicit ``download`` runs without making a periodic tick
-    # discover work for it.
+    # Scheduling is opt-in per source.  An empty tuple keeps an imported source
+    # available for durable backlog recovery without creating new windows.
     schedule_times: tuple[str, ...] = ()
     max_catchup_seconds: int | None = None
 
@@ -88,13 +87,15 @@ class LarkConfig:
 
 @dataclass(frozen=True, slots=True)
 class PipelineSettingsConfig:
-    """Stable extraction, concurrency, and publication-grouping settings."""
+    """Stable processing, local projection, and publication settings."""
 
     extractor_version: str
     summary_max_workers: int
     doc_group_size: int
     doc_group_threshold: int
     max_files_per_document: int
+    research_library_root: Path | None
+    obsidian_vault_root: Path | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,6 +352,8 @@ def _parse_pipeline_settings(raw: Any) -> PipelineSettingsConfig:
             "doc_group_size",
             "doc_group_threshold",
             "max_files_per_document",
+            "research_library_root",
+            "obsidian_vault_root",
         },
     )
     extractor_version = str(table.get("extractor_version", "")).strip()
@@ -370,6 +373,12 @@ def _parse_pipeline_settings(raw: Any) -> PipelineSettingsConfig:
         doc_group_size=group_size,
         doc_group_threshold=group_threshold,
         max_files_per_document=max_files,
+        research_library_root=_optional_absolute_path(
+            table.get("research_library_root"), field="pipeline.research_library_root"
+        ),
+        obsidian_vault_root=_optional_absolute_path(
+            table.get("obsidian_vault_root"), field="pipeline.obsidian_vault_root"
+        ),
     )
 
 

@@ -290,5 +290,5 @@ class BrowserSession:
             if expected and not any(item in text or item in title for item in expected):
                 return BrowserDoctorResult(False, "zsxq_page_state_unrecognized", "unrecognized")
             return BrowserDoctorResult(True, "ok", "ready")
-        except (PlaywrightError, OSError, RuntimeError) as exc:
+        except (PlaywrightError, OSError, RuntimeError):
             return BrowserDoctorResult(False, "zsxq_page_unavailable", "unavailable")

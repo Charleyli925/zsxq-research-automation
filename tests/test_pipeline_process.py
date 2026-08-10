@@ -221,7 +221,6 @@ def _config(runtime: Path) -> ProcessConfig:
         summary_cache_root=runtime / "summary_cache",
         work_root=runtime / "work",
         batch_path=runtime / "pending_batch.json",
-        watch_state_path=runtime / "watch_state.json",
         result_path=runtime / "last_result.json",
         result_markdown_path=runtime / "last_result.md",
         run_status_path=runtime / "run_status.json",
@@ -534,71 +533,6 @@ def test_content_failure_is_quarantined_without_blocking_a_good_pdf(tmp_path):
     assert outcome.published == 1
     quarantine = json.loads((runtime / "quarantine.json").read_text(encoding="utf-8"))
     assert quarantine["entries"][0]["filename"] == bad.name
-
-
-def test_scanner_batch_acknowledges_only_when_each_pdf_is_published_or_quarantined(tmp_path, monkeypatch):
-    runtime = tmp_path / "runtime"
-    runtime.mkdir()
-    good = tmp_path / "good.pdf"
-    bad = tmp_path / "bad.pdf"
-    good.write_bytes(b"good")
-    bad.write_bytes(b"bad")
-    processor = DigestProcessor(
-        _config(runtime),
-        extractor=FakeExtractor(failed_names={bad.name}),
-        provider=FakeProvider(),
-        publisher=FakePublisher(),
-        notifier=FakeNotifier(),
-        clock=lambda: NOW,
-    )
-    scanner_calls: list[bool] = []
-    acknowledgements: list[str] = []
-
-    def fake_scan(*, include_existing: bool) -> None:
-        scanner_calls.append(include_existing)
-        _batch(processor.config.batch_path, [good, bad])
-
-    def fake_ack() -> None:
-        acknowledgements.append("ack")
-
-    monkeypatch.setattr(processor, "_scan_batch", fake_scan)
-    monkeypatch.setattr(processor, "_ack_scanner_batch", fake_ack)
-
-    outcome = processor.run(ProcessRequest())
-
-    assert outcome.status == "partial"
-    assert outcome.quarantined == 1
-    assert outcome.published == 1
-    assert scanner_calls == [False]
-    assert acknowledgements == ["ack"]
-
-
-def test_scanner_batch_does_not_ack_a_transient_publish_failure(tmp_path, monkeypatch):
-    runtime = tmp_path / "runtime"
-    runtime.mkdir()
-    pdf = tmp_path / "report.pdf"
-    pdf.write_bytes(b"fixture PDF")
-    processor = DigestProcessor(
-        _config(runtime),
-        extractor=FakeExtractor(),
-        provider=FakeProvider(),
-        publisher=FailingPublisher(),
-        notifier=FakeNotifier(),
-        clock=lambda: NOW,
-    )
-    acknowledgements: list[str] = []
-
-    def fake_scan(*, include_existing: bool) -> None:
-        _batch(processor.config.batch_path, [pdf])
-
-    monkeypatch.setattr(processor, "_scan_batch", fake_scan)
-    monkeypatch.setattr(processor, "_ack_scanner_batch", lambda: acknowledgements.append("ack"))
-
-    outcome = processor.run(ProcessRequest())
-
-    assert outcome.status == "partial"
-    assert outcome.published == 0
-    assert acknowledgements == []
 
 
 def test_later_empty_batch_drains_notification_outbox_without_new_pipeline_work(tmp_path):
