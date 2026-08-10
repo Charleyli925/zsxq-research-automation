@@ -16,15 +16,12 @@
       "enum": ["success", "failed"]
     },
     "handled_count": {
-      "type": "integer",
-      "minimum": 0
+      "type": "integer"
     },
     "handled_paths": {
       "type": "array",
-      "uniqueItems": true,
       "items": {
-        "type": "string",
-        "minLength": 1
+        "type": "string"
       }
     },
     "summaries": {
@@ -34,17 +31,16 @@
         "additionalProperties": false,
         "required": ["path", "filename", "title", "quality_hint", "markdown"],
         "properties": {
-          "path": {"type": "string", "minLength": 1},
-          "filename": {"type": "string", "minLength": 1},
-          "title": {"type": "string", "minLength": 1},
+          "path": {"type": "string"},
+          "filename": {"type": "string"},
+          "title": {"type": "string"},
           "quality_hint": {"type": "string"},
-          "markdown": {"type": "string", "minLength": 1}
+          "markdown": {"type": "string"}
         }
       }
     },
     "error": {
-      "type": ["string", "null"],
-      "minLength": 1
+      "type": ["string", "null"]
     }
   }
 }

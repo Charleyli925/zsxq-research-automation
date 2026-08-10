@@ -166,6 +166,9 @@ def test_summary_schema_asset_forbids_free_form_root_and_entry_fields():
     assert "oneOf" not in schema
     assert set(schema["required"]) == {"status", "handled_count", "handled_paths", "summaries", "error"}
     assert schema["properties"]["error"]["type"] == ["string", "null"]
+    assert "uniqueItems" not in schema["properties"]["handled_paths"]
+    assert "minimum" not in schema["properties"]["handled_count"]
+    assert "minLength" not in json.dumps(schema)
     assert set(schema["properties"]["summaries"]["items"]["required"]) == {
         "path",
         "filename",
