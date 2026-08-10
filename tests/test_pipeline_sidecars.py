@@ -4,8 +4,10 @@ import hashlib
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from zsxq_pipeline.model import SummaryIdentity
-from zsxq_pipeline.sidecars import ArtifactSidecars
+from zsxq_pipeline.sidecars import ArtifactSidecars, SidecarError
 from zsxq_pipeline.summary import PersistedSummary, SummaryArtifactPaths, SummaryEntry
 
 
@@ -54,3 +56,22 @@ def test_sidecar_helpers_share_one_runtime_owned_library_database(tmp_path):
     assert commands[0][commands[0].index("--database") + 1] == str(database)
     assert commands[1][commands[1].index("--database") + 1] == str(database)
     assert commands[2][commands[2].index("--library-database") + 1] == str(database)
+
+
+def test_archive_rejects_a_partial_helper_result(tmp_path):
+    sidecars = ArtifactSidecars(
+        library_root=tmp_path / "ResearchLibrary",
+        library_database=tmp_path / "runtime" / "state" / "research-library.sqlite",
+        vault_root=tmp_path / "ResearchVault",
+        work_root=tmp_path / "runtime" / "work",
+    )
+    source = tmp_path / "report.pdf"
+    item = {"path": str(source), "filename": source.name}
+
+    with mock.patch.object(ArtifactSidecars, "_run", return_value={"archived_count": 0}):
+        with pytest.raises(SidecarError, match="completed 0 of 1"):
+            sidecars.archive_published_group(
+                entries=(SimpleNamespace(path=str(source)),),
+                batch_items={str(source): item},
+                document_url="https://example.com/doc",
+            )

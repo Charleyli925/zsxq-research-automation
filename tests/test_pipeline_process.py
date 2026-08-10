@@ -11,7 +11,7 @@ from zsxq_pipeline.publish import PublicationError
 from zsxq_pipeline.process import DigestProcessor, ProcessConfig, ProcessRequest
 from zsxq_pipeline.providers.codex import CodexTimeoutError
 from zsxq_pipeline.state import PipelineState
-from zsxq_pipeline.sidecars import SidecarArchiveResult
+from zsxq_pipeline.sidecars import SidecarArchiveResult, SidecarError
 
 
 NOW = datetime(2026, 8, 10, 2, 3, 4, tzinfo=timezone.utc)
@@ -194,6 +194,19 @@ class FakeSidecars:
 
     def archive_published_group(self, *, entries, batch_items, document_url):
         self.archives.append((tuple(entry.path for entry in entries), document_url))
+        return SidecarArchiveResult(archived_count=len(entries))
+
+
+class FailingOnceSidecars(FakeSidecars):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.failures_remaining = 1
+
+    def archive_published_group(self, *, entries, batch_items, document_url):
+        self.archives.append((tuple(entry.path for entry in entries), document_url))
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise SidecarError("temporary local projection failure")
         return SidecarArchiveResult(archived_count=len(entries))
 
 
@@ -422,6 +435,62 @@ def test_partial_publish_stage_recovery_completes_only_the_unacknowledged_pdf(tm
         attempt = state.get_stage_attempt(document.id, Stage.PUBLISH, "publish:daily:new")
         assert attempt is not None
         assert attempt["state"] == StageState.SUCCEEDED.value
+
+
+def test_successful_lark_publication_retries_only_the_failed_local_projection(tmp_path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    pdf = tmp_path / "report.pdf"
+    pdf.write_bytes(b"fixture PDF")
+    sidecars = FailingOnceSidecars(tmp_path)
+    publisher = FakePublisher()
+    first = DigestProcessor(
+        _config(runtime),
+        extractor=FakeExtractor(),
+        provider=FakeProvider(),
+        publisher=publisher,
+        notifier=FakeNotifier(),
+        sidecars=sidecars,
+        clock=lambda: NOW,
+    )
+
+    first_outcome = first.run(ProcessRequest(batch_file=_batch(tmp_path / "first.json", [pdf])))
+
+    assert first_outcome.status == "partial"
+    assert first_outcome.published == 1
+    assert len(publisher.created) == 1
+    with PipelineState.open(runtime / "state" / "pipeline.sqlite3") as state:
+        attempt = state._connection.execute(
+            "SELECT state, error_code FROM stage_attempts WHERE stage=?", (Stage.PUBLISH.value,)
+        ).fetchone()
+        assert attempt is not None
+        assert attempt["state"] == StageState.RETRY_WAIT.value
+        assert attempt["error_code"] == "local_projection_failed"
+
+    retry_publisher = FakePublisher()
+    retry = DigestProcessor(
+        _config(runtime),
+        extractor=FakeExtractor(fail_if_called=True),
+        provider=FakeProvider(fail_if_called=True),
+        publisher=retry_publisher,
+        notifier=FakeNotifier(),
+        sidecars=sidecars,
+        clock=lambda: NOW + timedelta(minutes=5),
+    )
+    retry_outcome = retry.run(ProcessRequest(batch_file=_batch(tmp_path / "retry.json", [pdf])))
+
+    assert retry_outcome.status == "success"
+    assert retry_outcome.published == 1
+    assert retry_publisher.created == []
+    assert retry_publisher.appended == []
+    assert len(sidecars.archives) == 2
+    with PipelineState.open(runtime / "state" / "pipeline.sqlite3") as state:
+        attempt = state._connection.execute(
+            "SELECT state, error_code FROM stage_attempts WHERE stage=?", (Stage.PUBLISH.value,)
+        ).fetchone()
+        assert attempt is not None
+        assert attempt["state"] == StageState.SUCCEEDED.value
+        assert attempt["error_code"] == ""
 
 
 def test_extractor_profile_mismatch_blocks_the_release_contract(tmp_path):

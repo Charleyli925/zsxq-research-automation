@@ -17,3 +17,6 @@ All notable changes will be documented here.
 - Routed every ResearchLibrary and Obsidian sidecar through one explicit SQLite
   index inside the runtime root so the unified LaunchAgent avoids macOS
   Documents-folder TCC denials.
+- Kept the publish-stage lease recoverable until every local projection is
+  complete, so a sidecar failure retries locally without writing the verified
+  Feishu document a second time.

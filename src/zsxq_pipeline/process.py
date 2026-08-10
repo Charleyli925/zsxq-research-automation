@@ -61,7 +61,7 @@ from .publish import (
     resolve_same_day_capacity_target,
 )
 from .state import PipelineState
-from .sidecars import ArtifactSidecars
+from .sidecars import ArtifactSidecars, SidecarError
 from .summary import (
     PersistedSummary,
     SummaryCacheCorruptionError,
@@ -391,7 +391,7 @@ def _failure_category(error: Exception) -> ErrorCategory:
     text = str(error).lower()
     if any(token in text for token in ("auth", "unauthorized", "forbidden", "token", "keychain", "permission")):
         return ErrorCategory.AUTH
-    if isinstance(error, (CodexExecutionError, ExtractionError, SummaryError, PublicationError)):
+    if isinstance(error, (CodexExecutionError, ExtractionError, SummaryError, PublicationError, SidecarError)):
         return ErrorCategory.TRANSIENT
     return ErrorCategory.INVARIANT
 
@@ -537,7 +537,6 @@ class DigestProcessor:
                     queue_notifications=self.config.notifications_enabled and not request.no_notify,
                 )
                 failures.extend(publish_failures)
-                failures.extend(self._archive_published_sidecars(batch, publication_records))
                 _write_json(batch_path, batch)
                 if publication_records and self.config.notifications_enabled and not request.no_notify:
                     if failures and self.config.target_chat_id:
@@ -1116,38 +1115,39 @@ class DigestProcessor:
         item["summary_cache_path"] = str(persisted.paths.markdown_path)
         item["summary_cache_key"] = persisted.identity.cache_key
 
-    def _archive_published_sidecars(
+    def _archive_published_sidecar(
         self,
         batch: Mapping[str, Any],
-        records: Sequence[tuple[Any, Any]],
-    ) -> list[str]:
-        """Refresh Obsidian only after a publication is durably successful."""
+        group: Any,
+        publication: Any,
+    ) -> None:
+        """Refresh one local projection while its publish-stage lease is held."""
 
-        failures: list[str] = []
+        if getattr(self.sidecars, "enabled", True) is False:
+            return
         batch_items = {
             str(item["path"]): item
             for item in batch["files"]
             if isinstance(item, dict) and str(item.get("path", ""))
         }
-        for group, publication in records:
-            reference = str(publication.remote_reference or "").strip()
-            if not reference:
-                failures.append(f"Obsidian {group.title}: successful publication had no document URL")
-                continue
-            try:
-                result = self.sidecars.archive_published_group(
-                    entries=group.entries,
-                    batch_items=batch_items,
-                    document_url=reference,
-                )
-                if result.manifest_path is not None and result.manifest_path.is_file():
-                    payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
-                    for item in payload.get("files", []):
-                        if isinstance(item, Mapping) and str(item.get("path", "")) in batch_items:
-                            batch_items[str(item["path"])].update(dict(item))
-            except Exception as exc:
-                failures.append(f"Obsidian {group.title}: {exc}")
-        return failures
+        reference = str(publication.remote_reference or "").strip()
+        if not reference:
+            raise SidecarError(f"Obsidian {group.title}: successful publication had no document URL")
+        result = self.sidecars.archive_published_group(
+            entries=group.entries,
+            batch_items=batch_items,
+            document_url=reference,
+        )
+        expected_count = len(group.entries)
+        if result.archived_count != expected_count:
+            raise SidecarError(
+                f"Obsidian {group.title}: expected {expected_count} archived notes, got {result.archived_count}"
+            )
+        if result.manifest_path is not None and result.manifest_path.is_file():
+            payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+            for item in payload.get("files", []):
+                if isinstance(item, Mapping) and str(item.get("path", "")) in batch_items:
+                    batch_items[str(item["path"])].update(dict(item))
 
     def _summary_output_paths(self, identity: SummaryIdentity) -> tuple[Path, Path]:
         root = self.config.work_root / "summary-batches"
@@ -1230,8 +1230,6 @@ class DigestProcessor:
                         self._queue_document_notifications(state, ((effective_group, publication),), run_id)
                     except Exception as exc:
                         failures.append(f"notify {effective_group.title}: unable to enqueue document notice: {exc}")
-                for claim in owned_claims:
-                    state.complete_stage(claim, now=self.clock())
                 published += 1
                 records.append((effective_group, publication))
             except Exception as exc:
@@ -1245,6 +1243,23 @@ class DigestProcessor:
                         error_detail=str(exc),
                     )
                 failures.append(f"publish {effective_group.title}: {exc}")
+                continue
+            try:
+                self._archive_published_sidecar(batch, effective_group, publication)
+            except Exception as exc:
+                category = _failure_category(exc)
+                for claim in owned_claims:
+                    self._fail_stage(
+                        state,
+                        claim,
+                        category=category,
+                        error_code="local_projection_failed",
+                        error_detail=str(exc),
+                    )
+                failures.append(f"Obsidian {effective_group.title}: {exc}")
+                continue
+            for claim in owned_claims:
+                state.complete_stage(claim, now=self.clock())
         return published, failures, tuple(records)
 
     def _queue_document_notifications(self, state: PipelineState, records: Sequence[tuple[Any, Any]], run_id: str) -> None:
