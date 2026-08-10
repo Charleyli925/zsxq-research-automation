@@ -1,0 +1,35 @@
+# This file is a shape-only example. Keep real paths, source IDs, credentials,
+# chat IDs, browser profiles, and local research content out of Git.
+schema_version = 1
+
+[runtime]
+# Must be an absolute local runtime root. All state paths below must remain
+# inside it; paths such as ../pipeline.sqlite3 are rejected.
+root = "/absolute/path/to/zsxq-pipeline-runtime"
+database = "state/pipeline.sqlite3"
+
+[schedule]
+timezone = "Asia/Shanghai"
+
+[model]
+name = "logical-summary-model"
+provider = "logical-provider"
+prompt_version = "summary-v1"
+
+[sources.foreign_reports]
+kind = "zsxq"
+state_path = "state/foreign_reports.json"
+
+[sources.domestic_cicc]
+kind = "zsxq"
+state_path = "state/domestic_cicc.json"
+
+[publish_targets.daily_digest]
+kind = "lark"
+target = "logical-daily-digest"
+
+[legacy]
+# Only `legacy plan` reads this path, and it reads JSON/JSONL/SQLite state
+# without changing it. It is intentionally outside runtime.root in most
+# migrations.
+root = "/absolute/path/to/legacy-zsxq-runtime"

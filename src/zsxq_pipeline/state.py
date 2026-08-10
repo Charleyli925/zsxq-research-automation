@@ -1,0 +1,1128 @@
+"""Transactional API for the pipeline's single SQLite state authority.
+
+Workers use this module instead of assembling SQL or writing parallel JSON
+checkpoints.  The API is intentionally small and every mutating operation
+uses a short ``BEGIN IMMEDIATE`` transaction.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+import unicodedata
+import uuid
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Self
+
+from . import SCHEMA_VERSION
+from ._time import require_aware, to_iso_epoch, utc_now
+from .model import (
+    ArtifactRecord,
+    DocumentRecord,
+    ErrorCategory,
+    NotificationRecord,
+    PipelineHealth,
+    PublicationRecord,
+    PublicationState,
+    Stage,
+    StageClaim,
+    StageState,
+    as_error_category,
+    as_stage,
+    as_stage_state,
+    canonical_json_value,
+)
+from .schema import assert_compatible, connect, installed_schema_version, migrate
+
+
+class StateError(RuntimeError):
+    """Base class for a state transition rejected by the durable contract."""
+
+
+class StateNotMigratedError(StateError):
+    """The caller attempted business work before ``db migrate`` completed."""
+
+
+class InvariantViolation(StateError):
+    """A unique identity or monotonic transition would be violated."""
+
+
+class LeaseLostError(StateError):
+    """A worker attempted to finish work after its exclusive lease was lost."""
+
+
+class UnknownDocumentError(StateError):
+    """A stage or artifact references a document that does not exist."""
+
+
+_SHA256_LENGTH = 64
+def _json(value: Mapping[str, Any] | None) -> str:
+    return json.dumps(canonical_json_value(dict(value or {})), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _normalize_filename(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", Path(value).stem)
+    compact = "".join(character.casefold() for character in normalized if character.isalnum())
+    return compact or normalized.casefold()
+
+
+def _canonical_path(value: str | Path) -> str:
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    return str(Path(raw).expanduser().resolve(strict=False))
+
+
+def _validate_sha256(value: str | None, *, field: str, required: bool = False) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        if required:
+            raise ValueError(f"{field} is required")
+        return None
+    if len(text) != _SHA256_LENGTH or any(character not in "0123456789abcdef" for character in text):
+        raise ValueError(f"{field} must be a lowercase SHA256 digest")
+    return text
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _timestamp(value: datetime | None) -> tuple[datetime, str, int]:
+    instant = require_aware(value) if value is not None else utc_now()
+    iso, epoch = to_iso_epoch(instant)
+    return instant, iso, epoch
+
+
+def _row_document(row: sqlite3.Row) -> DocumentRecord:
+    return DocumentRecord(
+        id=int(row["id"]),
+        source=str(row["source"]),
+        source_file_id=str(row["source_file_id"]),
+        filename=str(row["filename"]),
+        normalized_filename=str(row["normalized_filename"]),
+        source_path=str(row["source_path"]),
+        artifact_id=int(row["artifact_id"]) if row["artifact_id"] is not None else None,
+    )
+
+
+def _row_artifact(row: sqlite3.Row) -> ArtifactRecord:
+    return ArtifactRecord(
+        id=int(row["id"]),
+        kind=str(row["kind"]),
+        pdf_sha256=str(row["pdf_sha256"]) if row["pdf_sha256"] else None,
+        content_sha256=str(row["content_sha256"]) if row["content_sha256"] else None,
+        canonical_path=str(row["canonical_path"]),
+        extractor_version=str(row["extractor_version"]),
+        prompt_version=str(row["prompt_version"]),
+        model=str(row["model"]),
+    )
+
+
+class PipelineState:
+    """A local SQLite state store with explicit, monotonic transition methods."""
+
+    def __init__(self, path: Path, connection: sqlite3.Connection) -> None:
+        self.path = Path(path).expanduser().resolve(strict=False)
+        self._connection = connection
+
+    @classmethod
+    def open(cls, path: str | Path) -> Self:
+        """Open a database and reject a schema newer than this package supports.
+
+        Opening an empty database is harmless; callers must explicitly call
+        :meth:`migrate` before reading or writing pipeline entities.
+        """
+
+        resolved = Path(path).expanduser().resolve(strict=False)
+        connection = connect(resolved)
+        try:
+            assert_compatible(connection)
+        except Exception:
+            connection.close()
+            raise
+        return cls(resolved, connection)
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+    @property
+    def schema_version(self) -> int:
+        return installed_schema_version(self._connection)
+
+    def migrate(self) -> int:
+        return migrate(self._connection)
+
+    def _require_migrated(self) -> None:
+        version = assert_compatible(self._connection)
+        if version != SCHEMA_VERSION:
+            raise StateNotMigratedError(
+                f"pipeline database schema is {version}; run `zsxq-pipeline db migrate` before state operations"
+            )
+
+    @contextmanager
+    def _write_transaction(self) -> Iterator[None]:
+        self._require_migrated()
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    def register_source_window(
+        self,
+        source: str,
+        window_start: datetime,
+        window_end: datetime,
+        *,
+        status: str = "planned",
+        checkpoint_eligible: bool = False,
+        now: datetime | None = None,
+    ) -> int:
+        source = str(source).strip()
+        if not source:
+            raise ValueError("source is required")
+        _, start_iso, start_epoch = _timestamp(window_start)
+        _, end_iso, end_epoch = _timestamp(window_end)
+        if end_epoch < start_epoch:
+            raise ValueError("window_end must not be before window_start")
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            self._connection.execute(
+                """
+                INSERT INTO source_windows(
+                  source, window_start_iso, window_start_epoch, window_end_iso, window_end_epoch,
+                  status, checkpoint_eligible, created_at_iso, created_at_epoch, updated_at_iso, updated_at_epoch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source, window_start_epoch, window_end_epoch) DO UPDATE SET
+                  status=excluded.status,
+                  checkpoint_eligible=excluded.checkpoint_eligible,
+                  updated_at_iso=excluded.updated_at_iso,
+                  updated_at_epoch=excluded.updated_at_epoch
+                """,
+                (
+                    source,
+                    start_iso,
+                    start_epoch,
+                    end_iso,
+                    end_epoch,
+                    str(status).strip() or "planned",
+                    int(bool(checkpoint_eligible)),
+                    now_iso,
+                    now_epoch,
+                    now_iso,
+                    now_epoch,
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT id FROM source_windows WHERE source = ? AND window_start_epoch = ? AND window_end_epoch = ?",
+                (source, start_epoch, end_epoch),
+            ).fetchone()
+        assert row is not None
+        return int(row["id"])
+
+    def upsert_document(
+        self,
+        source: str,
+        source_file_id: str,
+        *,
+        filename: str = "",
+        normalized_filename: str | None = None,
+        source_path: str | Path = "",
+        source_window_id: int | None = None,
+        now: datetime | None = None,
+    ) -> DocumentRecord:
+        source = str(source).strip()
+        source_file_id = str(source_file_id).strip()
+        if not source or not source_file_id:
+            raise ValueError("source and source_file_id are required")
+        filename = str(filename).strip()
+        normalized = str(normalized_filename).strip() if normalized_filename is not None else _normalize_filename(filename)
+        canonical_source_path = _canonical_path(source_path)
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            if source_window_id is not None:
+                found_window = self._connection.execute(
+                    "SELECT 1 FROM source_windows WHERE id = ?", (int(source_window_id),)
+                ).fetchone()
+                if found_window is None:
+                    raise InvariantViolation(f"source window {source_window_id} does not exist")
+            self._connection.execute(
+                """
+                INSERT INTO documents(
+                  source, source_file_id, source_window_id, filename, normalized_filename, source_path,
+                  created_at_iso, created_at_epoch, updated_at_iso, updated_at_epoch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source, source_file_id) DO UPDATE SET
+                  source_window_id=COALESCE(excluded.source_window_id, documents.source_window_id),
+                  filename=CASE WHEN excluded.filename <> '' THEN excluded.filename ELSE documents.filename END,
+                  normalized_filename=CASE
+                    WHEN excluded.normalized_filename <> '' THEN excluded.normalized_filename
+                    ELSE documents.normalized_filename
+                  END,
+                  source_path=CASE WHEN excluded.source_path <> '' THEN excluded.source_path ELSE documents.source_path END,
+                  updated_at_iso=excluded.updated_at_iso,
+                  updated_at_epoch=excluded.updated_at_epoch
+                """,
+                (
+                    source,
+                    source_file_id,
+                    source_window_id,
+                    filename,
+                    normalized,
+                    canonical_source_path,
+                    now_iso,
+                    now_epoch,
+                    now_iso,
+                    now_epoch,
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM documents WHERE source = ? AND source_file_id = ?", (source, source_file_id)
+            ).fetchone()
+        assert row is not None
+        return _row_document(row)
+
+    def get_document(self, document_id: int) -> DocumentRecord:
+        self._require_migrated()
+        row = self._connection.execute("SELECT * FROM documents WHERE id = ?", (int(document_id),)).fetchone()
+        if row is None:
+            raise UnknownDocumentError(f"document {document_id} does not exist")
+        return _row_document(row)
+
+    def record_artifact(
+        self,
+        document_id: int,
+        *,
+        kind: str,
+        path: str | Path,
+        pdf_sha256: str | None = None,
+        content_sha256: str | None = None,
+        extractor_version: str = "",
+        prompt_version: str = "",
+        model: str = "",
+        size_bytes: int | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> ArtifactRecord:
+        """Attach one artifact to a document without collapsing source identities.
+
+        A PDF digest represents content identity and is unique.  Two source
+        documents may reference it, but a single canonical path may never be
+        silently reassigned to different content.
+        """
+
+        kind = str(kind).strip().lower()
+        if not kind:
+            raise ValueError("artifact kind is required")
+        canonical_path = _canonical_path(path)
+        if not canonical_path:
+            raise ValueError("artifact path is required")
+        materialized_path = Path(canonical_path)
+        pdf_digest = _validate_sha256(pdf_sha256, field="pdf_sha256")
+        content_digest = _validate_sha256(content_sha256, field="content_sha256")
+        if kind == "pdf" and pdf_digest is None:
+            if materialized_path.exists() and materialized_path.is_file():
+                pdf_digest = _hash_file(materialized_path)
+            else:
+                raise ValueError("pdf artifacts require pdf_sha256 when the file is not available")
+        if content_digest is None:
+            content_digest = pdf_digest
+        extractor_version = str(extractor_version).strip()
+        prompt_version = str(prompt_version).strip()
+        model = str(model).strip()
+        if kind == "summary" and (pdf_digest is None or not extractor_version or not prompt_version or not model):
+            raise ValueError("summary artifacts require pdf_sha256, extractor_version, prompt_version, and model")
+        if size_bytes is not None and int(size_bytes) < 0:
+            raise ValueError("size_bytes must not be negative")
+        _, now_iso, now_epoch = _timestamp(now)
+        metadata_value = dict(metadata or {})
+        metadata_value["observed_paths"] = sorted(
+            {str(item) for item in metadata_value.get("observed_paths", []) if str(item).strip()} | {canonical_path}
+        )
+        with self._write_transaction():
+            document = self._connection.execute("SELECT * FROM documents WHERE id = ?", (int(document_id),)).fetchone()
+            if document is None:
+                raise UnknownDocumentError(f"document {document_id} does not exist")
+            if kind == "pdf" and pdf_digest is not None:
+                artifact = self._connection.execute(
+                    "SELECT * FROM artifacts WHERE kind = 'pdf' AND pdf_sha256 = ?", (pdf_digest,)
+                ).fetchone()
+            elif kind == "summary" and pdf_digest is not None:
+                artifact = self._connection.execute(
+                    """
+                    SELECT * FROM artifacts
+                    WHERE kind = 'summary' AND pdf_sha256 = ? AND extractor_version = ?
+                      AND prompt_version = ? AND model = ?
+                    """,
+                    (pdf_digest, extractor_version, prompt_version, model),
+                ).fetchone()
+            else:
+                artifact = self._connection.execute(
+                    """
+                    SELECT * FROM artifacts
+                    WHERE kind = ? AND content_sha256 IS ? AND canonical_path = ?
+                    ORDER BY id LIMIT 1
+                    """,
+                    (kind, content_digest, canonical_path),
+                ).fetchone()
+            if artifact is None:
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO artifacts(
+                      kind, pdf_sha256, content_sha256, extractor_version, prompt_version, model,
+                      canonical_path, size_bytes, metadata_json,
+                      created_at_iso, created_at_epoch, updated_at_iso, updated_at_epoch
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        kind,
+                        pdf_digest,
+                        content_digest,
+                        extractor_version,
+                        prompt_version,
+                        model,
+                        canonical_path,
+                        int(size_bytes) if size_bytes is not None else None,
+                        _json(metadata_value),
+                        now_iso,
+                        now_epoch,
+                        now_iso,
+                        now_epoch,
+                    ),
+                )
+                artifact_id = int(cursor.lastrowid)
+                artifact = self._connection.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
+            else:
+                artifact_id = int(artifact["id"])
+                if (
+                    kind == "summary"
+                    and content_digest is not None
+                    and artifact["content_sha256"] is not None
+                    and str(artifact["content_sha256"]) != content_digest
+                ):
+                    raise InvariantViolation(
+                        "one summary identity produced conflicting content; create a new workflow version instead"
+                    )
+                existing_metadata: dict[str, Any]
+                try:
+                    decoded = json.loads(str(artifact["metadata_json"]))
+                    existing_metadata = decoded if isinstance(decoded, dict) else {}
+                except (TypeError, ValueError):
+                    existing_metadata = {}
+                observed = {str(item) for item in existing_metadata.get("observed_paths", []) if str(item).strip()}
+                observed.update(metadata_value["observed_paths"])
+                existing_metadata.update(metadata_value)
+                existing_metadata["observed_paths"] = sorted(observed)
+                self._connection.execute(
+                    """
+                    UPDATE artifacts SET content_sha256=COALESCE(content_sha256, ?),
+                      size_bytes=COALESCE(size_bytes, ?), metadata_json=?, updated_at_iso=?, updated_at_epoch=?
+                    WHERE id=?
+                    """,
+                    (content_digest, int(size_bytes) if size_bytes is not None else None, _json(existing_metadata), now_iso, now_epoch, artifact_id),
+                )
+                artifact = self._connection.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
+
+            conflicts = self._connection.execute(
+                """
+                SELECT id FROM documents
+                WHERE source_path = ? AND artifact_id IS NOT NULL AND artifact_id <> ?
+                """,
+                (canonical_path, artifact_id),
+            ).fetchall()
+            if conflicts:
+                raise InvariantViolation(
+                    f"path {canonical_path} already identifies different content; refusing silent artifact replacement"
+                )
+            current_artifact_id = int(document["artifact_id"]) if document["artifact_id"] is not None else None
+            current_path = str(document["source_path"] or "")
+            if current_artifact_id is not None and current_artifact_id != artifact_id and current_path == canonical_path:
+                raise InvariantViolation(
+                    f"document {document_id} would replace content at the same path without an explicit revision"
+                )
+            if kind == "pdf":
+                self._connection.execute(
+                    """
+                    UPDATE documents SET artifact_id=?, source_path=?, updated_at_iso=?, updated_at_epoch=? WHERE id=?
+                    """,
+                    (artifact_id, canonical_path, now_iso, now_epoch, int(document_id)),
+                )
+        assert artifact is not None
+        return _row_artifact(artifact)
+
+    def ensure_stage(
+        self,
+        document_id: int,
+        stage: Stage | str,
+        workflow_version: str,
+        *,
+        available_at: datetime | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """Create one future stage output identity without overwriting an existing one."""
+
+        normalized_stage = as_stage(stage)
+        workflow_version = str(workflow_version).strip()
+        if not workflow_version:
+            raise ValueError("workflow_version is required")
+        _, now_iso, now_epoch = _timestamp(now)
+        available_iso: str | None = None
+        available_epoch: int | None = None
+        if available_at is not None:
+            _, available_iso, available_epoch = _timestamp(available_at)
+        with self._write_transaction():
+            if self._connection.execute("SELECT 1 FROM documents WHERE id = ?", (int(document_id),)).fetchone() is None:
+                raise UnknownDocumentError(f"document {document_id} does not exist")
+            self._connection.execute(
+                """
+                INSERT INTO stage_attempts(
+                  document_id, stage, workflow_version, state, available_at_iso, available_at_epoch,
+                  created_at_iso, created_at_epoch, updated_at_iso, updated_at_epoch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id, stage, workflow_version) DO NOTHING
+                """,
+                (
+                    int(document_id),
+                    normalized_stage.value,
+                    workflow_version,
+                    StageState.QUEUED.value,
+                    available_iso,
+                    available_epoch,
+                    now_iso,
+                    now_epoch,
+                    now_iso,
+                    now_epoch,
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT id FROM stage_attempts WHERE document_id=? AND stage=? AND workflow_version=?",
+                (int(document_id), normalized_stage.value, workflow_version),
+            ).fetchone()
+        assert row is not None
+        return int(row["id"])
+
+    def claim_due_stage(
+        self,
+        stage: Stage | str,
+        workflow_version: str,
+        *,
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+    ) -> StageClaim | None:
+        """Atomically claim one runnable stage, including expired crash leases."""
+
+        normalized_stage = as_stage(stage)
+        workflow_version = str(workflow_version).strip()
+        if not workflow_version:
+            raise ValueError("workflow_version is required")
+        if int(lease_seconds) <= 0:
+            raise ValueError("lease_seconds must be positive")
+        current, now_iso, now_epoch = _timestamp(now)
+        expiry = current + timedelta(seconds=int(lease_seconds))
+        _, expiry_iso, expiry_epoch = _timestamp(expiry)
+        with self._write_transaction():
+            self._connection.execute("DELETE FROM leases WHERE expires_at_epoch <= ?", (now_epoch,))
+            row = self._connection.execute(
+                """
+                SELECT stage_attempts.*, documents.source, documents.source_file_id
+                FROM stage_attempts
+                JOIN documents ON documents.id = stage_attempts.document_id
+                WHERE stage_attempts.stage = ? AND stage_attempts.workflow_version = ?
+                  AND (
+                    (stage_attempts.state = ? AND (stage_attempts.available_at_epoch IS NULL OR stage_attempts.available_at_epoch <= ?))
+                    OR (stage_attempts.state = ? AND stage_attempts.available_at_epoch <= ?)
+                    OR (stage_attempts.state = ? AND (
+                      stage_attempts.lease_expires_at_epoch IS NULL OR stage_attempts.lease_expires_at_epoch <= ?
+                    ))
+                  )
+                ORDER BY
+                  CASE stage_attempts.state
+                    WHEN 'queued' THEN 0
+                    WHEN 'retry_wait' THEN 1
+                    ELSE 2
+                  END,
+                  COALESCE(stage_attempts.available_at_epoch, 0),
+                  stage_attempts.id
+                LIMIT 1
+                """,
+                (
+                    normalized_stage.value,
+                    workflow_version,
+                    StageState.QUEUED.value,
+                    now_epoch,
+                    StageState.RETRY_WAIT.value,
+                    now_epoch,
+                    StageState.RUNNING.value,
+                    now_epoch,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+            token = uuid.uuid4().hex
+            attempt_id = int(row["id"])
+            self._connection.execute(
+                """
+                UPDATE stage_attempts
+                SET state=?, attempt_count=attempt_count + 1, lease_token=?, lease_expires_at_iso=?,
+                    lease_expires_at_epoch=?, updated_at_iso=?, updated_at_epoch=?
+                WHERE id=?
+                """,
+                (
+                    StageState.RUNNING.value,
+                    token,
+                    expiry_iso,
+                    expiry_epoch,
+                    now_iso,
+                    now_epoch,
+                    attempt_id,
+                ),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO leases(
+                  lease_key, stage_attempt_id, owner_token, acquired_at_iso, acquired_at_epoch, expires_at_iso, expires_at_epoch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(lease_key) DO UPDATE SET
+                  stage_attempt_id=excluded.stage_attempt_id,
+                  owner_token=excluded.owner_token,
+                  acquired_at_iso=excluded.acquired_at_iso,
+                  acquired_at_epoch=excluded.acquired_at_epoch,
+                  expires_at_iso=excluded.expires_at_iso,
+                  expires_at_epoch=excluded.expires_at_epoch
+                """,
+                (f"stage:{attempt_id}", attempt_id, token, now_iso, now_epoch, expiry_iso, expiry_epoch),
+            )
+            claimed = self._connection.execute("SELECT attempt_count FROM stage_attempts WHERE id = ?", (attempt_id,)).fetchone()
+        assert claimed is not None
+        return StageClaim(
+            attempt_id=attempt_id,
+            document_id=int(row["document_id"]),
+            source=str(row["source"]),
+            source_file_id=str(row["source_file_id"]),
+            stage=normalized_stage,
+            workflow_version=workflow_version,
+            lease_token=token,
+            claimed_at=current,
+            lease_expires_at=expiry,
+            attempt_count=int(claimed["attempt_count"]),
+        )
+
+    def _assert_claim(self, claim: StageClaim) -> sqlite3.Row:
+        row = self._connection.execute("SELECT * FROM stage_attempts WHERE id = ?", (int(claim.attempt_id),)).fetchone()
+        if row is None:
+            raise LeaseLostError(f"stage attempt {claim.attempt_id} no longer exists")
+        if str(row["state"]) != StageState.RUNNING.value or str(row["lease_token"] or "") != claim.lease_token:
+            raise LeaseLostError(f"lease for stage attempt {claim.attempt_id} is no longer held by this worker")
+        return row
+
+    def complete_stage(
+        self,
+        claim: StageClaim,
+        *,
+        output_artifact_id: int | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Complete a claimed stage and release its lease in the same transaction."""
+
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            self._assert_claim(claim)
+            if output_artifact_id is not None:
+                artifact = self._connection.execute("SELECT 1 FROM artifacts WHERE id = ?", (int(output_artifact_id),)).fetchone()
+                if artifact is None:
+                    raise InvariantViolation(f"output artifact {output_artifact_id} does not exist")
+            self._connection.execute(
+                """
+                UPDATE stage_attempts SET state=?, error_category=NULL, error_code='', error_detail='',
+                  available_at_iso=NULL, available_at_epoch=NULL, lease_token=NULL,
+                  lease_expires_at_iso=NULL, lease_expires_at_epoch=NULL,
+                  output_artifact_id=COALESCE(?, output_artifact_id), updated_at_iso=?, updated_at_epoch=?
+                WHERE id=?
+                """,
+                (StageState.SUCCEEDED.value, output_artifact_id, now_iso, now_epoch, claim.attempt_id),
+            )
+            self._connection.execute("DELETE FROM leases WHERE stage_attempt_id = ?", (claim.attempt_id,))
+
+    def fail_stage(
+        self,
+        claim: StageClaim,
+        *,
+        category: ErrorCategory | str,
+        error_code: str = "",
+        error_detail: str = "",
+        retry_at: datetime | None = None,
+        now: datetime | None = None,
+    ) -> StageState:
+        """Persist a category-driven failure outcome and release the worker lease."""
+
+        normalized_category = as_error_category(category)
+        if normalized_category is ErrorCategory.TRANSIENT:
+            next_time = retry_at if retry_at is not None else now or utc_now()
+            _, available_iso, available_epoch = _timestamp(next_time)
+            next_state = StageState.RETRY_WAIT
+        else:
+            if retry_at is not None:
+                raise ValueError("only transient failures may have retry_at")
+            available_iso = None
+            available_epoch = None
+            next_state = {
+                ErrorCategory.AUTH: StageState.BLOCKED_AUTH,
+                ErrorCategory.RELEASE_CONTRACT: StageState.BLOCKED_RELEASE,
+                ErrorCategory.CONTENT: StageState.QUARANTINED,
+                ErrorCategory.INVARIANT: StageState.BLOCKED_RELEASE,
+            }[normalized_category]
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            self._assert_claim(claim)
+            self._connection.execute(
+                """
+                UPDATE stage_attempts SET state=?, error_category=?, error_code=?, error_detail=?,
+                  available_at_iso=?, available_at_epoch=?, lease_token=NULL,
+                  lease_expires_at_iso=NULL, lease_expires_at_epoch=NULL,
+                  updated_at_iso=?, updated_at_epoch=? WHERE id=?
+                """,
+                (
+                    next_state.value,
+                    normalized_category.value,
+                    str(error_code).strip(),
+                    str(error_detail).strip(),
+                    available_iso,
+                    available_epoch,
+                    now_iso,
+                    now_epoch,
+                    claim.attempt_id,
+                ),
+            )
+            self._connection.execute("DELETE FROM leases WHERE stage_attempt_id = ?", (claim.attempt_id,))
+        return next_state
+
+    def import_stage_attempt(
+        self,
+        document_id: int,
+        *,
+        stage: Stage | str,
+        workflow_version: str,
+        state: StageState | str,
+        error_category: ErrorCategory | str | None = None,
+        error_code: str = "",
+        error_detail: str = "",
+        attempt_count: int = 0,
+        available_at: datetime | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """Compatibility-only import path; normal workers use claim/complete/fail."""
+
+        normalized_stage = as_stage(stage)
+        normalized_state = as_stage_state(state)
+        workflow_version = str(workflow_version).strip()
+        if not workflow_version:
+            raise ValueError("workflow_version is required")
+        category = as_error_category(error_category).value if error_category is not None else None
+        if normalized_state is StageState.RETRY_WAIT and available_at is None:
+            raise ValueError("retry_wait imports require available_at")
+        available_iso = available_epoch = None
+        if available_at is not None:
+            _, available_iso, available_epoch = _timestamp(available_at)
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            if self._connection.execute("SELECT 1 FROM documents WHERE id = ?", (int(document_id),)).fetchone() is None:
+                raise UnknownDocumentError(f"document {document_id} does not exist")
+            self._connection.execute(
+                """
+                INSERT INTO stage_attempts(
+                  document_id, stage, workflow_version, state, error_category, error_code, error_detail,
+                  attempt_count, available_at_iso, available_at_epoch,
+                  created_at_iso, created_at_epoch, updated_at_iso, updated_at_epoch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id, stage, workflow_version) DO UPDATE SET
+                  state=CASE
+                    WHEN stage_attempts.state = 'succeeded' THEN stage_attempts.state
+                    ELSE excluded.state
+                  END,
+                  error_category=CASE
+                    WHEN stage_attempts.state = 'succeeded' THEN stage_attempts.error_category
+                    ELSE excluded.error_category
+                  END,
+                  error_code=CASE WHEN stage_attempts.state = 'succeeded' THEN stage_attempts.error_code ELSE excluded.error_code END,
+                  error_detail=CASE WHEN stage_attempts.state = 'succeeded' THEN stage_attempts.error_detail ELSE excluded.error_detail END,
+                  attempt_count=MAX(stage_attempts.attempt_count, excluded.attempt_count),
+                  available_at_iso=CASE WHEN stage_attempts.state = 'succeeded' THEN stage_attempts.available_at_iso ELSE excluded.available_at_iso END,
+                  available_at_epoch=CASE WHEN stage_attempts.state = 'succeeded' THEN stage_attempts.available_at_epoch ELSE excluded.available_at_epoch END,
+                  updated_at_iso=excluded.updated_at_iso,
+                  updated_at_epoch=excluded.updated_at_epoch
+                """,
+                (
+                    int(document_id),
+                    normalized_stage.value,
+                    workflow_version,
+                    normalized_state.value,
+                    category,
+                    str(error_code).strip(),
+                    str(error_detail).strip(),
+                    max(0, int(attempt_count)),
+                    available_iso,
+                    available_epoch,
+                    now_iso,
+                    now_epoch,
+                    now_iso,
+                    now_epoch,
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT id FROM stage_attempts WHERE document_id=? AND stage=? AND workflow_version=?",
+                (int(document_id), normalized_stage.value, workflow_version),
+            ).fetchone()
+        assert row is not None
+        return int(row["id"])
+
+    def get_stage_attempt(self, document_id: int, stage: Stage | str, workflow_version: str) -> dict[str, Any] | None:
+        self._require_migrated()
+        row = self._connection.execute(
+            "SELECT * FROM stage_attempts WHERE document_id=? AND stage=? AND workflow_version=?",
+            (int(document_id), as_stage(stage).value, str(workflow_version)),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def record_publication_intent(
+        self,
+        summary_sha256: str,
+        target: str,
+        partition_key: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> PublicationRecord:
+        summary_digest = _validate_sha256(summary_sha256, field="summary_sha256", required=True)
+        target = str(target).strip()
+        partition_key = str(partition_key).strip()
+        if not target or not partition_key:
+            raise ValueError("target and partition_key are required")
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            self._connection.execute(
+                """
+                INSERT INTO publications(
+                  summary_sha256, target, partition_key, state, details_json,
+                  created_at_iso, created_at_epoch, updated_at_iso, updated_at_epoch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(summary_sha256, target, partition_key) DO NOTHING
+                """,
+                (
+                    summary_digest,
+                    target,
+                    partition_key,
+                    PublicationState.INTENT.value,
+                    _json(details),
+                    now_iso,
+                    now_epoch,
+                    now_iso,
+                    now_epoch,
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM publications WHERE summary_sha256=? AND target=? AND partition_key=?",
+                (summary_digest, target, partition_key),
+            ).fetchone()
+        assert row is not None
+        return PublicationRecord(
+            id=int(row["id"]),
+            summary_sha256=str(row["summary_sha256"]),
+            target=str(row["target"]),
+            partition_key=str(row["partition_key"]),
+            state=PublicationState(str(row["state"])),
+            remote_reference=str(row["remote_reference"]) if row["remote_reference"] else None,
+        )
+
+    def record_remote_write(
+        self,
+        summary_sha256: str,
+        target: str,
+        partition_key: str,
+        *,
+        remote_reference: str,
+        details: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> PublicationRecord:
+        """Durably record a remote write before any local success acknowledgement."""
+
+        remote_reference = str(remote_reference).strip()
+        if not remote_reference:
+            raise ValueError("remote_reference is required for remote_written")
+        intent = self.record_publication_intent(
+            summary_sha256, target, partition_key, details=details, now=now
+        )
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            row = self._connection.execute("SELECT * FROM publications WHERE id = ?", (intent.id,)).fetchone()
+            assert row is not None
+            current = PublicationState(str(row["state"]))
+            existing_reference = str(row["remote_reference"] or "")
+            if current is PublicationState.SUCCESS:
+                if existing_reference and existing_reference != remote_reference:
+                    raise InvariantViolation("a completed publication cannot be rebound to another remote reference")
+            elif current is PublicationState.REMOTE_WRITTEN:
+                if existing_reference and existing_reference != remote_reference:
+                    raise InvariantViolation("a remote-written publication cannot be rebound to another remote reference")
+            else:
+                self._connection.execute(
+                    """
+                    UPDATE publications SET state=?, remote_reference=?, details_json=?, updated_at_iso=?, updated_at_epoch=?
+                    WHERE id=?
+                    """,
+                    (PublicationState.REMOTE_WRITTEN.value, remote_reference, _json(details), now_iso, now_epoch, intent.id),
+                )
+            row = self._connection.execute("SELECT * FROM publications WHERE id = ?", (intent.id,)).fetchone()
+        assert row is not None
+        return PublicationRecord(
+            id=int(row["id"]),
+            summary_sha256=str(row["summary_sha256"]),
+            target=str(row["target"]),
+            partition_key=str(row["partition_key"]),
+            state=PublicationState(str(row["state"])),
+            remote_reference=str(row["remote_reference"]) if row["remote_reference"] else None,
+        )
+
+    def complete_publication(
+        self,
+        summary_sha256: str,
+        target: str,
+        partition_key: str,
+        *,
+        now: datetime | None = None,
+    ) -> PublicationRecord:
+        """Commit local publication success only after a durable remote-written row exists."""
+
+        summary_digest = _validate_sha256(summary_sha256, field="summary_sha256", required=True)
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            row = self._connection.execute(
+                "SELECT * FROM publications WHERE summary_sha256=? AND target=? AND partition_key=?",
+                (summary_digest, str(target).strip(), str(partition_key).strip()),
+            ).fetchone()
+            if row is None:
+                raise InvariantViolation("cannot complete a publication without a remote_written record")
+            current = PublicationState(str(row["state"]))
+            if current is PublicationState.INTENT or not str(row["remote_reference"] or ""):
+                raise InvariantViolation("cannot complete a publication before remote_written is durable")
+            if current is not PublicationState.SUCCESS:
+                self._connection.execute(
+                    "UPDATE publications SET state=?, updated_at_iso=?, updated_at_epoch=? WHERE id=?",
+                    (PublicationState.SUCCESS.value, now_iso, now_epoch, int(row["id"])),
+                )
+                row = self._connection.execute("SELECT * FROM publications WHERE id=?", (int(row["id"]),)).fetchone()
+        assert row is not None
+        return PublicationRecord(
+            id=int(row["id"]),
+            summary_sha256=str(row["summary_sha256"]),
+            target=str(row["target"]),
+            partition_key=str(row["partition_key"]),
+            state=PublicationState(str(row["state"])),
+            remote_reference=str(row["remote_reference"]) if row["remote_reference"] else None,
+        )
+
+    def get_publication(self, summary_sha256: str, target: str, partition_key: str) -> PublicationRecord | None:
+        self._require_migrated()
+        digest = _validate_sha256(summary_sha256, field="summary_sha256", required=True)
+        row = self._connection.execute(
+            "SELECT * FROM publications WHERE summary_sha256=? AND target=? AND partition_key=?",
+            (digest, str(target).strip(), str(partition_key).strip()),
+        ).fetchone()
+        if row is None:
+            return None
+        return PublicationRecord(
+            id=int(row["id"]),
+            summary_sha256=str(row["summary_sha256"]),
+            target=str(row["target"]),
+            partition_key=str(row["partition_key"]),
+            state=PublicationState(str(row["state"])),
+            remote_reference=str(row["remote_reference"]) if row["remote_reference"] else None,
+        )
+
+    def enqueue_notification(
+        self,
+        idempotency_key: str,
+        *,
+        event: str,
+        payload: Mapping[str, Any] | None = None,
+        publication_id: int | None = None,
+        now: datetime | None = None,
+    ) -> NotificationRecord:
+        key = str(idempotency_key).strip()
+        event = str(event).strip()
+        if not key or not event:
+            raise ValueError("idempotency_key and event are required")
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            if publication_id is not None and self._connection.execute(
+                "SELECT 1 FROM publications WHERE id = ?", (int(publication_id),)
+            ).fetchone() is None:
+                raise InvariantViolation(f"publication {publication_id} does not exist")
+            cursor = self._connection.execute(
+                """
+                INSERT INTO notification_outbox(
+                  idempotency_key, publication_id, event, payload_json, status,
+                  created_at_iso, created_at_epoch, updated_at_iso, updated_at_epoch
+                ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO NOTHING
+                """,
+                (key, publication_id, event, _json(payload), now_iso, now_epoch, now_iso, now_epoch),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM notification_outbox WHERE idempotency_key = ?", (key,)
+            ).fetchone()
+        assert row is not None
+        return NotificationRecord(
+            id=int(row["id"]),
+            idempotency_key=str(row["idempotency_key"]),
+            event=str(row["event"]),
+            status=str(row["status"]),
+            created=cursor.rowcount == 1,
+        )
+
+    def set_notification_status(self, idempotency_key: str, status: str, *, now: datetime | None = None) -> None:
+        """Compatibility importer transition; delivery workers will gain a dedicated API later."""
+
+        key = str(idempotency_key).strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            cursor = self._connection.execute(
+                "UPDATE notification_outbox SET status=?, updated_at_iso=?, updated_at_epoch=? WHERE idempotency_key=?",
+                (str(status).strip() or "queued", now_iso, now_epoch, key),
+            )
+            if cursor.rowcount != 1:
+                raise InvariantViolation(f"notification {key} does not exist")
+
+    def derive_health(self, *, now: datetime | None = None) -> dict[str, Any]:
+        """Derive operational health from all durable stage rows, never a last exit code."""
+
+        self._require_migrated()
+        _, now_iso, now_epoch = _timestamp(now)
+        source_rows = self._connection.execute("SELECT DISTINCT source FROM documents ORDER BY source").fetchall()
+        sources: dict[str, dict[str, Any]] = {
+            str(row["source"]): {"stages": {}, "totals": _empty_counts()} for row in source_rows
+        }
+        rows = self._connection.execute(
+            """
+            SELECT documents.source, stage_attempts.stage, stage_attempts.state,
+              stage_attempts.available_at_iso, stage_attempts.available_at_epoch,
+              stage_attempts.lease_expires_at_epoch
+            FROM stage_attempts JOIN documents ON documents.id = stage_attempts.document_id
+            ORDER BY documents.source, stage_attempts.stage
+            """
+        ).fetchall()
+        blocked_count = 0
+        degraded_count = 0
+        for row in rows:
+            source = str(row["source"])
+            stage = str(row["stage"])
+            state = StageState(str(row["state"]))
+            bucket = sources.setdefault(source, {"stages": {}, "totals": _empty_counts()})["stages"].setdefault(
+                stage, _empty_counts()
+            )
+            _increment_count(bucket, state)
+            _increment_count(sources[source]["totals"], state)
+            if state in {StageState.BLOCKED_AUTH, StageState.BLOCKED_RELEASE}:
+                blocked_count += 1
+            elif state in {StageState.RETRY_WAIT, StageState.QUARANTINED}:
+                degraded_count += 1
+            elif state is StageState.RUNNING and row["lease_expires_at_epoch"] is not None and int(row["lease_expires_at_epoch"]) <= now_epoch:
+                degraded_count += 1
+            if state in {StageState.QUEUED, StageState.RETRY_WAIT}:
+                _consider_runnable(bucket, row["available_at_iso"], row["available_at_epoch"])
+                _consider_runnable(sources[source]["totals"], row["available_at_iso"], row["available_at_epoch"])
+        health = (
+            PipelineHealth.BLOCKED
+            if blocked_count
+            else PipelineHealth.DEGRADED
+            if degraded_count
+            else PipelineHealth.HEALTHY
+        )
+        for source_payload in sources.values():
+            _finalize_counts(source_payload["totals"])
+            for stage_payload in source_payload["stages"].values():
+                _finalize_counts(stage_payload)
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "health": health.value,
+            "as_of": now_iso,
+            "sources": sources,
+        }
+
+    def table_count(self, table: str) -> int:
+        """Small diagnostic helper used by CLI doctor and tests; table names are allow-listed."""
+
+        self._require_migrated()
+        allowed = {
+            "runs",
+            "source_windows",
+            "documents",
+            "artifacts",
+            "stage_attempts",
+            "publications",
+            "notification_outbox",
+            "leases",
+        }
+        if table not in allowed:
+            raise ValueError(f"unsupported state table: {table}")
+        row = self._connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+        assert row is not None
+        return int(row["count"])
+
+
+def _empty_counts() -> dict[str, Any]:
+    return {
+        "queued": 0,
+        "running": 0,
+        "succeeded": 0,
+        "retry_wait": 0,
+        "blocked": 0,
+        "blocked_auth": 0,
+        "blocked_release": 0,
+        "quarantined": 0,
+        "runnable_now_count": 0,
+        "earliest_runnable_at": None,
+        "_earliest_runnable_epoch": None,
+    }
+
+
+def _increment_count(bucket: dict[str, Any], state: StageState) -> None:
+    bucket[state.value] = int(bucket.get(state.value, 0)) + 1
+    if state in {StageState.BLOCKED_AUTH, StageState.BLOCKED_RELEASE}:
+        bucket["blocked"] = int(bucket.get("blocked", 0)) + 1
+
+
+def _consider_runnable(bucket: dict[str, Any], iso_value: str | None, epoch_value: int | None) -> None:
+    if epoch_value is None:
+        bucket["runnable_now_count"] = int(bucket.get("runnable_now_count", 0)) + 1
+        bucket["earliest_runnable_at"] = None
+        bucket["_earliest_runnable_epoch"] = None
+        return
+    if int(bucket.get("runnable_now_count", 0)):
+        return
+    earliest = bucket.get("_earliest_runnable_epoch")
+    if earliest is None or int(epoch_value) < int(earliest):
+        bucket["_earliest_runnable_epoch"] = int(epoch_value)
+        bucket["earliest_runnable_at"] = str(iso_value) if iso_value else None
+
+
+def _finalize_counts(bucket: dict[str, Any]) -> None:
+    bucket.pop("_earliest_runnable_epoch", None)
