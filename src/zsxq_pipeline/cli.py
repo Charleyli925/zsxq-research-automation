@@ -225,6 +225,11 @@ def _doctor_from_args(args: argparse.Namespace) -> dict[str, Any]:
                 config.pipeline.research_library_root.is_dir()
                 and os.access(config.pipeline.research_library_root, os.W_OK)
             ),
+            "research_library_database_available": config.pipeline.research_library_database is None
+            or (
+                config.pipeline.research_library_database.parent.is_dir()
+                and os.access(config.pipeline.research_library_database.parent, os.W_OK)
+            ),
             "obsidian_vault_available": config.pipeline.obsidian_vault_root is None
             or (
                 config.pipeline.obsidian_vault_root.is_dir()

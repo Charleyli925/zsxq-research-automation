@@ -152,6 +152,7 @@ doc_group_size = 10
 doc_group_threshold = 15
 max_files_per_document = 20
 research_library_root = "{library_root}"
+research_library_database = "state/research_library.sqlite"
 obsidian_vault_root = "{vault_root}"
 
 [publish_targets.daily]
@@ -173,9 +174,11 @@ target_document = "daily-doc-logical-id"
     assert config.pipeline.summary_max_workers == 2
     assert config.pipeline.max_files_per_document == 20
     assert config.pipeline.research_library_root == library_root
+    assert config.pipeline.research_library_database == runtime_root / "state" / "research_library.sqlite"
     assert config.pipeline.obsidian_vault_root == vault_root
     process_config = ProcessConfig.from_pipeline_config(config)
     assert process_config.research_library_root == library_root
+    assert process_config.research_library_database == runtime_root / "state" / "research_library.sqlite"
     assert process_config.obsidian_vault_root == vault_root
     assert config.publish_targets["daily"].target_document == "daily-doc-logical-id"
 
@@ -184,6 +187,31 @@ target_document = "daily-doc-logical-id"
         encoding="utf-8",
     )
     with pytest.raises(ConfigError, match="1..2"):
+        load_pipeline_config(config_path)
+
+
+def test_research_library_projection_requires_one_runtime_owned_database(tmp_path):
+    runtime_root = tmp_path / "runtime"
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir()
+    library_root = tmp_path / "ResearchLibrary"
+    config_path = tmp_path / "pipeline.toml"
+    _write_config(config_path, runtime_root, legacy_root)
+
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + f'\n[pipeline]\nresearch_library_root = "{library_root}"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="must be configured together"):
+        load_pipeline_config(config_path)
+
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + 'research_library_database = "../outside.sqlite"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="inside runtime.root"):
         load_pipeline_config(config_path)
 
 

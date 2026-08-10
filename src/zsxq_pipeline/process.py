@@ -206,6 +206,7 @@ class ProcessConfig:
     quarantine_path: Path
     notification_audit_path: Path
     research_library_root: Path | None
+    research_library_database: Path | None
     obsidian_vault_root: Path | None
     lark_command: str
     lark_config_dir: Path | None
@@ -237,6 +238,12 @@ class ProcessConfig:
             "notification_audit_path",
         ):
             object.__setattr__(self, name, _inside(root, getattr(self, name), field_name=name))
+        if self.research_library_database is not None:
+            object.__setattr__(
+                self,
+                "research_library_database",
+                _inside(root, self.research_library_database, field_name="research_library_database"),
+            )
         preflight_path = self.preflight_path if self.preflight_path is not None else Path("last_preflight.json")
         object.__setattr__(self, "preflight_path", _inside(root, preflight_path, field_name="preflight_path"))
         # Prompt assets are copied as plain text into each isolated Codex work
@@ -295,6 +302,7 @@ class ProcessConfig:
             quarantine_path=_inside(root, "quarantine.json", field_name="quarantine_path"),
             notification_audit_path=_inside(root, "notification_messages.jsonl", field_name="notification_audit_path"),
             research_library_root=config.pipeline.research_library_root,
+            research_library_database=config.pipeline.research_library_database,
             obsidian_vault_root=config.pipeline.obsidian_vault_root,
             lark_command=config.lark.command,
             lark_config_dir=config.lark.config_dir,
@@ -428,6 +436,7 @@ class DigestProcessor:
         self.notifier = notifier or LarkNotifier(lark_config)
         self.sidecars = sidecars or ArtifactSidecars(
             library_root=config.research_library_root,
+            library_database=config.research_library_database,
             vault_root=config.obsidian_vault_root,
             work_root=config.work_root,
             python_executable=os.environ.get("PYTHON_BIN", sys.executable),

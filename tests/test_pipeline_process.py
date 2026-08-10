@@ -228,6 +228,7 @@ def _config(runtime: Path) -> ProcessConfig:
         quarantine_path=runtime / "quarantine.json",
         notification_audit_path=runtime / "notification_messages.jsonl",
         research_library_root=None,
+        research_library_database=None,
         obsidian_vault_root=None,
         lark_command="lark-cli-test",
         lark_config_dir=None,

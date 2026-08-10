@@ -94,12 +94,16 @@ class ArtifactSidecars:
         self,
         *,
         library_root: str | Path | None,
+        library_database: str | Path | None = None,
         vault_root: str | Path | None,
         work_root: str | Path,
         python_executable: str | Path | None = None,
         repository_root: str | Path | None = None,
     ) -> None:
         self.library_root = Path(library_root).expanduser().resolve(strict=False) if library_root else None
+        self.library_database = (
+            Path(library_database).expanduser().resolve(strict=False) if library_database else None
+        )
         self.vault_root = Path(vault_root).expanduser().resolve(strict=False) if vault_root else None
         self.work_root = Path(work_root).expanduser().resolve(strict=False)
         self.python_executable = str(python_executable or sys.executable)
@@ -158,6 +162,11 @@ class ArtifactSidecars:
                 str(self.vault_root),
                 "--feishu-doc-url",
                 str(document_url),
+                *(
+                    ("--library-database", str(self.library_database))
+                    if self.library_database is not None
+                    else ()
+                ),
             ],
             operation="archive Obsidian notes",
         )
@@ -178,6 +187,11 @@ class ArtifactSidecars:
                 str(script),
                 "--library-root",
                 str(self.library_root),
+                *(
+                    ("--database", str(self.library_database))
+                    if self.library_database is not None
+                    else ()
+                ),
                 "upsert-from-batch",
                 "--batch-file",
                 str(manifest_path),
@@ -201,6 +215,11 @@ class ArtifactSidecars:
                 str(script),
                 "--library-root",
                 str(self.library_root),
+                *(
+                    ("--database", str(self.library_database))
+                    if self.library_database is not None
+                    else ()
+                ),
                 "upsert",
                 "--report-id",
                 _report_id(item),
