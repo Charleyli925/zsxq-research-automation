@@ -1,4 +1,4 @@
-"""No-side-effect command line interface for the pipeline state core."""
+"""Command line interface for the state core and direct-Codex digest worker."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from .legacy_import import (
     load_import_plan,
     write_import_plan,
 )
+from .process import DigestProcessor, ProcessConfig, ProcessError, ProcessOutcome, ProcessRequest
 from .schema import SchemaVersionError
 from .state import PipelineState, StateError
 from .status import doctor_state_only, read_status
@@ -33,7 +34,7 @@ def _state_locator(parser: argparse.ArgumentParser) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="zsxq-pipeline", description="ZSXQ pipeline state core; no worker integrations yet.")
+    parser = argparse.ArgumentParser(prog="zsxq-pipeline", description="ZSXQ pipeline state core and direct Codex/Lark worker.")
     top = parser.add_subparsers(dest="command", required=True)
 
     db = top.add_parser("db", help="Manage the pipeline SQLite schema.")
@@ -60,6 +61,19 @@ def _parser() -> argparse.ArgumentParser:
     doctor = top.add_parser("doctor", help="Run bounded diagnostics.")
     _state_locator(doctor)
     doctor.add_argument("--state-only", action="store_true", required=True, help="Do not probe network, browser, model, or Feishu.")
+
+    process = top.add_parser("process", help="Extract, summarize with direct Codex, publish through lark-cli, and export compatibility status.")
+    process_source = process.add_mutually_exclusive_group(required=True)
+    process_source.add_argument("--config", help="Validated direct pipeline TOML configuration.")
+    process_source.add_argument("--runtime-root", help="Task runtime root; direct settings are read from its sourced config.env environment.")
+    process.add_argument("--file", action="append", default=[], help="Absolute PDF path; may be repeated.")
+    process.add_argument("--folder", action="append", default=[], help="Folder of PDFs to process; may be repeated.")
+    process.add_argument("--batch-file", help="Existing batch manifest to copy into the runtime before processing.")
+    process.add_argument("--dry-run", action="store_true", help="Do not publish to Lark or send a notification.")
+    process.add_argument("--summary-only", action="store_true", help="Stop after local direct-Codex summary artifacts.")
+    process.add_argument("--no-notify", action="store_true", help="Publish documents but leave the notification outbox undrained.")
+    process.add_argument("--preflight-only", action="store_true", help="Run bounded extractor/Codex/Lark capability checks only.")
+    process.add_argument("--include-existing", action="store_true", help="Include existing PDFs on the first scanner baseline.")
     return parser
 
 
@@ -77,6 +91,27 @@ def _legacy_root_from_args(args: argparse.Namespace) -> Path:
     if config.legacy.root is None:
         raise ConfigError("[legacy].root is required when `legacy plan --config` is used")
     return config.legacy.root
+
+
+def _process_from_args(args: argparse.Namespace) -> ProcessOutcome:
+    if args.config:
+        config = ProcessConfig.from_pipeline_config(load_pipeline_config(args.config))
+    else:
+        runtime_root = Path(args.runtime_root).expanduser()
+        if not runtime_root.is_absolute():
+            raise ConfigError("--runtime-root must be absolute")
+        config = ProcessConfig.from_environment(runtime_root)
+    request = ProcessRequest(
+        files=tuple(Path(value).expanduser() for value in args.file),
+        folders=tuple(Path(value).expanduser() for value in args.folder),
+        batch_file=Path(args.batch_file).expanduser() if args.batch_file else None,
+        dry_run=bool(args.dry_run),
+        summary_only=bool(args.summary_only),
+        no_notify=bool(args.no_notify),
+        preflight_only=bool(args.preflight_only),
+        include_existing=bool(args.include_existing),
+    )
+    return DigestProcessor(config).run(request)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -111,7 +146,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "doctor":
             _emit(doctor_state_only(_database_from_args(args)))
             return 0
-    except (ConfigError, LegacyImportError, SchemaVersionError, StateError, ValueError) as exc:
+        if args.command == "process":
+            outcome = _process_from_args(args)
+            _emit(outcome.to_dict())
+            return 0 if outcome.status in {"success", "busy"} else 1
+    except (ConfigError, LegacyImportError, ProcessError, SchemaVersionError, StateError, ValueError) as exc:
         print(f"zsxq-pipeline: {exc}", file=sys.stderr)
         return 2
     parser.error("unsupported command")

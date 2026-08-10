@@ -1,129 +1,120 @@
-# ZSXQ PDF 总结任务执行流程
+# ZSXQ PDF Digest Workflow
 
-这份文档只说明当前真实链路。现在的分工是：
-
-- OpenClaw 只负责读正文并生成本地摘要。
-- 本地脚本负责分批、缓存、状态回写和失败处理。
-- `lark-cli docs/drive` 负责创建、追加、改标题和授权飞书文档。
-- `lark-cli im` 负责把文档链接发到目标群。
-
-## 1. 整体图
+这份文档说明当前真实链路。既有 cron wrapper 保留，但从 `run.sh` 开始的业务
+执行完全由 Python pipeline、`codex exec` 和 `lark-cli` 组成。
 
 ```mermaid
 flowchart TD
-    A["run.sh 启动"] --> B["快照配置、worker、helper、scanner、摘要提示词"]
-    B --> C["run.worker.sh 执行"]
-    C --> D["扫描新增 PDF 或使用手动文件"]
-    D --> E["文本提取和质量检查"]
-    E --> F["OpenClaw 摘要 agent 生成本地 Markdown/JSON"]
-    F --> G["本地脚本合并发布组"]
-    G --> H["lark-cli docs 以 user 身份创建或追加文档"]
-    H --> I["lark-cli drive 改标题、校验、给目标群授权"]
-    I --> J["lark-cli im 以 bot 身份发文档链接"]
-    J --> K["本地脚本回写状态和缓存"]
+    A["run.cron-safe.sh"] --> B["run.sh 读取 config.env"]
+    B --> C["zsxq-pipeline process"]
+    C --> D["扫描新增 PDF 或接收手动文件"]
+    D --> E["提取正文和质量门禁"]
+    E --> F{"summary cache 命中"}
+    F -- "是" --> G["复用本地 Markdown / JSON"]
+    F -- "否" --> H["codex exec\nephemeral + read-only + JSON schema"]
+    H --> I["原子落盘 summary artifact"]
+    G --> R["ResearchLibrary 永久摘要投影\n（best effort）"]
+    I --> R
+    G --> J["确定性发布分组"]
+    I --> J
+    J --> K["lark-cli docs/drive --as user"]
+    K --> L["remote_written -> fetch / title / permission verify"]
+    L --> M["publication success"]
+    M --> N["notification outbox"]
+    N --> O["lark-cli im --as bot + idempotency key"]
+    M --> S["Obsidian 阅读入口投影\n（best effort）"]
 ```
 
-## 2. 文件分工
+## 1. 入口与预检
 
-- [config.env.example](config.env.example)：本地配置模板。
-- [run.sh](run.sh)：稳定入口，先快照再启动 worker。
-- [run.worker.sh](run.worker.sh)：主流程。
-- [summary_prompt.md](summary_prompt.md)：摘要提示词。
-- [summary_system_prompt.md](summary_system_prompt.md)：摘要阶段 system prompt。
-- [extract_pdf_text.py](extract_pdf_text.py)：PDF 文本提取。
-- [manage_zsxq_digest_batch.py](../../scripts/manage_zsxq_digest_batch.py)：分批、渲染摘要 prompt、摘要校验、缓存、发布 key、飞书 URL 解析。
-- [scan_new_zsxq_pdfs.py](../../scripts/scan_new_zsxq_pdfs.py)：扫描新增 PDF，并在成功后确认已处理。
+`run.sh` 不再快照 worker、agent auth、session 或 registry。它读取实际任务目录
+的 `config.env`，设置 release checkout 的 `PYTHONPATH`，并转交：
 
-## 3. 启动和预检
+```text
+python -m zsxq_pipeline.cli process --runtime-root <actual-task-dir> <user-args>
+```
 
-`run.sh` 会先复制这一轮需要的文件到临时目录，再启动快照版 worker。这样任务跑到一半时，仓库里的代码或配置被修改，也不会撕裂当前这一轮。
+`--preflight-only` 只检查本机 command capability 和配置形状。它不会启动真实
+Codex 请求、创建飞书文档或发送群消息。建议在 scheduler 启用前运行：
 
-快照内容包括：
+```bash
+bash "${DIGEST_TASK_DIR}/run.sh" --preflight-only --no-notify
+```
 
-- `config.env`
-- `run.worker.sh`
-- `manage_zsxq_digest_batch.py`
-- `scan_new_zsxq_pdfs.py`
-- `extract_pdf_text.py`
-- `summary_prompt.md`
-- `summary_system_prompt.md`
+## 2. 提取和摘要
 
-预检会确认 Python、OpenClaw、helper、scanner、摘要提示词、文本提取脚本、MarkItDown 和缓存目录是否可用。
+1. pipeline 扫描 eligible PDF，或接收 `--file` / `--folder`。
+2. 现有 extractor 负责 `pdftotext`、清理、质量门禁和必要的 OCR fallback。
+3. 通过门禁的正文以 `pdf_sha256 + extractor_version` 缓存；不能形成可信正文的
+   文件进入 quarantine，不交给模型。
+4. 每个缺失摘要的 PDF 建立一个受控 job。提示词、正文输入、结果路径都只位于
+   本次工作目录；模型不读取 PDF、浏览器或飞书。
+5. `CodexSummaryProvider` 以 argv（不是 shell）执行：
 
-## 4. 摘要阶段
+   ```text
+   codex exec --ephemeral --ignore-user-config --ignore-rules \
+     --sandbox read-only --model <model> \
+     --output-schema <summary.schema.json> \
+     --output-last-message <result.json> -
+   ```
 
-每个 chunk 的顺序是：
+   已审批的 `CODEX_REASONING` 也通过本次调用的显式 Codex config override
+   传入；它和模型、prompt hash 一起进入 cache identity，绝不依赖用户全局配置。
 
-1. 先跑本地文本提取。
-2. 文本质量不够时，按 OCR fallback 继续尝试。
-3. 内容型失败写入隔离清单。
-4. 环境型失败会停止本轮后续处理。
-5. 如果命中 `summary_cache/`，直接复用本地摘要。
-6. 没命中缓存时，用 `summary_prompt.md` 和 `summary_system_prompt.md` 调用摘要 agent。
-7. 摘要输出必须通过 `validate-summary`。
-8. 摘要通过后落盘为 `.summary.json` 和 `.summary.md`，并写入缓存。
+6. 调用有独立 process group、硬超时、TERM/KILL 清理。只接受与 schema 完全
+   一致的 final output；无效输出不写 summary artifact。
+7. 成功结果先原子写 JSON/Markdown，再提交 summary stage。随后尝试把同一
+   Markdown 投影为 ResearchLibrary 的可读永久摘要；该 sidecar 失败会被记录，
+   但不会撤销摘要 artifact。cache key 包含 PDF hash、extractor 版本、prompt
+   版本/hash、model 和 reasoning。
 
-摘要 agent 每次调用前后都会清会话，避免上一个 PDF 的上下文影响下一个 PDF。
+默认一份 PDF 一个 job，最多两个 summary worker 并行。没有运行时 provider
+fallback，也不允许退回 OpenClaw agent。
 
-## 5. 飞书发布阶段
+## 3. 发布
 
-摘要落盘后先进入发布队列。长批次中，队列每攒够 `DOC_GROUP_SIZE` 份摘要就会先发布一份飞书文档；收尾时再发布不足一组的剩余摘要。发布只走 `lark-cli`：
+摘要 job 可以并发结束，但 publish group 总是按 source/date/file identity 的固定
+顺序生成。`DOC_GROUP_SIZE`、`DOC_GROUP_THRESHOLD` 和单文档容量决定分区。
 
-1. 每个新文档用 `docs +create --as user` 创建。
-2. 创建后用 `drive files patch --as user` 修正文档文件标题。
-3. 用 `drive +inspect --as user` 校验标题。
-4. 用 `docs +fetch --as user` 校验文档可读。
-5. 用 `drive permission.members create --as user` 给目标群授权。
-6. 若当前发布组明确复用已有目标文档，则用 `docs +update --command append --as user` 追加。
+对每个 group：
 
-`publish_records.jsonl` 会保留成功发布记录，用来防止重跑时重复创建同一份文档。它不是第二发布链路。
+1. 从本地 Markdown artifact 生成正文；它是唯一的 publish 输入真源。
+2. 以 `lark-cli docs ... --as user` create 或 append。
+3. 远端正文写成功后立即记为 `remote_written`，保存 document URL。
+4. 校验标题，`docs +fetch --as user` 验证正文锚点，以 `drive ... --as user`
+   给目标 chat 授予 view 权限。
+5. 验证完成后才记为 `success` 并确认 publish stage。
+6. 仅在该成功状态后，尝试创建或更新带已验证飞书 URL 的 Obsidian 阅读入口；
+   sidecar 失败可见，但不会回滚 publication。
 
-如果 `lark-cli docs/drive` 任一步失败，本轮发布阶段直接失败，失败原因会写入：
+若第 3 步已完成而第 4 步失败，下一次只能用保存的 URL 做 fetch/verify/grant。
+不得重复 create 或 append，同一 PDF 也不得因 publish 失败而重新总结。
 
-- `last_result.json`
-- `run_status.json`
-- `cron.log`
+## 4. 通知
 
-## 6. 群通知阶段
+document success 会写入 durable notification outbox。drain outbox 时：
 
-群通知只走 `lark-cli im +messages-send`。
+- `lark-cli im +messages-send --as bot` 必须带稳定 idempotency key；
+- 文档链接通知必须先于 batch terminal 通知；
+- 通知失败只记录 retry/dead-letter 状态，不撤销 publication success；
+- 每轮默认只尝试一次，后续 cron 触发再按退避重试。
 
-- 发送身份：`LARK_CLI_SEND_AS=bot`
-- 文档创建/追加身份：`PUBLISH_LARK_CLI_AS=user`
-- 每条通知都有稳定 idempotency key，避免成功消息重复发送。
-- 如果 `lark-cli im` 失败，只记录 `channel=lark-cli`、`status=failed` 和错误原因，不会换其他发送者。
+用户身份和机器人身份不能互换。现有 `LARKSUITE_CLI_CONFIG_DIR` 只是 lark-cli
+profile 位置；即使旧目录名含 `openclaw`，也不应在本迁移中重命名、复制或删除。
 
-当前保留的群消息主要是：
+## 5. 状态与恢复
 
-- 开始处理
-- 文档完成卡片
-- 等待、busy、失败等必要状态
+SQLite database 记录 artifact identity、stage lease、publication 和 outbox。
+`run_status.json`、`last_result.json`、`last_result.md` 是兼容运维导出，不是
+事务真相。恢复优先级如下：
 
-没有新增 PDF 时只写本地状态，不发群提醒。
+1. summary cache 命中：复用 artifact，不执行 Codex。
+2. ResearchLibrary 投影失败：保留本地 artifact，修复 sidecar 后可单独补齐，
+   不重新调用 Codex。
+3. publication `remote_written`：验证已有 URL，不重复远端写入。
+4. publication `success` 而通知未送达：仅 drain outbox。
+5. content failure：保留 quarantine；不让无效 PDF 无限重跑。
 
-## 7. 状态和缓存
-
-常用运行态文件：
-
-- `run_status.json`：当前或最近一次运行状态。
-- `last_result.json`：最近一次结构化结果。
-- `last_result.md`：最近一次给人看的结果摘要。
-- `cron.log`：完整日志。
-- `notification_messages.jsonl`：通知发送记录。
-- `publish_records.jsonl`：发布去重记录。
-- `failure_backoff.json`：同一批文件失败退避状态。
-- `quarantine.json`：内容型失败隔离清单。
-- `text_cache/`：正文缓存。
-- `summary_cache/`：摘要缓存。
-
-## 8. 保留的安全机制
-
-这些不是多发布者兜底，仍然保留：
-
-- 运行锁：避免 cron 和手动运行互相覆盖。
-- 静默窗口：避免文件刚写入一半就开始处理。
-- 下载任务检查：下载任务还在跑时先等待。
-- 失败退避：`EOF`、超时、断流等临时网络故障按 `5/10/20` 分钟快速重试并在第 4 次失败后暂停；权限、认证、配置及其他故障按 `30/60` 分钟重试并在第 3 次失败后暂停。
-- 正文缓存和摘要缓存：减少重复处理。
-- 发布记录：避免重复创建文档。
-- OCR fallback：处理 PDF 质量问题。
+`run.cron-safe.sh` 暂时继续持有 scheduler/日志/重叠保护，直至后续统一调度
+变更。不要删除它、不要手工删除 runtime state 来强制恢复，也不要把真实外部
+canary 包含在预检或自动化测试中。

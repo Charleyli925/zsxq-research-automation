@@ -237,7 +237,7 @@ class ManageZsxqDigestBatchTests(unittest.TestCase):
         self.assertIn("ZSXQ PDF 隔离清单", report_text)
         self.assertIn("broken.pdf", report_text)
         self.assertIn("确认文件是否损坏", report_text)
-        self.assertIn("bash ${OPENCLAW_TASKS_ROOT:-$HOME/.openclaw/workspace/tasks}/ZSXQ_pdf_digest/run.sh --dry-run", report_text)
+        self.assertIn("bash <digest-task-dir>/run.sh --dry-run", report_text)
         self.assertIn("broken.pdf", stream.getvalue())
 
     def test_summary_artifacts_can_be_persisted_and_reloaded_from_cache(self) -> None:

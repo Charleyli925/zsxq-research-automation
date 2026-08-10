@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
@@ -95,6 +98,60 @@ class ArtifactRecord:
     extractor_version: str = ""
     prompt_version: str = ""
     model: str = ""
+    reasoning: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SummaryIdentity:
+    """The complete cache identity for one deterministic summary invocation.
+
+    ``reasoning`` is deliberately part of this value.  A change in Codex
+    reasoning can change the generated artifact even when the model name and
+    prompt bytes do not, so it must never share a durable summary cache entry.
+    An empty reasoning value is reserved for artifacts imported from the
+    version-1 schema; new callers should pass their configured reasoning.
+    """
+
+    pdf_sha256: str
+    extractor_version: str
+    prompt_version: str
+    model: str
+    reasoning: str
+
+    def __post_init__(self) -> None:
+        pdf_sha256 = str(self.pdf_sha256).strip().lower()
+        if len(pdf_sha256) != 64 or any(character not in "0123456789abcdef" for character in pdf_sha256):
+            raise ValueError("pdf_sha256 must be a lowercase SHA256 digest")
+        object.__setattr__(self, "pdf_sha256", pdf_sha256)
+        for field_name in ("extractor_version", "prompt_version", "model"):
+            value = str(getattr(self, field_name)).strip()
+            if not value:
+                raise ValueError(f"{field_name} is required")
+            object.__setattr__(self, field_name, value)
+        object.__setattr__(self, "reasoning", str(self.reasoning).strip())
+
+    @property
+    def canonical_json(self) -> str:
+        """Stable serialization suitable for a cache-key input or audit log."""
+
+        return json.dumps(
+            {
+                "extractor_version": self.extractor_version,
+                "model": self.model,
+                "pdf_sha256": self.pdf_sha256,
+                "prompt_version": self.prompt_version,
+                "reasoning": self.reasoning,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @property
+    def cache_key(self) -> str:
+        """A compact, unambiguous key for filesystem cache namespaces."""
+
+        return hashlib.sha256(self.canonical_json.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +162,10 @@ class PublicationRecord:
     partition_key: str
     state: PublicationState
     remote_reference: str | None
+    target_document: str = ""
+    # Publication metadata is diagnostic and supports safe capacity decisions;
+    # the immutable identity and state above remain the transaction authority.
+    details: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +175,24 @@ class NotificationRecord:
     event: str
     status: str
     created: bool
+    publication_id: int | None = None
+    payload: Mapping[str, Any] = field(default_factory=dict)
+    attempt_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationClaim:
+    """An exclusive outbox-delivery lease returned by the notification drainer."""
+
+    id: int
+    idempotency_key: str
+    event: str
+    payload: Mapping[str, Any]
+    publication_id: int | None
+    lease_token: str
+    claimed_at: datetime
+    lease_expires_at: datetime
+    attempt_count: int
 
 
 def as_stage(value: Stage | str) -> Stage:

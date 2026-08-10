@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Scan the ZSXQ download folder and build one batch of pending PDFs.
 
-This script is the local watcher for the OpenClaw PDF-summary task.
-It keeps a small pending queue in the state file.
-New PDFs stay pending until the caller marks the batch as processed.
-The OpenClaw task reads that batch file next and does the summarization.
+This script is the local watcher for the direct Python digest pipeline.  It
+keeps a small pending queue in the state file; new PDFs remain there until the
+pipeline has durably published them or explicitly quarantined their content.
 """
 
 from __future__ import annotations
@@ -43,6 +42,12 @@ def parse_args() -> argparse.Namespace:
         "--include-existing",
         action="store_true",
         help="On the first run, include existing PDFs instead of only building a baseline.",
+    )
+    parser.add_argument(
+        "--quiet-window-minutes",
+        type=int,
+        default=0,
+        help="Keep PDFs modified within this many minutes pending but out of this batch.",
     )
     return parser.parse_args()
 
@@ -243,11 +248,21 @@ def build_batch(
     state_path: Path,
     pending_files: dict[str, dict[str, int | str]],
     first_run: bool,
-) -> None:
+    quiet_window_minutes: int = 0,
+    now_epoch: float | None = None,
+) -> tuple[int, int]:
+    if int(quiet_window_minutes) < 0:
+        raise ValueError("quiet_window_minutes must be non-negative")
+    current_epoch = time.time() if now_epoch is None else float(now_epoch)
+    eligible_before = current_epoch - (int(quiet_window_minutes) * 60)
     files = []
+    deferred_recent_count = 0
     for path_str in sorted(pending_files.keys(), key=lambda item: pending_files[item]["mtime"]):
         path = Path(path_str)
         info = pending_files[path_str]
+        if int(info["mtime"]) > eligible_before:
+            deferred_recent_count += 1
+            continue
         files.append(
             {
                 "path": path_str,
@@ -272,11 +287,15 @@ def build_batch(
         "batch_file": str(batch_path),
         "first_run": first_run,
         "new_pdf_count": len(files),
+        "pending_pdf_count": len(pending_files),
+        "deferred_recent_count": deferred_recent_count,
+        "quiet_window_minutes": int(quiet_window_minutes),
         "latest_modified_at": files[-1]["modified_at"] if files else None,
         "files": files,
     }
     batch_path.parent.mkdir(parents=True, exist_ok=True)
     batch_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return len(files), deferred_recent_count
 
 
 def acknowledge_batch(
@@ -329,6 +348,8 @@ def acknowledge_batch(
 
 def main() -> int:
     args = parse_args()
+    if args.quiet_window_minutes < 0:
+        raise SystemExit("--quiet-window-minutes must be non-negative")
     root = Path(args.root).expanduser().resolve()
     roots = [root, *[Path(value).expanduser().resolve() for value in args.extra_root]]
     roots = list(dict.fromkeys(roots))
@@ -412,11 +433,22 @@ def main() -> int:
                 pending_sha256s[sha] = path
 
     save_state(state_path, known_files, pending_files, known_sha256s, pending_sha256s)
-    build_batch(root, roots, batch_path, state_path, pending_files, first_run)
+    eligible_count, deferred_recent_count = build_batch(
+        root,
+        roots,
+        batch_path,
+        state_path,
+        pending_files,
+        first_run,
+        quiet_window_minutes=args.quiet_window_minutes,
+    )
 
     summary = {
         "first_run": first_run,
-        "new_pdf_count": len(pending_files),
+        "new_pdf_count": eligible_count,
+        "pending_pdf_count": len(pending_files),
+        "deferred_recent_count": deferred_recent_count,
+        "quiet_window_minutes": args.quiet_window_minutes,
         "batch_file": str(batch_path),
         "root": str(root),
         "roots": [str(item) for item in roots],

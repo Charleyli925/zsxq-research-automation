@@ -17,9 +17,10 @@ source scan
   -> plan-bound download helper
   -> archive + manifest reconciliation
   -> text extraction / OCR
-  -> summary + quarantine
-  -> Feishu notification
-  -> ResearchLibrary / Obsidian index
+  -> direct Codex summary + durable local Markdown / quarantine
+  -> ResearchLibrary readable-summary projection (best effort)
+  -> Lark document publication + notification outbox
+  -> verified document -> Obsidian reading projection (best effort)
 ```
 
 The important invariant is that browser success is not archive proof. A run is
@@ -28,7 +29,11 @@ complete only after the finalizer and manifest account for every planned file.
 ## Repository layout
 
 - `scripts/`: download, reconciliation, report-processing, and knowledge-base tools
-- `openclaw_tasks/`: version-controlled OpenClaw task entrypoints
+- `openclaw_tasks/`: version-controlled compatibility task entrypoints; the
+  digest wrapper keeps its existing cron schedule but invokes the Python
+  pipeline directly
+- `src/zsxq_pipeline/`: durable state, extraction, direct Codex summary, and
+  direct lark-cli publication adapters
 - `deploy/`: sanitized macOS LaunchAgent templates and release deployment tools
 - `prompts/`: browser and summary task contracts
 - `config/examples/`: sanitized configuration examples
@@ -64,6 +69,14 @@ cp openclaw_tasks/zsxq_pdf_digest/config.env.example \
 Replace every placeholder before a real run. `config/local/` and `config.env`
 are ignored by Git.
 
+The PDF digest does not require the OpenClaw binary, an agent registry, an
+agent session, or agent auth files. It calls `codex exec` with an ephemeral,
+read-only structured-output contract after text extraction. It creates,
+fetches, and authorizes Lark documents as the local `user` identity, then
+sends any group notification as the `bot` identity. A legacy-named
+`LARKSUITE_CLI_CONFIG_DIR` is only an existing lark-cli profile location, not
+a runtime dependency on OpenClaw.
+
 ## Validation
 
 ```bash
@@ -75,6 +88,17 @@ bash -n openclaw_tasks/zsxq_pdf_digest/*.sh
 
 Tests must not require a real ZSXQ login, Feishu identity, downloaded report,
 or production directory.
+
+The preflight below only checks locally installed command capabilities; it
+does not create a document, send a group message, or run a real model canary.
+
+```bash
+codex exec --help
+lark-cli docs +create --help
+lark-cli docs +update --help
+lark-cli docs +fetch --help
+lark-cli im +messages-send --help
+```
 
 ## Source-of-truth policy
 
