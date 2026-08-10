@@ -51,6 +51,26 @@ TEXT_PATTERNS = {
     ),
     "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 }
+DOWNLOAD_RUNTIME_PATTERNS = {
+    "legacy OpenClaw agent invocation": re.compile(r"\bopenclaw\s+agent\b", re.IGNORECASE),
+    "legacy Codex download launcher": re.compile(r"run_zsxq(?:_domestic_cicc)?_task_via_codex", re.IGNORECASE),
+    "dynamic Playwright MCP": re.compile(r"@playwright/mcp@latest|npx\s+.*playwright", re.IGNORECASE),
+    "direct Codex execution in download runtime": re.compile(r"\bcodex\s+exec\b", re.IGNORECASE),
+}
+
+
+def is_active_download_runtime(relative: Path) -> bool:
+    rendered = relative.as_posix()
+    return rendered.startswith("openclaw_tasks/zsxq_download/") or rendered in {
+        "scripts/scan_zsxq_download_candidates.py",
+        "scripts/download_zsxq_plan_file.py",
+        "scripts/finalize_download_batch.py",
+        "scripts/zsxq_preflight.py",
+        "scripts/run_zsxq_download_pipeline.py",
+        "src/zsxq_pipeline/browser.py",
+        "src/zsxq_pipeline/download.py",
+        "deploy/install_local_runtime.sh",
+    }
 
 
 def iter_repository_files(root: Path = ROOT) -> list[Path]:
@@ -93,6 +113,10 @@ def main() -> int:
         for label, pattern in TEXT_PATTERNS.items():
             if pattern.search(text):
                 violations.append(f"{relative}: {label}")
+        if is_active_download_runtime(relative):
+            for label, pattern in DOWNLOAD_RUNTIME_PATTERNS.items():
+                if pattern.search(text):
+                    violations.append(f"{relative}: {label}")
 
     if violations:
         print("Repository hygiene check failed:", file=sys.stderr)

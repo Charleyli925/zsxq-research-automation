@@ -27,7 +27,6 @@ class UpdateZsxqFocusTests(unittest.TestCase):
         self.tmp_path = Path(self.temp_dir.name)
         self.keywords_path = self.tmp_path / "interest_keywords.json"
         self.runtime_state_path = self.tmp_path / "runtime_state.json"
-        self.runtime_prompt_path = self.tmp_path / "runtime_prompt.md"
         self.keywords_path.write_text(
             json.dumps(
                 {
@@ -45,10 +44,8 @@ class UpdateZsxqFocusTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.runtime_state_path.write_text("{}\n", encoding="utf-8")
-        self.runtime_prompt_path.write_text("# placeholder\n", encoding="utf-8")
         MODULE.KEYWORDS_PATH = self.keywords_path
         MODULE.RUNTIME_STATE_PATH = self.runtime_state_path
-        MODULE.RUNTIME_PROMPT_PATH = self.runtime_prompt_path
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -70,7 +67,7 @@ class UpdateZsxqFocusTests(unittest.TestCase):
         self.assertIn("OpenAI", payload["standalone_keywords"])
         self.assertNotIn("match_keywords", payload)
 
-    def test_temporary_add_updates_runtime_state_and_prompt(self) -> None:
+    def test_temporary_add_updates_runtime_state_without_a_generated_control_prompt(self) -> None:
         with patch("sys.argv", [
             "update_zsxq_focus.py",
             "--scope", "temporary",
@@ -81,13 +78,10 @@ class UpdateZsxqFocusTests(unittest.TestCase):
             MODULE.main()
 
         runtime_state = json.loads(self.runtime_state_path.read_text(encoding="utf-8"))
-        prompt_text = self.runtime_prompt_path.read_text(encoding="utf-8")
         self.assertTrue(runtime_state["temporary_focus_enabled"])
         self.assertIn("伊朗", runtime_state["temporary_focus"])
-        self.assertIn("伊朗", prompt_text)
-        self.assertIn("Keep an eye on energy reports.", prompt_text)
 
-    def test_persistent_note_updates_prompt_snapshot(self) -> None:
+    def test_persistent_note_updates_structured_config(self) -> None:
         with patch("sys.argv", [
             "update_zsxq_focus.py",
             "--scope", "persistent",
@@ -97,9 +91,7 @@ class UpdateZsxqFocusTests(unittest.TestCase):
             MODULE.main()
 
         payload = json.loads(self.keywords_path.read_text(encoding="utf-8"))
-        prompt_text = self.runtime_prompt_path.read_text(encoding="utf-8")
         self.assertIn("只看高优先级风险。", payload["notes"])
-        self.assertIn("只看高优先级风险。", prompt_text)
 
 
 if __name__ == "__main__":

@@ -16,10 +16,5 @@
   "research_library": {
     "root": "~/Library/Application Support/investment-reports-automation/ResearchLibrary",
     "pdf_root": "~/Library/Application Support/investment-reports-automation/ResearchLibrary/pdfs"
-  },
-  "automation_inputs": {
-    "keyword_file": "config/local/interest_keywords.json",
-    "runtime_prompt_file": "prompts/openclaw_runtime_prompt.md",
-    "state_file": ".runtime/state/zsxq_reports_state.json"
   }
 }

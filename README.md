@@ -14,7 +14,7 @@ runtime state, and machine-specific configuration stay outside Git.
 ```text
 source scan
   -> immutable candidate plan
-  -> plan-bound download helper
+  -> plan-bound Playwright/CDP download
   -> archive + manifest reconciliation
   -> text extraction / OCR
   -> direct Codex summary + durable local Markdown / quarantine
@@ -29,13 +29,12 @@ complete only after the finalizer and manifest account for every planned file.
 ## Repository layout
 
 - `scripts/`: download, reconciliation, report-processing, and knowledge-base tools
-- `openclaw_tasks/`: version-controlled compatibility task entrypoints; the
-  digest wrapper keeps its existing cron schedule but invokes the Python
-  pipeline directly
+- `openclaw_tasks/`: legacy-named compatibility task directories; their
+  wrappers invoke versioned Python commands directly and keep only local
+  logs, result exports, and notification rendering until scheduler cutover
 - `src/zsxq_pipeline/`: durable state, extraction, direct Codex summary, and
   direct lark-cli publication adapters
 - `deploy/`: sanitized macOS LaunchAgent templates and release deployment tools
-- `prompts/`: browser and summary task contracts
 - `config/examples/`: sanitized configuration examples
 - `tests/`: unit and workflow tests built around synthetic data
 - `docs/`: architecture, deployment, and operating conventions
@@ -62,26 +61,29 @@ Prepare local configuration:
 mkdir -p config/local
 cp config/examples/job.example.json config/local/zsxq_foreign_reports_job.json
 cp config/examples/keywords.example.json config/local/interest_keywords.json
+cp openclaw_tasks/zsxq_download/config.foreign.env.example \
+  /actual/task/ZSXQ_autodownload/config.env
 cp openclaw_tasks/zsxq_pdf_digest/config.env.example \
-  openclaw_tasks/zsxq_pdf_digest/config.env
+  /actual/task/ZSXQ_pdf_digest/config.env
 ```
 
 Replace every placeholder before a real run. `config/local/` and `config.env`
 are ignored by Git.
 
-The PDF digest does not require the OpenClaw binary, an agent registry, an
-agent session, or agent auth files. It calls `codex exec` with an ephemeral,
-read-only structured-output contract after text extraction. It creates,
-fetches, and authorizes Lark documents as the local `user` identity, then
-sends any group notification as the `bot` identity. A legacy-named
-`LARKSUITE_CLI_CONFIG_DIR` is only an existing lark-cli profile location, not
-a runtime dependency on OpenClaw.
+The download path uses one authenticated Chrome for Testing CDP session per
+immutable source window. It has no model, agent, MCP, or dynamic package
+runtime dependency. The digest calls `codex exec` only after text extraction,
+with an ephemeral read-only structured-output contract. It creates, fetches,
+and authorizes Lark documents as the local `user` identity, then sends group
+notifications as the `bot` identity. A legacy-named `LARKSUITE_CLI_CONFIG_DIR`
+is only an existing lark-cli profile location, not a runtime dependency.
 
 ## Validation
 
 ```bash
 python scripts/check_repository_hygiene.py
 bash -n scripts/*.sh
+bash -n openclaw_tasks/zsxq_download/*.sh
 bash -n openclaw_tasks/zsxq_pdf_digest/*.sh
 .venv/bin/python -m pytest -q
 ```

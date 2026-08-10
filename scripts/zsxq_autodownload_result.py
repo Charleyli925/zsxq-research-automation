@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Single-source result builder and renderer for ZSXQ autodownload runs."""
+"""Historical result parser and renderer for archived ZSXQ download runs.
+
+The direct Python download pipeline writes its canonical result itself and
+does not import this module. The Codex/Agent markers below are retained only
+to render or inspect legacy run logs during migration.
+"""
 
 from __future__ import annotations
 
@@ -225,6 +230,7 @@ def derive_reason_code(*, codex_rc: int, downloaded_count: int, no_download_reas
         and "operation not permitted" in lowered
         and "run_zsxq_task_via_codex.sh" in lowered
     ):
+        # Historical Agent-launcher log marker; never a direct-pipeline input.
         return "blocked_documents_permission"
     if codex_rc != 0 and has_cloud_requirements_timeout(raw_text):
         return "cloud_requirements_timeout"

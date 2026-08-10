@@ -13,9 +13,10 @@ try:
     from runtime_paths import DEFAULT_RUNTIME_ROOT, REPO_ROOT
     from zsxq_focus_config import (
         build_runtime_state,
+        effective_focus,
+        effective_notes,
         load_persistent_config,
         load_runtime_state,
-        rebuild_runtime_prompt,
         save_persistent_config,
         save_runtime_state,
         unique_keep_order,
@@ -25,9 +26,10 @@ except ModuleNotFoundError:  # pragma: no cover - package import fallback
     from scripts.runtime_paths import DEFAULT_RUNTIME_ROOT, REPO_ROOT
     from scripts.zsxq_focus_config import (
         build_runtime_state,
+        effective_focus,
+        effective_notes,
         load_persistent_config,
         load_runtime_state,
-        rebuild_runtime_prompt,
         save_persistent_config,
         save_runtime_state,
         unique_keep_order,
@@ -36,7 +38,6 @@ except ModuleNotFoundError:  # pragma: no cover - package import fallback
 
 KEYWORDS_PATH = REPO_ROOT / "config/local/interest_keywords.json"
 RUNTIME_STATE_PATH = DEFAULT_RUNTIME_ROOT / "state/zsxq_focus_runtime_state.json"
-RUNTIME_PROMPT_PATH = DEFAULT_RUNTIME_ROOT / "prompts/openclaw_runtime_prompt.md"
 
 
 def parse_args() -> argparse.Namespace:
@@ -116,13 +117,10 @@ def main() -> int:
             merged_notes["notes"] = update_note_text(merged_notes.get("notes", ""), notes, args.action)
             save_persistent_config(KEYWORDS_PATH, merged_notes)
 
-    runtime_snapshot = rebuild_runtime_prompt(
-        config_path=KEYWORDS_PATH,
-        runtime_state_path=RUNTIME_STATE_PATH,
-        runtime_prompt_path=RUNTIME_PROMPT_PATH,
-    )
-    result["runtime_focus"] = runtime_snapshot["focus"]
-    result["runtime_notes"] = runtime_snapshot["notes"]
+    final_config = load_persistent_config(KEYWORDS_PATH)
+    final_runtime_state = load_runtime_state(RUNTIME_STATE_PATH)
+    result["runtime_focus"] = effective_focus(final_config, final_runtime_state)
+    result["runtime_notes"] = effective_notes(final_config, final_runtime_state)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

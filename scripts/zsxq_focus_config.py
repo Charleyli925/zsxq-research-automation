@@ -206,48 +206,6 @@ def update_persistent_config(
     return normalize_persistent_config(next_config)
 
 
-def render_runtime_prompt(config: dict[str, Any], runtime_state: dict[str, Any]) -> str:
-    focus = effective_focus(config, runtime_state)
-    notes = effective_notes(config, runtime_state)
-
-    focus_lines = focus or ["暂无明确关注方向"]
-    note_lines = notes or ["暂无临时备注"]
-
-    lines = [
-        "# OpenClaw Runtime Prompt",
-        "",
-        "This file is generated from `config/local/interest_keywords.json` and runtime state.",
-        "Do not edit it by hand.",
-        "",
-        "## Current focus",
-        "",
-    ]
-    lines.extend([f"- {item}" for item in focus_lines])
-    lines.extend(["", "## Temporary notes", ""])
-    lines.extend([f"- {item}" for item in note_lines])
-    lines.append("")
-    return "\n".join(lines)
-
-
-def rebuild_runtime_prompt(
-    *,
-    config_path: Path,
-    runtime_state_path: Path,
-    runtime_prompt_path: Path,
-) -> dict[str, list[str]]:
-    config = load_persistent_config(config_path)
-    runtime_state = load_runtime_state(runtime_state_path)
-    runtime_prompt_path.parent.mkdir(parents=True, exist_ok=True)
-    runtime_prompt_path.write_text(
-        render_runtime_prompt(config, runtime_state),
-        encoding="utf-8",
-    )
-    return {
-        "focus": effective_focus(config, runtime_state),
-        "notes": effective_notes(config, runtime_state),
-    }
-
-
 def build_runtime_state(
     *,
     config: dict[str, Any],

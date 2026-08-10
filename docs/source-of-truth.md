@@ -20,28 +20,28 @@ mandatory. See [development-workflow.md](development-workflow.md).
 A deployment records the exact tag or commit SHA it runs. Machine-specific
 configuration refers to that code but does not copy or fork it. The foreign
 download task, domestic-CICC task, and `ZSXQ_pdf_digest` are one deployment
-unit. For the digest, its cron wrappers, direct Python pipeline, packaged
-prompts/extractor, and local sidecar adapters must resolve to the same release
-checkout.
+unit. Their compatibility wrappers, direct Python pipelines, extractor, and
+local sidecar adapters must resolve to the same release checkout.
 
 Development and production checkouts are separate so a scheduler cannot
 execute an uncommitted edit.
 
-For the digest, ownership is deliberately split:
+For each compatibility task, ownership is deliberately split:
 
 - `config.env` owns business configuration: chat ID, local data roots,
-  identity selection, model/runtime tuning, and scheduler-facing options. It
-  cannot select an alternative digest source checkout.
+  source IDs, browser endpoint/profile settings, identity selection,
+  model/runtime tuning, and scheduler-facing options. It cannot select an
+  alternative source checkout.
 - installer-generated `deployment.env` remains release metadata for the local
   task installation. It cannot contain chat IDs, credentials, browser profile
   paths, logs, state, or downloaded content.
 - `.deployment/investment-reports-automation.json` records the deployed Git
   SHA, release root, task directories, and each task's scheduler type.
 
-The digest wrapper resolves its own linked source path and puts only that
-release's `src/` tree on `PYTHONPATH`; it does not snapshot a shell worker or
-accept a source-root override from `config.env`. A release mismatch is a
-deployment fault, not a transient retry.
+The wrappers resolve their own linked source path and put only that release's
+`src/` tree on `PYTHONPATH`; they do not snapshot a shell worker, interpret a
+browser prompt, or accept a source-root override from `config.env`. A release
+mismatch is a deployment fault, not a transient retry.
 
 ## Runtime state
 

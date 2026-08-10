@@ -3,7 +3,8 @@
 This file scans the current ZSXQ window and builds the exact PDF download plan.
 
 Relation to other files:
-- `prompts/openclaw_task_template.md` tells Codex to run this script first.
+- `zsxq_pipeline.download` reuses this scanner during a deterministic
+  download transaction.
 - `zsxq_keyword_matcher.py` is reused here so title matching stays consistent.
 - `config/local/zsxq_foreign_reports_job.json` provides the group URL, tag URL, and archive root.
 """
@@ -11,6 +12,7 @@ Relation to other files:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import time
@@ -283,77 +285,176 @@ def fetch_topics_from_browser(
     group_name: str = "前沿信息收录",
     tag_name: str = "",
 ) -> tuple[str | None, list[dict[str, Any]]]:
-    window_topics: list[dict[str, Any]] = []
-
     try:
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp(cdp_endpoint, timeout=45_000)
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = context.new_page()
-            navigation_reason = navigate_tag_page(
-                page,
-                tag_url=tag_url,
-                group_url=group_url,
-                group_name=group_name,
-                tag_name=tag_name,
-            )
-            if navigation_reason is not None:
-                return navigation_reason, []
-
-            url = topics_api_url
-            while url:
-                topics: list[dict[str, Any]] | None = None
-                last_error: str | None = None
-
-                for attempt in range(TOPICS_API_MAX_RETRIES):
-                    payload = page.evaluate(
-                        """async (u) => {
-                            const response = await fetch(u, { credentials: 'include' });
-                            const text = await response.text();
-                            return { ok: response.ok, status: response.status, text };
-                        }""",
-                        url,
-                    )
-                    error, topics = parse_topics_api_payload(payload)
-                    if error is None:
-                        break
-                    last_error = error
-                    if not is_retryable_topics_api_error(error) or attempt == TOPICS_API_MAX_RETRIES - 1:
-                        return error, []
-                    # 1059 is usually a short-lived session/business error. Refreshing
-                    # the tag page renews the browser-side request context; the bounded
-                    # backoff keeps this recovery inside the one immutable scan call.
-                    navigation_reason = navigate_tag_page(
-                        page,
-                        tag_url=tag_url,
-                        group_url=group_url,
-                        group_name=group_name,
-                        tag_name=tag_name,
-                    )
-                    if navigation_reason is not None:
-                        return navigation_reason, []
-                    delay_index = min(attempt, len(TOPICS_API_RETRY_DELAYS_SECONDS) - 1)
-                    time.sleep(TOPICS_API_RETRY_DELAYS_SECONDS[delay_index])
-
-                if topics is None:
-                    return last_error or "api_unknown_error", []
-                if not topics:
-                    break
-
-                for topic in topics:
-                    window_topics.append(topic)
-
-                last_topic = topics[-1]
-                last_create = str(last_topic.get("create_time") or "").strip() if isinstance(last_topic, dict) else ""
-                if not last_create:
-                    break
-                if parse_iso_datetime(last_create) < window_start:
-                    break
-                url = f"{topics_api_url}&end_time={quote(last_create, safe='')}"
+            try:
+                return fetch_topics_from_page(
+                    page,
+                    tag_url=tag_url,
+                    topics_api_url=topics_api_url,
+                    window_start=window_start,
+                    group_url=group_url,
+                    group_name=group_name,
+                    tag_name=tag_name,
+                )
+            finally:
+                close = getattr(page, "close", None)
+                if callable(close):
+                    close()
     except PlaywrightError:
         return "api_unavailable", []
 
+
+def fetch_topics_from_page(
+    page: Any,
+    *,
+    tag_url: str,
+    topics_api_url: str,
+    window_start: datetime,
+    group_url: str = "",
+    group_name: str = "前沿信息收录",
+    tag_name: str = "",
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """Scan through a caller-owned, authenticated browser page."""
+
+    window_topics: list[dict[str, Any]] = []
+    try:
+        navigation_reason = navigate_tag_page(
+            page,
+            tag_url=tag_url,
+            group_url=group_url,
+            group_name=group_name,
+            tag_name=tag_name,
+        )
+        if navigation_reason is not None:
+            return navigation_reason, []
+
+        url = topics_api_url
+        while url:
+            topics: list[dict[str, Any]] | None = None
+            last_error: str | None = None
+            for attempt in range(TOPICS_API_MAX_RETRIES):
+                payload = page.evaluate(
+                    """async (u) => {
+                        const response = await fetch(u, { credentials: 'include' });
+                        const text = await response.text();
+                        return { ok: response.ok, status: response.status, text };
+                    }""",
+                    url,
+                )
+                error, topics = parse_topics_api_payload(payload)
+                if error is None:
+                    break
+                last_error = error
+                if not is_retryable_topics_api_error(error) or attempt == TOPICS_API_MAX_RETRIES - 1:
+                    return error, []
+                navigation_reason = navigate_tag_page(
+                    page,
+                    tag_url=tag_url,
+                    group_url=group_url,
+                    group_name=group_name,
+                    tag_name=tag_name,
+                )
+                if navigation_reason is not None:
+                    return navigation_reason, []
+                delay_index = min(attempt, len(TOPICS_API_RETRY_DELAYS_SECONDS) - 1)
+                time.sleep(TOPICS_API_RETRY_DELAYS_SECONDS[delay_index])
+
+            if topics is None:
+                return last_error or "api_unknown_error", []
+            if not topics:
+                break
+            window_topics.extend(topics)
+            last_topic = topics[-1]
+            last_create = str(last_topic.get("create_time") or "").strip() if isinstance(last_topic, dict) else ""
+            if not last_create or parse_iso_datetime(last_create) < window_start:
+                break
+            url = f"{topics_api_url}&end_time={quote(last_create, safe='')}"
+    except PlaywrightError:
+        return "api_unavailable", []
     return None, window_topics
+
+
+def canonical_plan_hash(payload: dict[str, Any]) -> str:
+    """Return a stable immutable-plan digest without self-referencing it."""
+
+    canonical = dict(payload)
+    canonical.pop("plan_hash", None)
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_scan_plan(
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    job_config: dict[str, Any],
+    keyword_payload: dict[str, Any],
+    blocked_reason: str | None,
+    raw_topics: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the versioned immutable plan shared by the CLI and pipeline."""
+
+    group_url = str(job_config.get("group_url") or "").strip()
+    archive_root = Path(((((job_config.get("download_settings") or {}).get("archive_root")) or "").strip()))
+    filtered = filter_topics(
+        raw_topics,
+        window_start=window_start,
+        window_end=window_end,
+        keyword_payload=keyword_payload,
+        archived_names=build_archived_name_set(archive_root),
+        group_url=group_url,
+    )
+    result: dict[str, Any] = {
+        "schema_version": 3,
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "scan_mode": "api_first",
+        "api_probe_status": "need_reauth" if blocked_reason == "need_reauth" else ("ok" if blocked_reason is None else "failed"),
+        "blocked_reason": blocked_reason,
+        "window_new_docs_count": len(filtered["topics"]),
+        "keyword_matched_docs_count": len(filtered["matched_topics"]),
+        "download_candidate_count": len(filtered["download_candidates"]),
+        "skipped_duplicate_count": len(filtered["skipped_duplicates"]),
+        **filtered,
+    }
+    result["plan_hash"] = canonical_plan_hash(result)
+    return result
+
+
+def scan_window(
+    page: Any,
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    job_config: dict[str, Any],
+    keyword_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Create one immutable plan using the pipeline's existing CDP page."""
+
+    group_url = str(job_config.get("group_url") or "").strip()
+    tag_url = str(job_config.get("tag_url") or "").strip()
+    tag_id = extract_tag_id(tag_url)
+    blocked_reason, raw_topics = fetch_topics_from_page(
+        page,
+        tag_url=tag_url,
+        topics_api_url=f"https://api.zsxq.com/v2/hashtags/{tag_id}/topics?count=20",
+        window_start=window_start,
+        group_url=group_url,
+        group_name=str(job_config.get("group_name") or "前沿信息收录").strip(),
+        tag_name=str(job_config.get("tag_name") or "").strip(),
+    )
+    return build_scan_plan(
+        window_start=window_start,
+        window_end=window_end,
+        job_config=job_config,
+        keyword_payload=keyword_payload,
+        blocked_reason=blocked_reason,
+        raw_topics=raw_topics,
+    )
 
 
 def main() -> int:
@@ -366,9 +467,6 @@ def main() -> int:
 
     group_url = str(job_config.get("group_url") or "").strip()
     tag_url = str(job_config.get("tag_url") or "").strip()
-    archive_root = Path(
-        (((job_config.get("download_settings") or {}).get("archive_root")) or "").strip()
-    )
     tag_id = extract_tag_id(tag_url)
     topics_api_url = f"https://api.zsxq.com/v2/hashtags/{tag_id}/topics?count=20"
 
@@ -382,28 +480,14 @@ def main() -> int:
         tag_name=str(job_config.get("tag_name") or "").strip(),
     )
 
-    archived_names = build_archived_name_set(archive_root)
-    filtered = filter_topics(
-        raw_topics,
+    result = build_scan_plan(
         window_start=window_start,
         window_end=window_end,
+        job_config=job_config,
         keyword_payload=keyword_payload,
-        archived_names=archived_names,
-        group_url=group_url,
+        blocked_reason=blocked_reason,
+        raw_topics=raw_topics,
     )
-
-    result = {
-        "window_start": window_start.isoformat(),
-        "window_end": window_end.isoformat(),
-        "scan_mode": "api_first",
-        "api_probe_status": "need_reauth" if blocked_reason == "need_reauth" else ("ok" if blocked_reason is None else "failed"),
-        "blocked_reason": blocked_reason,
-        "window_new_docs_count": len(filtered["topics"]),
-        "keyword_matched_docs_count": len(filtered["matched_topics"]),
-        "download_candidate_count": len(filtered["download_candidates"]),
-        "skipped_duplicate_count": len(filtered["skipped_duplicates"]),
-        **filtered,
-    }
 
     output = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:

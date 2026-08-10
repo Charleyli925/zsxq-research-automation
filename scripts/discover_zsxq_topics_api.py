@@ -3,8 +3,8 @@
 This file probes the current ZSXQ topic-list API from a live logged-in browser session.
 
 Relation to other files:
-- `prompts/openclaw_task_template.md` asks Codex to run this script only when API-first
-  candidate scanning fails and DOM fallback is about to start.
+- The deterministic download pipeline may run this bounded diagnostic only when
+  API-first candidate scanning fails and DOM fallback is about to start.
 - This script does not download files, archive files, or update task state.
 """
 

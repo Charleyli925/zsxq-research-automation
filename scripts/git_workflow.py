@@ -190,11 +190,31 @@ def select_test_targets(repo: Path, changed_paths: Iterable[str]) -> list[str]:
         if path in {"scripts/git_workflow.py", "scripts/check_repository_hygiene.py", "AGENTS.md", "docs/development-workflow.md"}:
             targets.add("tests/test_git_workflow.py")
         elif path.startswith(("deploy/", "openclaw_tasks/zsxq_download/")):
-            targets.add("tests/test_local_runtime_deployment.py")
+            targets.update({"tests/test_local_runtime_deployment.py", "tests/test_zsxq_download_launcher_runtime.py"})
         elif path.startswith("openclaw_tasks/zsxq_pdf_digest/"):
             targets.add("tests/test_zsxq_pdf_digest_run.py")
-        elif path in {"scripts/run_zsxq_task_via_codex.sh", "scripts/run_zsxq_domestic_cicc_task_via_codex.sh"}:
-            targets.add("tests/test_zsxq_download_launcher_runtime.py")
+        elif path in {
+            "scripts/run_zsxq_download_pipeline.py",
+            "scripts/scan_zsxq_download_candidates.py",
+            "scripts/download_zsxq_plan_file.py",
+            "scripts/finalize_download_batch.py",
+            "scripts/zsxq_preflight.py",
+            "src/zsxq_pipeline/browser.py",
+            "src/zsxq_pipeline/download.py",
+        }:
+            targets.update(
+                {
+                    "tests/test_pipeline_browser.py",
+                    "tests/test_pipeline_download.py",
+                    "tests/test_pipeline_download_result.py",
+                    "tests/test_scan_zsxq_download_candidates.py",
+                    "tests/test_download_zsxq_plan_file.py",
+                    "tests/test_finalize_download_batch.py",
+                    "tests/test_zsxq_preflight.py",
+                }
+            )
+        elif path in {"src/zsxq_pipeline/cli.py", "src/zsxq_pipeline/config.py"}:
+            targets.add("tests/test_pipeline_cli.py")
         elif path == "scripts/zsxq_autodownload_result.py":
             targets.add("tests/test_zsxq_autodownload_result.py")
         elif path.endswith((".py", ".sh")):

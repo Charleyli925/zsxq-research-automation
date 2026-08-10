@@ -18,11 +18,32 @@ prompt_version = "summary-v1"
 
 [sources.foreign_reports]
 kind = "zsxq"
+# The JSON files stay outside Git.  The database becomes authoritative after
+# the initial import; state_path is retained only as the finalizer's legacy
+# read-only checkpoint mirror during cutover.
 state_path = "state/foreign_reports.json"
+job_config = "/absolute/path/to/zsxq_foreign_reports_job.json"
+keyword_file = "/absolute/path/to/interest_keywords.json"
+cdp_endpoint = "http://127.0.0.1:9223"
+cft_executable = "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+cft_user_data_dir = "/absolute/path/to/zsxq-cft-profile"
+cft_start_url = "https://wx.zsxq.com/group/YOUR_GROUP_ID"
+cft_headless = true
+cft_window_size = "1440,1200"
+workflow_version = "download:v1"
 
 [sources.domestic_cicc]
 kind = "zsxq"
 state_path = "state/domestic_cicc.json"
+job_config = "/absolute/path/to/zsxq_domestic_cicc_reports_job.json"
+keyword_file = "/absolute/path/to/zsxq_domestic_cicc_keywords.json"
+cdp_endpoint = "http://127.0.0.1:9223"
+cft_executable = "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+cft_user_data_dir = "/absolute/path/to/zsxq-cft-profile"
+cft_start_url = "https://wx.zsxq.com/group/YOUR_GROUP_ID"
+cft_headless = true
+cft_window_size = "1440,1200"
+workflow_version = "download:v1"
 
 [publish_targets.daily_digest]
 kind = "lark"
