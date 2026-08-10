@@ -28,6 +28,7 @@ class ArchiveToObsidianTests(unittest.TestCase):
             pdf_path = base / "alpha.pdf"
             batch_id = "2026-05-07_10-00-00__to__2026-05-07_10-10-00"
             summary_path = library_root / "summaries" / batch_id / "alpha.summary.md"
+            library_database = base / "runtime" / "research_library.sqlite"
             batch_path = base / "batch.json"
             pdf_path.write_bytes(b"%PDF-test")
             summary_path.parent.mkdir(parents=True)
@@ -57,6 +58,7 @@ class ArchiveToObsidianTests(unittest.TestCase):
                 library_root=library_root,
                 vault_root=vault_root,
                 feishu_doc_url="https://example.com/doc",
+                library_database=library_database,
             )
             updated = json.loads(batch_path.read_text(encoding="utf-8"))["files"][0]
             note_path = Path(updated["obsidian_note_path"])
@@ -69,6 +71,8 @@ class ArchiveToObsidianTests(unittest.TestCase):
             self.assertIn("feishu_doc_url", note_text)
             self.assertIn("https://example.com/doc", note_text)
             self.assertIn("# Alpha", note_text)
+            self.assertTrue(library_database.is_file())
+            self.assertFalse((library_root / "state" / "processed_files.sqlite").exists())
 
 
 if __name__ == "__main__":

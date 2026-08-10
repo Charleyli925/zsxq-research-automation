@@ -12,7 +12,13 @@ placeholder paths/identities. Keep credentials, browser profiles, report
 content, and the real target chat outside the checkout.
 Set `pipeline.research_library_root` and `pipeline.obsidian_vault_root` to the
 existing writable absolute paths when those local projections are required;
-`doctor` fails closed if a configured destination is unavailable.
+set `pipeline.research_library_database` to one path inside `runtime.root`.
+macOS background jobs cannot safely open SQLite databases under
+`~/Documents`, even when ordinary Markdown writes work there. Keep one index
+database in the runtime and, when preserving an older library layout, replace
+the old database path with a symlink to that same file after an idle backup.
+`doctor` fails closed if a configured destination or database parent is
+unavailable.
 
 ## Release install
 

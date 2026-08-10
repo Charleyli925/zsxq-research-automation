@@ -14,3 +14,6 @@ All notable changes will be documented here.
   package-owned pipeline.
 - Restored configured ResearchLibrary and Obsidian projections in the unified
   processing path and added lint/retired-entrypoint gates.
+- Routed every ResearchLibrary and Obsidian sidecar through one explicit SQLite
+  index inside the runtime root so the unified LaunchAgent avoids macOS
+  Documents-folder TCC denials.

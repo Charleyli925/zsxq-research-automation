@@ -84,8 +84,11 @@ summary_max_workers = 2
 doc_group_size = 10
 doc_group_threshold = 15
 max_files_per_document = 20
-# Optional durable local projections. Both paths must be absolute when set.
+# Optional durable local projections. The human-readable roots must be
+# absolute. Keep the SQLite index inside runtime.root so a background
+# LaunchAgent never needs TCC access to a database under ~/Documents.
 research_library_root = "/absolute/path/to/ResearchLibrary"
+research_library_database = "state/research_library.sqlite"
 obsidian_vault_root = "/absolute/path/to/Obsidian/ResearchVault"
 
 [publish_targets.daily_digest]

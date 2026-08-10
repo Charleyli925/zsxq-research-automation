@@ -528,6 +528,11 @@ def record_text_extract_started_events_from_batch(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Maintain the local ResearchLibrary SQLite index.")
     parser.add_argument("--library-root", default="")
+    parser.add_argument(
+        "--database",
+        default="",
+        help="Optional absolute index path outside TCC-protected folders for background runtimes.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("init", help="Create or migrate the index database.")
@@ -590,7 +595,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     library_root = library_root_from_arg(args.library_root)
-    db_path = db_path_for_library(library_root)
+    db_path = (
+        Path(args.database).expanduser().resolve(strict=False)
+        if str(args.database).strip()
+        else db_path_for_library(library_root)
+    )
 
     if args.command == "init":
         ensure_schema(db_path)

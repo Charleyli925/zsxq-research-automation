@@ -147,7 +147,12 @@ def render_note(item: dict[str, Any], feishu_doc_url: str) -> str:
     return "\n".join(lines)
 
 
-def enrich_note_metadata(note_path: Path, vault_root: Path, library_root: Path) -> dict[str, Any]:
+def enrich_note_metadata(
+    note_path: Path,
+    vault_root: Path,
+    library_root: Path,
+    library_database: Path | None = None,
+) -> dict[str, Any]:
     configs = load_kb_configs(library_root / "config")
     note = load_note(note_path, vault_root)
     metadata = extract_report_metadata(note, configs, vault_root)
@@ -157,11 +162,17 @@ def enrich_note_metadata(note_path: Path, vault_root: Path, library_root: Path) 
     if changed_fields:
         note_path.write_text(render_frontmatter(merged, body), encoding="utf-8")
         note = load_note(note_path, vault_root)
-    upsert_metadata(db_path_for_library(library_root), note, metadata, "archive_to_obsidian")
+    upsert_metadata(library_database or db_path_for_library(library_root), note, metadata, "archive_to_obsidian")
     return metadata
 
 
-def archive_batch(batch_file: Path, library_root: Path, vault_root: Path, feishu_doc_url: str) -> dict[str, Any]:
+def archive_batch(
+    batch_file: Path,
+    library_root: Path,
+    vault_root: Path,
+    feishu_doc_url: str,
+    library_database: Path | None = None,
+) -> dict[str, Any]:
     batch = json.loads(batch_file.read_text(encoding="utf-8"))
     files = batch.get("files", [])
     if not isinstance(files, list):
@@ -179,13 +190,13 @@ def archive_batch(batch_file: Path, library_root: Path, vault_root: Path, feishu
         try:
             note_path.parent.mkdir(parents=True, exist_ok=True)
             note_path.write_text(render_note(item, feishu_doc_url), encoding="utf-8")
-            metadata = enrich_note_metadata(note_path, vault_root, library_root)
+            metadata = enrich_note_metadata(note_path, vault_root, library_root, library_database)
             item["obsidian_note_path"] = str(note_path)
             item["feishu_doc_url"] = feishu_doc_url or str(item.get("feishu_doc_url", "") or "")
             item["metadata_confidence"] = metadata.get("metadata_confidence", 0)
             item["metadata_status"] = metadata.get("metadata_status", "")
             archived_count += 1
-            db_path = db_path_for_library(library_root)
+            db_path = library_database or db_path_for_library(library_root)
             upsert_report(
                 db_path,
                 {
@@ -219,7 +230,7 @@ def archive_batch(batch_file: Path, library_root: Path, vault_root: Path, feishu
         except Exception as exc:
             item["obsidian_error"] = str(exc)
             try:
-                db_path = db_path_for_library(library_root)
+                db_path = library_database or db_path_for_library(library_root)
                 upsert_report(
                     db_path,
                     {
@@ -261,6 +272,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Archive ZSXQ summaries to Obsidian.")
     parser.add_argument("--batch-file", required=True)
     parser.add_argument("--library-root", default=str(DEFAULT_LIBRARY_ROOT))
+    parser.add_argument("--library-database", default="")
     parser.add_argument("--vault-root", default=str(DEFAULT_VAULT_ROOT))
     parser.add_argument("--feishu-doc-url", default="")
     return parser.parse_args()
@@ -273,6 +285,11 @@ def main() -> int:
         library_root=Path(args.library_root).expanduser(),
         vault_root=Path(args.vault_root).expanduser(),
         feishu_doc_url=args.feishu_doc_url.strip(),
+        library_database=(
+            Path(args.library_database).expanduser().resolve(strict=False)
+            if args.library_database.strip()
+            else None
+        ),
     )
     print(json.dumps(summary, ensure_ascii=False))
     return 0
