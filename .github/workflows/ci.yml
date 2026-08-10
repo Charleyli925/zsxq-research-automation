@@ -24,7 +24,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install dependencies
-        run: python -m pip install -r requirements-dev.txt
+        run: python -m pip install -e ".[dev]"
       - name: Check shell syntax
         run: |
           bash -n scripts/*.sh

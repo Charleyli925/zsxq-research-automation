@@ -50,6 +50,19 @@ Recovery audits may be appended to a retry ledger, but prior failure entries
 and `remote_written` publish records remain historical evidence. Never clear a
 ledger or delete a publish record merely to make work eligible again.
 
+The new `pipeline.sqlite3` is the durable state authority only for pipeline
+workers that explicitly adopt `zsxq_pipeline` in a later change. It separates
+source-document identity, PDF content identity, stage state, publication state,
+and notification idempotency in one transaction boundary. During the migration
+period, existing JSON/JSONL files and `processed_files.sqlite` remain their
+current compatibility/material-view roles; no existing runtime may infer that a
+new database alone proves a batch has completed.
+
+`zsxq-pipeline legacy plan` reads legacy files and records a SHA256 snapshot of
+each source. `legacy apply --apply` rechecks those hashes before writing only a
+new pipeline database. It never changes legacy state, caches, research files,
+or the existing knowledge-base index.
+
 ## Research content
 
 Downloaded PDFs, extracted text, summaries, and Obsidian notes remain in the

@@ -41,7 +41,7 @@ complete only after the finalizer and manifest account for every planned file.
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pip install -e ".[dev]"
 ```
 
 Playwright connects to an existing, authorized Chrome for Testing profile.

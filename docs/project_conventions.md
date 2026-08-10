@@ -33,3 +33,19 @@
 - `last_successful_check_at` is the primary lower bound for the next run.
 - The current run time is the upper bound.
 - If no files are archived, state is still updated after a clean successful scan.
+
+## Pipeline-state conventions
+
+- Business modules that adopt the new core must use `PipelineState`; they may
+  not write a second JSON checkpoint or issue ad-hoc SQL against
+  `pipeline.sqlite3`.
+- Persist all timestamps as the paired timezone-aware ISO 8601 and UTC-epoch
+  fields supplied by the state API. Render Asia/Shanghai only at the UI or
+  notification boundary.
+- Free-form error details are diagnostic evidence. `transient`, `auth`,
+  `release_contract`, `content`, and `invariant` are the only retry-policy
+  categories.
+- Compatibility JSON/JSONL may be exported for human inspection during the
+  cutover, but it cannot become a second scheduler or retry truth source.
+- Keep PDF, text, summary, and Obsidian artifacts as files. The database stores
+  their identity, hashes, state, and paths rather than their full content.
