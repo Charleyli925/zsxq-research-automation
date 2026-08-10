@@ -149,17 +149,55 @@ def _legacy_runtime_busy(root: Path) -> bool:
     return True
 
 
-def _preflight_legacy(args: argparse.Namespace) -> tuple[list[Path], list[Path], list[Path]]:
+def _read_crontab(command: str) -> str:
+    completed = subprocess.run([command, "-l"], capture_output=True, text=True, check=False)
+    if completed.returncode == 0:
+        return completed.stdout
+    if completed.returncode == 1 and "no crontab" in (completed.stderr or "").lower():
+        return ""
+    raise InstallError("unable to read the current user crontab")
+
+
+def _validated_crontab_lines(values: list[str], current: str) -> list[str]:
+    expected: list[str] = []
+    for raw in values:
+        line = str(raw).rstrip("\n")
+        if not line.strip() or "\n" in line or "\r" in line:
+            raise InstallError("--legacy-crontab-line must contain one non-empty exact line")
+        if line in expected:
+            raise InstallError("--legacy-crontab-line must not be repeated")
+        expected.append(line)
+    actual = current.splitlines()
+    for line in expected:
+        if actual.count(line) != 1:
+            raise InstallError("an approved legacy crontab line is absent or duplicated")
+    return expected
+
+
+def _without_crontab_lines(current: str, expected: list[str]) -> str:
+    filtered = [line for line in current.splitlines() if line not in set(expected)]
+    return "\n".join(filtered) + ("\n" if filtered else "")
+
+
+def _write_crontab(command: str, value: str) -> None:
+    completed = subprocess.run([command, "-"], input=value, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        raise InstallError("unable to install the updated user crontab")
+
+
+def _preflight_legacy(args: argparse.Namespace) -> tuple[list[Path], list[Path], list[Path], list[str], str]:
     plists = [_absolute_existing(value, field="--legacy-plist") for value in args.legacy_plist]
     cron_files = [_absolute_existing(value, field="--legacy-cron-file") for value in args.legacy_cron_file]
     wrappers = [_absolute_existing(value, field="--legacy-wrapper") for value in args.legacy_wrapper]
     runtime_roots = [_absolute_existing(value, field="--legacy-runtime-root", directory=True) for value in args.legacy_runtime_root]
+    crontab = _read_crontab(args.crontab_command) if args.legacy_crontab_line else ""
+    crontab_lines = _validated_crontab_lines(args.legacy_crontab_line, crontab)
     busy = [root for root in runtime_roots if _legacy_runtime_busy(root)]
     if busy:
         raise InstallError("a legacy runtime reports an active PID; wait for idle before cutover")
-    if (plists or cron_files or wrappers) and not args.cutover:
+    if (plists or cron_files or wrappers or crontab_lines) and not args.cutover:
         raise InstallError("legacy scheduler files are still present; pass --cutover only for an approved production switch")
-    return plists, cron_files, wrappers
+    return plists, cron_files, wrappers, crontab_lines, crontab
 
 
 def _doctor(release: Path, config: Path, python: str) -> dict[str, Any]:
@@ -292,12 +330,12 @@ def _write_bytes(path: Path, value: bytes) -> None:
 
 def _backup(paths: list[Path], destination: Path) -> list[str]:
     copied: list[str] = []
-    for path in paths:
+    for index, path in enumerate(paths, start=1):
         if not path.exists():
             continue
-        target = destination / path.name
+        target = destination / f"legacy-{index:03d}-{path.name}"
         shutil.copy2(path, target)
-        copied.append(path.name)
+        copied.append(target.name)
     return copied
 
 
@@ -335,7 +373,7 @@ def _install(args: argparse.Namespace) -> dict[str, Any]:
     if _configured_runtime_root(config) != runtime_root:
         raise InstallError("--runtime-root must match pipeline configuration runtime.root")
     sha = _release_sha(release_root)
-    plists, cron_files, wrappers = _preflight_legacy(args)
+    plists, cron_files, wrappers, crontab_lines, original_crontab = _preflight_legacy(args)
     if not _runtime_lock_available(runtime_root, create=bool(args.apply)):
         raise InstallError("unified pipeline runtime is active; wait for idle before switching")
     release = runtime_root / "releases" / sha
@@ -355,8 +393,14 @@ def _install(args: argparse.Namespace) -> dict[str, Any]:
     backup_root = runtime_root / "backups" / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     backup_root.mkdir(parents=True, exist_ok=True)
     backup_names = _backup([*plists, *cron_files, *wrappers], backup_root)
+    if crontab_lines:
+        crontab_backup = backup_root / "user-crontab.before"
+        _write_bytes(crontab_backup, original_crontab.encode("utf-8"))
+        crontab_backup.chmod(0o600)
+        backup_names.append(crontab_backup.name)
     unloaded_legacy: list[Path] = []
     disabled_crons: list[tuple[Path, Path]] = []
+    crontab_attempted = False
     runtime_manifest_path = runtime_root / "deployment-manifest.json"
     previous_manifest = runtime_manifest_path.read_bytes() if runtime_manifest_path.is_file() else None
     manifest = _manifest(
@@ -381,6 +425,17 @@ def _install(args: argparse.Namespace) -> dict[str, Any]:
     try:
         if args.cutover and plists and not args.skip_launchd:
             unloaded_legacy = _bootout_legacy(plists)
+        if args.cutover and crontab_lines:
+            if _read_crontab(args.crontab_command) != original_crontab:
+                raise InstallError("user crontab changed after cutover preflight")
+            crontab_attempted = True
+            _write_crontab(
+                args.crontab_command,
+                _without_crontab_lines(original_crontab, crontab_lines),
+            )
+            active_lines = _read_crontab(args.crontab_command).splitlines()
+            if any(line in active_lines for line in crontab_lines):
+                raise InstallError("a legacy crontab line remained active after retirement")
         if args.cutover:
             for cron in cron_files:
                 disabled = cron.with_name(f"{cron.name}.disabled-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}")
@@ -398,6 +453,11 @@ def _install(args: argparse.Namespace) -> dict[str, Any]:
         for original, disabled in reversed(disabled_crons):
             if disabled.exists():
                 os.replace(disabled, original)
+        if crontab_attempted:
+            try:
+                _write_crontab(args.crontab_command, original_crontab)
+            except InstallError:
+                pass
         if unloaded_legacy and not args.skip_launchd:
             _restore_legacy_launchd(unloaded_legacy)
         if previous_manifest is not None:
@@ -456,6 +516,8 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument("--home", default=str(Path.home()))
     install.add_argument("--legacy-plist", action="append", default=[])
     install.add_argument("--legacy-cron-file", action="append", default=[])
+    install.add_argument("--legacy-crontab-line", action="append", default=[])
+    install.add_argument("--crontab-command", default="crontab")
     install.add_argument("--legacy-wrapper", action="append", default=[])
     install.add_argument("--legacy-runtime-root", action="append", default=[])
     install.add_argument("--cutover", action="store_true", help="Approved switch only: unload supplied old agents after backup.")

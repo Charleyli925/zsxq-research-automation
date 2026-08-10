@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from zsxq_pipeline.model import ErrorCategory, Stage
 from zsxq_pipeline.state import PipelineState
-from zsxq_pipeline.status import read_status
+from zsxq_pipeline.status import doctor_state_only, read_status
 
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
@@ -35,3 +35,7 @@ def test_status_derives_blocked_without_presenting_it_as_waiting(tmp_path):
     reopened = read_status(database)
     assert reopened["health"] == "blocked"
     assert "_earliest_runnable_epoch" not in str(reopened)
+
+    doctor = doctor_state_only(database)
+    assert doctor["ok"] is True
+    assert doctor["health"]["health"] == "blocked"
