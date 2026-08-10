@@ -220,7 +220,7 @@ def validate_summary_payload(payload: Any, *, expected_paths: Sequence[str]) -> 
     unknown = sorted(set(value) - _ROOT_FIELDS)
     if unknown:
         errors.append("root contains unsupported field(s): " + ", ".join(unknown))
-    required = ("status", "handled_count", "handled_paths", "summaries")
+    required = ("status", "handled_count", "handled_paths", "summaries", "error")
     missing = [field for field in required if field not in value]
     if missing:
         errors.append("root is missing required field(s): " + ", ".join(missing))
@@ -256,22 +256,24 @@ def validate_summary_payload(payload: Any, *, expected_paths: Sequence[str]) -> 
                 errors.append(
                     f"summaries[{index}] contains unsupported field(s): " + ", ".join(summary_unknown)
                 )
-            summary_missing = [field for field in ("path", "filename", "title", "markdown") if field not in summary_value]
+            summary_missing = [
+                field for field in ("path", "filename", "title", "quality_hint", "markdown") if field not in summary_value
+            ]
             if summary_missing:
                 errors.append(f"summaries[{index}] is missing required field(s): " + ", ".join(summary_missing))
             for field in ("path", "filename", "title", "markdown"):
                 candidate = summary_value.get(field)
                 if not isinstance(candidate, str) or not candidate:
                     errors.append(f"summaries[{index}].{field} must be a non-empty string")
-            if "quality_hint" in summary_value and not isinstance(summary_value["quality_hint"], str):
-                errors.append(f"summaries[{index}].quality_hint must be a string when present")
+            if not isinstance(summary_value.get("quality_hint"), str):
+                errors.append(f"summaries[{index}].quality_hint must be a string")
             candidate_path = summary_value.get("path")
             if isinstance(candidate_path, str) and candidate_path:
                 validated_summary_paths.append(candidate_path)
 
     if status == "success":
-        if "error" in value:
-            errors.append("success output must not contain error")
+        if value.get("error") is not None:
+            errors.append("success output requires error to be null")
         if handled_paths != list(expected):
             errors.append("success handled_paths must exactly equal the job manifest paths in order")
         if validated_summary_paths != list(expected):

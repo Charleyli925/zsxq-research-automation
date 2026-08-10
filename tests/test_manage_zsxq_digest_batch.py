@@ -260,6 +260,7 @@ class ManageZsxqDigestBatchTests(unittest.TestCase):
             "status": "success",
             "handled_count": 1,
             "handled_paths": ["/tmp/alpha.pdf"],
+            "error": None,
             "summaries": [
                 {
                     "path": "/tmp/alpha.pdf",

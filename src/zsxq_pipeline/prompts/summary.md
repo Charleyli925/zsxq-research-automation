@@ -48,4 +48,5 @@
 - 最终回复必须是一个且仅一个符合 `summary.schema.json` 的 JSON 对象。
 - 不得添加 `ZSXQ_SUMMARY_JSON:` 前缀、完成通知、Markdown 代码围栏或任何额外文本。
 - 成功时 `handled_paths` 必须逐字保留 manifest 的全部路径，顺序一致；每个路径恰好对应一条 summary。
-- 失败时必须返回 `status: "failed"`、空的 handled/summaries 数组和简洁 `error`。
+- 成功时 `error` 必须为 JSON `null`；每条 summary 都必须包含字符串 `quality_hint`，没有提示时使用空字符串。
+- 失败时必须返回 `status: "failed"`、空的 handled/summaries 数组和简洁的非空字符串 `error`。

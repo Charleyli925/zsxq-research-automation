@@ -79,6 +79,7 @@ def test_summary_schema_requires_exact_ordered_paths_and_no_extra_fields(tmp_pat
         "status": "success",
         "handled_count": 2,
         "handled_paths": paths,
+        "error": None,
         "summaries": [_entry(paths[0]), _entry(paths[1])],
     }
 
@@ -125,6 +126,7 @@ def test_summary_batch_artifacts_cache_and_state_all_preserve_reasoning(tmp_path
         "status": "success",
         "handled_count": 2,
         "handled_paths": paths,
+        "error": None,
         "summaries": [_entry(paths[0], markdown="# Alpha\n\n- A"), _entry(paths[1], markdown="# Beta\n\n- B")],
     }
     store = SummaryStore(tmp_path / "cache")

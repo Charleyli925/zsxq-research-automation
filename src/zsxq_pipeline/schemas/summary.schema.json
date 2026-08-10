@@ -7,7 +7,8 @@
     "status",
     "handled_count",
     "handled_paths",
-    "summaries"
+    "summaries",
+    "error"
   ],
   "properties": {
     "status": {
@@ -31,7 +32,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["path", "filename", "title", "markdown"],
+        "required": ["path", "filename", "title", "quality_hint", "markdown"],
         "properties": {
           "path": {"type": "string", "minLength": 1},
           "filename": {"type": "string", "minLength": 1},
@@ -42,27 +43,8 @@
       }
     },
     "error": {
-      "type": "string",
+      "type": ["string", "null"],
       "minLength": 1
     }
-  },
-  "oneOf": [
-    {
-      "properties": {
-        "status": {"const": "success"}
-      },
-      "not": {
-        "required": ["error"]
-      }
-    },
-    {
-      "properties": {
-        "status": {"const": "failed"},
-        "handled_count": {"const": 0},
-        "handled_paths": {"maxItems": 0},
-        "summaries": {"maxItems": 0}
-      },
-      "required": ["error"]
-    }
-  ]
+  }
 }

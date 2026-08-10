@@ -104,6 +104,7 @@ class FakeProvider:
             "status": "success",
             "handled_count": 1,
             "handled_paths": [item.path],
+            "error": None,
             "summaries": [
                 {
                     "path": item.path,
