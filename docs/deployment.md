@@ -67,6 +67,12 @@ zsxq-pipeline outbox drain --config /absolute/path/to/pipeline.toml
 document or run a summary. `tick` returns `busy` without mutating business
 state if another tick/manual stage owns the advisory lock.
 
+Before a tick enters potentially long PDF/model processing, it drains durable
+notifications left by the prior tick. It drains again after processing when
+the soft deadline still has time remaining. Therefore an over-budget process
+may defer its own new notification until the next wake-up, but a sustained
+processing backlog cannot starve the outbox.
+
 For a resolved terminal failure, first create a narrow, reviewed retry plan
 matching one stage/workflow/error code, then apply exactly its expected row
 count. There is deliberately no broad "retry all" command:

@@ -110,6 +110,51 @@ def test_process_stage_uses_existing_source_identity_and_respects_quota(tmp_path
     assert seen[0][1][0]["source_file_id"] == "source-file-1"
 
 
+def test_all_stage_drains_prior_outbox_before_process_overruns_budget(tmp_path):
+    config = _config(tmp_path)
+    pdf = tmp_path / "report.pdf"
+    pdf.write_bytes(b"synthetic-pdf")
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        document = state.upsert_document("foreign", "source-file-1", filename=pdf.name, source_path=pdf)
+        state.record_artifact(document.id, kind="pdf", path=pdf, pdf_sha256="a" * 64, size_bytes=pdf.stat().st_size)
+
+    now = [0.0]
+    events: list[str] = []
+    delivered = (
+        SimpleNamespace(
+            idempotency_key="prior",
+            event="document_ready",
+            status="sent",
+            deferred=False,
+            error="",
+        ),
+    )
+
+    def process(source, rows):
+        events.append("process")
+        now[0] = 2.0
+        return SimpleNamespace(status="success")
+
+    def outbox(max_items):
+        events.append("outbox")
+        return delivered
+
+    worker = PipelineWorker(
+        config,
+        monotonic=lambda: now[0],
+        process_runner=process,
+        download_runner=lambda request: SimpleNamespace(status="success", source=request.source),
+        outbox_runner=outbox,
+    )
+    outcome = worker.run_stage("all", budget_seconds=1)
+
+    assert events == ["outbox", "process"]
+    assert outcome.processed == 1
+    assert outcome.notifications == delivered
+    assert outcome.budget_exhausted is True
+
+
 def test_tick_returns_busy_without_mutating_schedule_state(tmp_path):
     config = _config(tmp_path)
     now = datetime(2026, 8, 10, 8, 10, tzinfo=UTC)

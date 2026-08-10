@@ -108,7 +108,7 @@ class PipelineWorker:
         self._outbox_runner = outbox_runner or self._drain_outbox
 
     def tick(self, *, budget_seconds: int | None = None) -> TickOutcome:
-        """Discover due slots then execute every stage until a bounded deadline."""
+        """Discover due slots and keep durable notifications ahead of long work."""
 
         return self._run(stages=("schedule", "download", "process", "outbox"), budget_seconds=budget_seconds)
 
@@ -143,8 +143,18 @@ class PipelineWorker:
         failures: list[str] = []
         downloaded = 0
         processed = 0
-        notifications: tuple[NotificationDelivery, ...] = ()
+        notifications_by_key: dict[str, NotificationDelivery] = {}
         budget_exhausted = False
+
+        def drain_outbox() -> None:
+            try:
+                deliveries = self._outbox_runner(self.config.schedule.outbox_quota)
+            except Exception as exc:
+                failures.append(f"outbox:{type(exc).__name__}")
+                return
+            for delivery in deliveries:
+                notifications_by_key[delivery.idempotency_key] = delivery
+
         with PipelineState.open(self.config.runtime.database) as state:
             state.migrate()
             if "schedule" in stages:
@@ -177,6 +187,17 @@ class PipelineWorker:
                 elif outcome.status != "busy":
                     failures.append(f"download:{outcome.source}:{outcome.status}")
 
+        # A processor can legitimately run beyond the soft tick deadline while
+        # finishing a model request.  Drain durable work from the prior tick
+        # first so a sustained processing backlog cannot starve notifications.
+        # A second drain below still sends notifications produced by this tick
+        # when processing finishes inside the budget.
+        if "outbox" in stages and "process" in stages:
+            if not self._expired(deadline):
+                drain_outbox()
+            else:
+                budget_exhausted = True
+
         if "process" in stages and not self._expired(deadline):
             remaining = self.config.schedule.process_quota
             for source in self.config.sources.values():
@@ -204,10 +225,7 @@ class PipelineWorker:
                     failures.append(f"process:{source.name}:{outcome.status}")
 
         if "outbox" in stages and not self._expired(deadline):
-            try:
-                notifications = self._outbox_runner(self.config.schedule.outbox_quota)
-            except Exception as exc:
-                failures.append(f"outbox:{type(exc).__name__}")
+            drain_outbox()
         elif "outbox" in stages:
             budget_exhausted = True
 
@@ -217,7 +235,7 @@ class PipelineWorker:
             scheduled=scheduled,
             downloaded=downloaded,
             processed=processed,
-            notifications=notifications,
+            notifications=tuple(notifications_by_key.values()),
             budget_exhausted=budget_exhausted,
             failures=tuple(failures),
         )
