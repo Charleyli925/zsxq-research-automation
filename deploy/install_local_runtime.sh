@@ -19,6 +19,7 @@ TASKS_ROOT="${OPENCLAW_TASKS_ROOT:-$HOME/.openclaw/workspace/tasks}"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 FOREIGN_TASK_DIR=""
 DOMESTIC_TASK_DIR=""
+DIGEST_TASK_DIR=""
 FOREIGN_LABEL="com.investment-reports.zsxq-autodownload"
 DOMESTIC_LABEL="com.investment-reports.zsxq-domestic-cicc"
 
@@ -26,14 +27,16 @@ usage() {
   cat <<'EOF'
 Usage: bash deploy/install_local_runtime.sh [options]
 
-Installs the version-controlled ZSXQ download wrappers and renders two user
-LaunchAgents.  The default is a read-only dry run.
+Installs the version-controlled ZSXQ download and digest wrappers and renders
+two user LaunchAgents.  The digest remains on its existing cron schedule. The
+default is a read-only dry run.
 
   --apply                         Perform the installation.
   --dry-run                       Show validated targets without changing them (default).
-  --tasks-root PATH               Parent directory containing the two task directories.
+  --tasks-root PATH               Parent directory containing the three task directories.
   --foreign-task-dir PATH         Foreign-download task directory.
   --domestic-task-dir PATH        Domestic-CICC task directory.
+  --digest-task-dir PATH          PDF-digest task directory.
   --launch-agents-dir PATH        Destination for rendered user LaunchAgents.
   --foreign-label LABEL           LaunchAgent label for the foreign task.
   --domestic-label LABEL          LaunchAgent label for the domestic task.
@@ -42,7 +45,7 @@ LaunchAgents.  The default is a read-only dry run.
   --allow-branch                  Permit a branch checkout (emergency/testing only).
   --help                          Show this help.
 
-Both task directories must already contain their private config.env.  The
+All three task directories must already contain their private config.env. The
 installer never edits config.env; it writes a Git-ignored deployment.env with
 the checked-out code paths and creates recoverable backups of old wrappers.
 EOF
@@ -67,12 +70,13 @@ while [[ $# -gt 0 ]]; do
       APPLY=0
       shift
       ;;
-    --tasks-root|--foreign-task-dir|--domestic-task-dir|--launch-agents-dir|--foreign-label|--domestic-label)
+    --tasks-root|--foreign-task-dir|--domestic-task-dir|--digest-task-dir|--launch-agents-dir|--foreign-label|--domestic-label)
       need_value "$1" "${2:-}"
       case "$1" in
         --tasks-root) TASKS_ROOT="$2" ;;
         --foreign-task-dir) FOREIGN_TASK_DIR="$2" ;;
         --domestic-task-dir) DOMESTIC_TASK_DIR="$2" ;;
+        --digest-task-dir) DIGEST_TASK_DIR="$2" ;;
         --launch-agents-dir) LAUNCH_AGENTS_DIR="$2" ;;
         --foreign-label) FOREIGN_LABEL="$2" ;;
         --domestic-label) DOMESTIC_LABEL="$2" ;;
@@ -113,10 +117,12 @@ resolve_existing_dir() {
 TASKS_ROOT="$(resolve_existing_dir "$TASKS_ROOT")"
 FOREIGN_TASK_DIR="${FOREIGN_TASK_DIR:-$TASKS_ROOT/ZSXQ_autodownload}"
 DOMESTIC_TASK_DIR="${DOMESTIC_TASK_DIR:-$TASKS_ROOT/ZSXQ_国内研报_中金公司}"
+DIGEST_TASK_DIR="${DIGEST_TASK_DIR:-$TASKS_ROOT/ZSXQ_pdf_digest}"
 FOREIGN_TASK_DIR="$(resolve_existing_dir "$FOREIGN_TASK_DIR")"
 DOMESTIC_TASK_DIR="$(resolve_existing_dir "$DOMESTIC_TASK_DIR")"
+DIGEST_TASK_DIR="$(resolve_existing_dir "$DIGEST_TASK_DIR")"
 
-for task_dir in "$FOREIGN_TASK_DIR" "$DOMESTIC_TASK_DIR"; do
+for task_dir in "$FOREIGN_TASK_DIR" "$DOMESTIC_TASK_DIR" "$DIGEST_TASK_DIR"; do
   case "$task_dir/" in
     "$TASKS_ROOT/"*) ;;
     *) die "task directory must be below --tasks-root: $task_dir" ;;
@@ -150,13 +156,17 @@ DOMESTIC_CRON_SOURCE="$FOREIGN_CRON_SOURCE"
 DOMESTIC_LAUNCHER_SOURCE="$RELEASE_ROOT/scripts/run_zsxq_domestic_cicc_task_via_codex.sh"
 FOREIGN_TEMPLATE="$RELEASE_ROOT/deploy/launchd/zsxq-autodownload.plist.template"
 DOMESTIC_TEMPLATE="$RELEASE_ROOT/deploy/launchd/zsxq-domestic-cicc.plist.template"
+DIGEST_RUNNER_SOURCE="$RELEASE_ROOT/openclaw_tasks/zsxq_pdf_digest/run.sh"
+DIGEST_CRON_SOURCE="$RELEASE_ROOT/openclaw_tasks/zsxq_pdf_digest/run.cron-safe.sh"
 for source_path in \
   "$FOREIGN_RUNNER_SOURCE" \
   "$FOREIGN_CRON_SOURCE" \
   "$FOREIGN_LAUNCHER_SOURCE" \
   "$DOMESTIC_LAUNCHER_SOURCE" \
   "$FOREIGN_TEMPLATE" \
-  "$DOMESTIC_TEMPLATE"; do
+  "$DOMESTIC_TEMPLATE" \
+  "$DIGEST_RUNNER_SOURCE" \
+  "$DIGEST_CRON_SOURCE"; do
   [[ -f "$source_path" ]] || die "required release file is missing: $source_path"
 done
 
@@ -167,10 +177,12 @@ task_is_running() {
   if [[ -f "$pid_file" ]]; then
     pid="$(tr -d '[:space:]' < "$pid_file" 2>/dev/null || true)"
     if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-      command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-      if [[ "$command_line" == *"$task_dir"* ]]; then
-        return 0
-      fi
+      # Digest workers execute from an immutable temporary snapshot, so their
+      # command line intentionally does not contain the task directory.  A
+      # live PID recorded by a task is therefore sufficient to defer a
+      # release; a stale/reused PID is safer to resolve manually than to
+      # replace wrappers under a possibly-live runtime.
+      return 0
     fi
   fi
   while IFS= read -r command_line; do
@@ -183,7 +195,7 @@ task_is_running() {
 }
 
 RUNNING_TASKS=()
-for task_dir in "$FOREIGN_TASK_DIR" "$DOMESTIC_TASK_DIR"; do
+for task_dir in "$FOREIGN_TASK_DIR" "$DOMESTIC_TASK_DIR" "$DIGEST_TASK_DIR"; do
   if task_is_running "$task_dir"; then
     RUNNING_TASKS+=("$task_dir")
   fi
@@ -251,6 +263,45 @@ os.replace(temporary, output)
 PY
 }
 
+write_digest_deployment_env() {
+  local task_dir output_path
+  task_dir="$1"
+  output_path="$task_dir/deployment.env"
+  "$DEPLOY_PYTHON_BIN" - "$output_path" "$RELEASE_ROOT" <<'PY'
+from pathlib import Path
+import os
+import shlex
+import sys
+
+output_path, release_root = sys.argv[1:]
+output = Path(output_path)
+root = Path(release_root)
+paths = {
+    "AUTOMATION_ROOT": root,
+    "HELPER_SCRIPT_PATH": root / "scripts/manage_zsxq_digest_batch.py",
+    "SCANNER_SCRIPT_PATH": root / "scripts/scan_new_zsxq_pdfs.py",
+    "RESEARCH_LIBRARY_INDEX_SCRIPT_PATH": root / "scripts/research_library_index.py",
+    "MARKITDOWN_SCRIPT_PATH": root / "scripts/convert_with_markitdown.py",
+    "CLEAN_MARKDOWN_SCRIPT_PATH": root / "scripts/build_clean_markdown.py",
+    "OBSIDIAN_ARCHIVE_SCRIPT_PATH": root / "scripts/archive_to_obsidian.py",
+    "OBSIDIAN_INDEX_SCRIPT_PATH": root / "scripts/update_obsidian_indexes.py",
+    "RUNTIME_GUARD_SCRIPT_PATH": root / "scripts/zsxq_runtime_guard.py",
+}
+body = "\n".join(
+    [
+        "# Generated by deploy/install_local_runtime.sh; safe to regenerate.",
+        "# This file may only pin release-owned source paths.",
+        "# Keep secrets, chat identifiers, and runtime state in config.env.",
+        *[f"{key}={shlex.quote(str(value))}" for key, value in paths.items()],
+        "",
+    ]
+)
+temporary = output.with_name(f".{output.name}.tmp-{os.getpid()}")
+temporary.write_text(body, encoding="utf-8")
+os.replace(temporary, output)
+PY
+}
+
 install_link() {
   local source_path="$1" destination_path="$2" backup_dir="$3"
   if [[ -L "$destination_path" ]] && [[ "$(readlink "$destination_path")" == "$source_path" ]]; then
@@ -275,7 +326,7 @@ write_deployment_record() {
   record_path="$record_dir/investment-reports-automation.json"
   mkdir -p "$record_dir"
   "$DEPLOY_PYTHON_BIN" - "$record_path" "$RELEASE_ROOT" "$DEPLOYED_SHA" "$DEPLOYED_REF" \
-    "$FOREIGN_TASK_DIR" "$FOREIGN_LABEL" "$DOMESTIC_TASK_DIR" "$DOMESTIC_LABEL" <<'PY'
+    "$FOREIGN_TASK_DIR" "$FOREIGN_LABEL" "$DOMESTIC_TASK_DIR" "$DOMESTIC_LABEL" "$DIGEST_TASK_DIR" <<'PY'
 from datetime import datetime, timezone
 import json
 import os
@@ -283,7 +334,7 @@ from pathlib import Path
 import sys
 
 (record_path, release_root, sha, ref, foreign_dir, foreign_label,
- domestic_dir, domestic_label) = sys.argv[1:]
+ domestic_dir, domestic_label, digest_dir) = sys.argv[1:]
 payload = {
     "installed_at": datetime.now(timezone.utc).isoformat(),
     "release_root": release_root,
@@ -292,6 +343,7 @@ payload = {
     "tasks": {
         "foreign_download": {"task_dir": foreign_dir, "label": foreign_label},
         "domestic_cicc": {"task_dir": domestic_dir, "label": domestic_label},
+        "pdf_digest": {"task_dir": digest_dir, "scheduler": "cron"},
     },
 }
 target = Path(record_path)
@@ -304,12 +356,13 @@ PY
 printf 'release: %s (%s)\n' "$DEPLOYED_REF" "$DEPLOYED_SHA"
 printf 'foreign task: %s [%s]\n' "$FOREIGN_TASK_DIR" "$FOREIGN_LABEL"
 printf 'domestic task: %s [%s]\n' "$DOMESTIC_TASK_DIR" "$DOMESTIC_LABEL"
+printf 'digest task: %s [cron]\n' "$DIGEST_TASK_DIR"
 if [[ ${#RUNNING_TASKS[@]} -gt 0 ]]; then
   printf 'running task detected; --apply would refuse: %s\n' "${RUNNING_TASKS[*]}"
 fi
 
 if [[ "$APPLY" -ne 1 ]]; then
-  printf 'dry run complete; re-run with --apply after both tasks are idle.\n'
+  printf 'dry run complete; re-run with --apply after all three tasks are idle.\n'
   exit 0
 fi
 
@@ -331,8 +384,12 @@ for task_dir in "$FOREIGN_TASK_DIR" "$DOMESTIC_TASK_DIR"; do
   install_link "$FOREIGN_RUNNER_SOURCE" "$task_dir/run.sh" "$backup_dir"
   install_link "$FOREIGN_CRON_SOURCE" "$task_dir/run.cron-safe.sh" "$backup_dir"
 done
+digest_backup_dir="$DIGEST_TASK_DIR/.deployment-backups/$BACKUP_STAMP"
+install_link "$DIGEST_RUNNER_SOURCE" "$DIGEST_TASK_DIR/run.sh" "$digest_backup_dir"
+install_link "$DIGEST_CRON_SOURCE" "$DIGEST_TASK_DIR/run.cron-safe.sh" "$digest_backup_dir"
 write_deployment_env "$FOREIGN_TASK_DIR" "foreign_download" "$FOREIGN_LAUNCHER_SOURCE" "zsxq_last_run_structured.json"
 write_deployment_env "$DOMESTIC_TASK_DIR" "domestic_cicc" "$DOMESTIC_LAUNCHER_SOURCE" "zsxq_domestic_cicc_last_run_structured.json"
+write_digest_deployment_env "$DIGEST_TASK_DIR"
 write_deployment_record
 
 if [[ "$SKIP_LAUNCHD" -ne 1 ]]; then
