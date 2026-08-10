@@ -106,10 +106,11 @@ def test_document_write_is_user_markdown_then_higher_layer_can_verify_and_grant(
         "--as",
         "user",
     )
-    params = json.loads(permission_argv[permission_argv.index("--params") + 1])
     data = json.loads(permission_argv[permission_argv.index("--data") + 1])
-    assert params == {"token": "doxcn12345678", "type": "docx", "need_notification": False}
-    assert data == {"member_type": "chat", "member_id": "oc_chat_123", "perm": "view"}
+    assert permission_argv[permission_argv.index("--token") + 1] == "doxcn12345678"
+    assert permission_argv[permission_argv.index("--type") + 1] == "docx"
+    assert "--params" not in permission_argv
+    assert data == {"member_type": "openchat", "member_id": "oc_chat_123", "perm": "view", "type": "chat"}
 
 
 def test_append_uses_user_identity_markdown_stdin_and_append_command(tmp_path):

@@ -504,16 +504,19 @@ def _run_subprocess(
 
 def _default_permission_argv(document_url: str, chat_id: str, identity: str) -> Sequence[str]:
     token = document_token(document_url)
-    parameters = _compact_json({"token": token, "type": "docx", "need_notification": False})
-    data = _compact_json({"member_type": "chat", "member_id": chat_id, "perm": "view"})
+    data = _compact_json(
+        {"member_type": "openchat", "member_id": chat_id, "perm": "view", "type": "chat"}
+    )
     return (
         "drive",
         "permission.members",
         "create",
         "--as",
         identity,
-        "--params",
-        parameters,
+        "--token",
+        token,
+        "--type",
+        "docx",
         "--data",
         data,
         "--yes",
