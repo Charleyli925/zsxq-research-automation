@@ -41,11 +41,14 @@ configuration content, auth profiles, reports, or credentials. A failed
 doctor leaves `current` and the active LaunchAgent unchanged.
 
 `--cutover` is a separate explicit operation. Supply every old LaunchAgent,
-cron fragment, and legacy runtime root only after the runbook's idle/snapshot
-checks have passed; it backs them up before unloading/renaming them. Do not
-use `--skip-launchd` for a production cutover. `rollback --apply` only moves
-the code entrypoint back to the prior release; it never rewrites SQLite,
-artifacts, Lark documents, or notifications.
+cron fragment, exact active crontab line, wrapper, and legacy runtime root only
+after the runbook's idle/snapshot checks have passed. The installer backs up
+the complete user crontab, requires each `--legacy-crontab-line` to match
+exactly once, removes only those approved lines in the activation transaction,
+and restores them if activation fails. Do not use `--skip-launchd` for a
+production cutover. `rollback --apply` only moves the code entrypoint back to
+the prior unified release; it never rewrites SQLite, artifacts, Lark documents,
+or notifications.
 
 ## Operations
 

@@ -17,9 +17,11 @@ PR3 download canary plus PR4 direct-Codex/Lark canary.
 5. Run the detached release's installer dry run, then `doctor`. Resolve any
    local CFT, Codex, Lark, config, or `.openclaw` migration debt before
    activation.
-6. With all runtimes still idle, use the installer with explicit `--cutover`
-   and the complete legacy scheduler inventory. Verify the manifest and the
-   one new LaunchAgent; there must be no overlap window.
+6. With all runtimes still idle, use the installer with explicit `--cutover`,
+   the complete legacy scheduler inventory, and the exact digest cron line as
+   `--legacy-crontab-line`. Verify the backed-up crontab, manifest, one new
+   LaunchAgent, zero old loaded LaunchAgents, and zero remaining matching cron
+   lines; there must be no overlap window.
 7. Run one bounded manual `tick` on canary work. Verify source windows,
    artifact identities, publication recovery, and notification idempotency.
 8. Soak: foreign and domestic sources each complete four real scheduled
