@@ -26,12 +26,20 @@ every planned candidate is downloaded, already satisfied, or deterministically
 blocked. Legacy JSON state is a finalizer input mirror and compatibility view,
 not checkpoint truth.
 
-## 4. Digest processing
+## 4. Unified scheduling and digest processing
 
-The legacy digest cron wrapper remains the scheduler entry point, but it is a
-thin compatibility shell around `zsxq-pipeline process`. The implementation
-is in `src/zsxq_pipeline` and does not invoke the OpenClaw binary or consume
-the former model registry, session, credential artifact, or model binding.
+One launchd one-shot job invokes `zsxq-pipeline tick` every five minutes.
+`PipelineScheduler` derives due source slots in the configured IANA timezone,
+coalesces missed slots into one checkpoint-to-now window, persists that window
+and cursor atomically, then hands bounded work to `PipelineWorker`. A shared
+`flock` returns `busy` on overlap and releases automatically on crash; no
+stage infers truth from a PID file, quiet window, or sibling task directory.
+
+`PipelineWorker` independently runs due download windows, extraction/summary/
+publication recovery, and notification-outbox drain under wall-clock and
+per-stage quotas. The implementation is in `src/zsxq_pipeline` and does not
+invoke the OpenClaw binary or consume an agent registry, session, credential
+artifact, or model binding.
 
 For each eligible PDF the pipeline:
 
@@ -69,10 +77,11 @@ are delivered before a terminal batch summary.
 
 ## 6. Durable state
 
-`pipeline.sqlite3` records source windows, source documents, immutable
-artifact identities, short stage leases/attempts, publication transitions, and
-an idempotent notification outbox. It deliberately does not store report text
-or summary bodies; those remain readable files in the research library.
+`pipeline.sqlite3` records schedule cursors/source windows, source documents,
+immutable artifact identities, short stage leases/attempts, publication
+transitions, and an idempotent notification outbox. It deliberately does not
+store report text or summary bodies; those remain readable files in the
+research library.
 
 The key durable contracts are:
 
@@ -84,7 +93,10 @@ The key durable contracts are:
   it must fetch and verify rather than write again.
 - Retry eligibility follows an error category, not free-form error text. Auth,
   release-contract, invariant, and content failures are terminal until an
-  explicit future workflow resolves them.
+  explicit reviewed retry plan or future workflow resolves them.
+- A schedule cursor never advances without a persisted source window. Business
+  checkpoints remain independent, so a failed window cannot be silently
+  treated as successful coverage.
 
 ## Boundaries
 

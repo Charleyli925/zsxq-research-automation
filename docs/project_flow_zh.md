@@ -6,11 +6,12 @@
 - 摘要发布链：扫描已归档 PDF、提取正文、生成本地摘要，再发布到飞书。
 - 资料库链：把 PDF、正文、摘要、飞书链接和 Obsidian 阅读入口关联起来。
 
-下载链和摘要发布链都由版本化 Python pipeline 执行。下载在一个已授权的
-Chrome for Testing CDP session 中生成 immutable plan、逐项下载并完成归档对账；
-不依赖 Agent、MCP 或动态 npm 包。保留在 `openclaw_tasks/` 下的文件名只是既有
-scheduler 兼容目录：下载 wrapper 调用 `zsxq-pipeline download`，digest wrapper
-调用 `zsxq-pipeline process`，两者都不读取旧模型注册表、session 或 auth artifact。
+下载链和摘要发布链都由版本化 Python pipeline 执行。一个 launchd one-shot job
+每 300 秒调用 `zsxq-pipeline tick`；它从 SQLite schedule cursor 和 checkpoint
+发现到期工作，再以独立 stage 运行下载、提取、摘要、发布和通知。下载在一个已
+授权的 Chrome for Testing CDP session 中生成 immutable plan、逐项下载并完成归档
+对账；不依赖 Agent、MCP 或动态 npm 包。`openclaw_tasks/` 仅是 cutover 前保留的
+迁移证据，不能与统一 scheduler 同时运行。
 
 ## 1. 总体流向
 
@@ -18,8 +19,8 @@ scheduler 兼容目录：下载 wrapper 调用 `zsxq-pipeline download`，digest
 flowchart TD
     A["冻结窗口 + immutable scan plan"] --> B["单一 CDP session 的计划内下载"]
     B --> C["归档 PDF + batch manifest"]
-    C --> D["digest cron compatibility wrapper"]
-    D --> E["zsxq-pipeline process"]
+    C --> D["SQLite stage / outbox"]
+    D --> E["launchd one-shot: zsxq-pipeline tick"]
     E --> F["提取正文 + 质量门禁"]
     F --> G{"正文可用吗"}
     G -- "否" --> H["quarantine / blocked_release"]
@@ -52,8 +53,7 @@ flowchart TD
 | 组件 | 负责什么 | 不负责什么 |
 | --- | --- | --- |
 | `zsxq_pipeline.download` / Chrome for Testing | 固定窗口、候选计划、授权下载、归档对账和 SQLite 阶段记录 | 摘要、飞书写入 |
-| 下载 `run.cron-safe.sh` | 按既有日历唤醒、日志轮转、避免重叠触发 | 浏览器业务判断、摘要模型或飞书 API |
-| 下载 `run.sh` | 读取任务本地配置并转交 Python 下载命令 | 启动 Agent、解析 Prompt、清 session 或同步 auth |
+| `zsxq_pipeline.scheduler` / `worker` | 从配置与 SQLite 发现到期窗口、`flock` 防重叠、按预算/配额执行独立 stage | 通过 PID、mtime 或旧 wrapper 推断完成 |
 | `zsxq_pipeline.extract` | 文本提取、OCR fallback、正文质量门禁 | 让模型直接读 PDF |
 | `zsxq_pipeline.providers.codex` | 通过固定 argv 调用 `codex exec` | 访问浏览器、飞书、仓库写入、外部事实 |
 | `zsxq_pipeline.publish` / `lark` | 确定性分组、文档创建/追加/fetch/授权 | 重做摘要 |
@@ -126,21 +126,20 @@ publication 的唯一正确恢复顺序是 `intent -> remote_written -> success`
 
 ## 6. 常用操作
 
-以下命令只操作本机；`--preflight-only` 只检查 capability，不会创建飞书
-文档、发送消息或运行真实 Codex canary：
+以下命令共享同一 TOML、runtime lock 和 SQLite；`doctor` 只检查 capability，
+不会创建飞书文档、发送消息或运行真实 Codex canary：
 
 | 目标 | 命令 |
 | --- | --- |
-| 手动跑 digest | `bash "${DIGEST_TASK_DIR}/run.cron-safe.sh"` |
-| 预检 | `bash "${DIGEST_TASK_DIR}/run.sh" --preflight-only --no-notify` |
-| 总结一个 PDF | `bash "${DIGEST_TASK_DIR}/run.sh" --file "/absolute/path/to/file.pdf"` |
-| 总结一个文件夹 | `bash "${DIGEST_TASK_DIR}/run.sh" --folder "/absolute/path/to/folder"` |
-| 仅做摘要、不发布 | `bash "${DIGEST_TASK_DIR}/run.sh" --summary-only --no-notify --file "/absolute/path/to/file.pdf"` |
-| 只做本地 dry run | `bash "${DIGEST_TASK_DIR}/run.sh" --dry-run --no-notify --file "/absolute/path/to/file.pdf"` |
+| 完整有界 tick | `zsxq-pipeline tick --config /absolute/path/to/pipeline.toml` |
+| 预检 | `zsxq-pipeline doctor --config /absolute/path/to/pipeline.toml` |
+| 只处理已有下载/摘要/发布 | `zsxq-pipeline run-stage --config /absolute/path/to/pipeline.toml --stage process` |
+| 只补发通知 | `zsxq-pipeline outbox drain --config /absolute/path/to/pipeline.toml` |
+| 查看 durable health | `zsxq-pipeline status --config /absolute/path/to/pipeline.toml --json` |
+| 计划并人工确认终态恢复 | `zsxq-pipeline retry plan ...` 然后 `retry apply --expected-count N --apply` |
 
-将 `${DIGEST_TASK_DIR}` 替换为实际 cron 任务目录（常见的既有路径是
-`${OPENCLAW_TASKS_ROOT}/ZSXQ_pdf_digest`）。目录名称不表示 pipeline 要求
-安装或运行 OpenClaw。
+历史 task 目录只能用于 migration snapshot/rollback 证据。新安装和手工运行
+一律使用同一份 `pipeline.toml`，不得旁路成单独 cron 或 wrapper。
 
 ## 7. 故障处理原则
 

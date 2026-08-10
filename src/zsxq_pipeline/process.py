@@ -10,7 +10,6 @@ the existing cron wrapper and human operators.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -19,7 +18,6 @@ import sys
 import tempfile
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
-from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,6 +35,7 @@ from .extract import (
     validate_extracted_manifest,
 )
 from .lark import LarkCliConfig, LarkNotifier, LarkPublisher
+from .lock import runtime_lock
 from .model import ErrorCategory, PublicationState, Stage, StageClaim, StageState, SummaryIdentity
 from .notify import (
     NotificationDelivery,
@@ -436,6 +435,10 @@ class ProcessRequest:
     dry_run: bool = False
     summary_only: bool = False
     no_notify: bool = False
+    # The unified worker queues document notices during publication, then
+    # drains the shared outbox once under its own bounded quota.  Existing
+    # standalone ``process`` callers retain immediate draining by default.
+    defer_notification_drain: bool = False
     preflight_only: bool = False
     include_existing: bool = False
 
@@ -486,23 +489,6 @@ class ProcessOutcome:
             ],
             "preflight": dict(self.preflight),
         }
-
-
-@contextmanager
-def _runtime_lock(path: Path):
-    """Take a non-blocking advisory lock without deleting user-owned files."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _same_path(left: str | Path, right: str | Path) -> bool:
@@ -590,42 +576,49 @@ class DigestProcessor:
         checks["lark_notifications"] = self.notifier.capability_preflight()
         return {"ok": True, "checks": {name: _safe_result(value) for name, value in checks.items()}}
 
-    def run(self, request: ProcessRequest) -> ProcessOutcome:
+    def run(self, request: ProcessRequest, *, acquire_lock: bool = True) -> ProcessOutcome:
         """Run one bounded batch and always refresh compatibility result files."""
 
         run_id = f"digest-{self.clock().strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:10]}"
         self.config.runtime_root.mkdir(parents=True, exist_ok=True)
-        with _runtime_lock(self.config.runtime_root / ".process.lock") as acquired:
-            if not acquired:
-                outcome = ProcessOutcome("busy", run_id, failures=("another digest process holds the runtime lock",))
-                self._write_outcome(outcome, phase="busy")
-                return outcome
+        if acquire_lock:
+            with runtime_lock(self.config.runtime_root) as acquired:
+                if not acquired:
+                    outcome = ProcessOutcome("busy", run_id, failures=("another pipeline worker holds the runtime lock",))
+                    self._write_outcome(outcome, phase="busy")
+                    return outcome
+                return self._run_locked(request, run_id=run_id)
+        return self._run_locked(request, run_id=run_id)
+
+    def _run_locked(self, request: ProcessRequest, *, run_id: str) -> ProcessOutcome:
+        """Perform the work after the shared runtime lock is held by caller."""
+
+        try:
             self._write_status(run_id, "running", "starting")
-            try:
-                if request.preflight_only:
-                    preflight = self.preflight()
-                    _write_json(self.config.preflight_path, preflight)
-                    outcome = ProcessOutcome("success", run_id, preflight=preflight)
-                    self._write_outcome(outcome, phase="preflight")
-                    return outcome
-                batch_path, scanner_batch = self._materialize_batch(request)
-                batch = self._load_batch(batch_path)
-                files = batch["files"]
-                if not files:
-                    notifications = self._drain_existing_notifications(request, run_id=run_id)
-                    outcome = ProcessOutcome("success", run_id, files_seen=0, notifications=notifications)
-                    self._write_outcome(outcome, phase="idle")
-                    return outcome
-                self._write_status(run_id, "running", "extract")
-                outcome = self._run_batch(run_id, batch_path, batch, request)
-                if scanner_batch and outcome.ack_eligible and not request.local_only:
-                    self._ack_scanner_batch()
-                self._write_outcome(outcome, phase="complete")
+            if request.preflight_only:
+                preflight = self.preflight()
+                _write_json(self.config.preflight_path, preflight)
+                outcome = ProcessOutcome("success", run_id, preflight=preflight)
+                self._write_outcome(outcome, phase="preflight")
                 return outcome
-            except Exception as exc:
-                outcome = ProcessOutcome("failed", run_id, failures=(str(exc) or type(exc).__name__,))
-                self._write_outcome(outcome, phase="failed")
+            batch_path, scanner_batch = self._materialize_batch(request)
+            batch = self._load_batch(batch_path)
+            files = batch["files"]
+            if not files:
+                notifications = self._drain_existing_notifications(request, run_id=run_id)
+                outcome = ProcessOutcome("success", run_id, files_seen=0, notifications=notifications)
+                self._write_outcome(outcome, phase="idle")
                 return outcome
+            self._write_status(run_id, "running", "extract")
+            outcome = self._run_batch(run_id, batch_path, batch, request)
+            if scanner_batch and outcome.ack_eligible and not request.local_only:
+                self._ack_scanner_batch()
+            self._write_outcome(outcome, phase="complete")
+            return outcome
+        except Exception as exc:
+            outcome = ProcessOutcome("failed", run_id, failures=(str(exc) or type(exc).__name__,))
+            self._write_outcome(outcome, phase="failed")
+            return outcome
 
     def _run_batch(
         self,
@@ -674,7 +667,7 @@ class DigestProcessor:
                             scope_key=run_id,
                         )
             if not request.local_only:
-                if self.config.notifications_enabled and not request.no_notify:
+                if self.config.notifications_enabled and not request.no_notify and not request.defer_notification_drain:
                     notifications = NotificationDrainer(state, self.notifier, clock=self.clock).drain()
                 export_notification_audit(state, self.config.notification_audit_path)
                 ack_eligible = self._scanner_ack_eligible(state, batch, documents)
@@ -702,7 +695,7 @@ class DigestProcessor:
     ) -> tuple[NotificationDelivery, ...]:
         """Drain the independent outbox even when the scanner has no PDFs."""
 
-        if request.local_only:
+        if request.local_only or request.defer_notification_drain:
             return ()
         with PipelineState.open(self.config.database) as state:
             state.migrate()
@@ -851,11 +844,22 @@ class DigestProcessor:
         for item in batch["files"]:
             assert isinstance(item, Mapping)
             path = str(item["path"])
+            source = str(item.get("source") or self.config.source).strip()
+            if source != self.config.source:
+                raise ProcessError("one processing batch must contain exactly one logical source")
+            source_file_id = str(item.get("source_file_id") or f"pdf:{item['pdf_sha256']}").strip()
+            source_window_id = item.get("source_window_id")
+            if source_window_id is not None:
+                try:
+                    source_window_id = int(source_window_id)
+                except (TypeError, ValueError) as exc:
+                    raise ProcessError("source_window_id must be an integer when supplied") from exc
             documents[path] = state.upsert_document(
-                self.config.source,
-                f"pdf:{item['pdf_sha256']}",
+                source,
+                source_file_id,
                 filename=str(item["filename"]),
                 source_path=path,
+                source_window_id=source_window_id,
             )
         return documents
 

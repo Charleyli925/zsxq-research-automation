@@ -9,7 +9,15 @@ root = "/absolute/path/to/zsxq-pipeline-runtime"
 database = "state/pipeline.sqlite3"
 
 [schedule]
+# Every launchd wake executes the same bounded tick.  Source slots remain
+# business configuration, not LaunchAgent calendar entries.
 timezone = "Asia/Shanghai"
+tick_budget_seconds = 240
+download_quota = 2
+process_quota = 20
+outbox_quota = 50
+# A longer outage is intentionally visible as a truncated catch-up window.
+max_catchup_seconds = 259200
 
 [model]
 name = "logical-summary-model"
@@ -31,6 +39,8 @@ cft_start_url = "https://wx.zsxq.com/group/YOUR_GROUP_ID"
 cft_headless = true
 cft_window_size = "1440,1200"
 workflow_version = "download:v1"
+# Preserve the existing foreign-report logical times after cutover.
+schedule_times = ["08:00", "12:00", "16:00", "20:30"]
 
 [sources.domestic_cicc]
 kind = "zsxq"
@@ -44,6 +54,36 @@ cft_start_url = "https://wx.zsxq.com/group/YOUR_GROUP_ID"
 cft_headless = true
 cft_window_size = "1440,1200"
 workflow_version = "download:v1"
+# Preserve the existing CICC logical times after cutover.
+schedule_times = ["08:20", "12:20", "16:20", "20:50"]
+
+[codex]
+# Absolute paths are allowed only for installed CLI executables; the release
+# entrypoint itself always resolves from runtime/current, never a dev checkout.
+command = "codex"
+model = "logical-summary-model"
+prompt_version = "summary-v1"
+reasoning = "high"
+timeout_seconds = 600
+work_root = "work/codex"
+
+[lark]
+command = "lark-cli"
+# Keep real profile paths and target chat IDs in the Git-ignored local copy.
+config_dir = "/absolute/path/to/lark-cli-profile"
+timeout_seconds = 90
+docs_identity = "user"
+notification_identity = "bot"
+notifications_enabled = true
+target_chat_id = ""
+parent_position = "my_library"
+
+[pipeline]
+extractor_version = "ocr-geometry-v2"
+summary_max_workers = 2
+doc_group_size = 10
+doc_group_threshold = 15
+max_files_per_document = 20
 
 [publish_targets.daily_digest]
 kind = "lark"

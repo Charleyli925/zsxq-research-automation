@@ -58,6 +58,16 @@ DOWNLOAD_RUNTIME_PATTERNS = {
     "direct Codex execution in download runtime": re.compile(r"\bcodex\s+exec\b", re.IGNORECASE),
 }
 
+UNIFIED_RUNTIME_PATTERNS = {
+    "legacy OpenClaw agent invocation": re.compile(r"\bopenclaw\s+agent\b", re.IGNORECASE),
+    "legacy task runtime entrypoint": re.compile(
+        r"openclaw_tasks/|install_local_runtime\.sh|zsxq-(?:autodownload|domestic-cicc)\.plist",
+        re.IGNORECASE,
+    ),
+    "dynamic Playwright MCP": re.compile(r"@playwright/mcp@latest|npx\s+.*playwright", re.IGNORECASE),
+    "development checkout absolute path": re.compile(r"/(?:Users|home)/[^/\s]+/(?:Developer|Documents)/", re.IGNORECASE),
+}
+
 
 def is_active_download_runtime(relative: Path) -> bool:
     rendered = relative.as_posix()
@@ -70,6 +80,20 @@ def is_active_download_runtime(relative: Path) -> bool:
         "src/zsxq_pipeline/browser.py",
         "src/zsxq_pipeline/download.py",
         "deploy/install_local_runtime.sh",
+    }
+
+
+def is_active_unified_runtime(relative: Path) -> bool:
+    rendered = relative.as_posix()
+    return rendered in {
+        "src/zsxq_pipeline/cli.py",
+        "src/zsxq_pipeline/config.py",
+        "src/zsxq_pipeline/lock.py",
+        "src/zsxq_pipeline/scheduler.py",
+        "src/zsxq_pipeline/worker.py",
+        "scripts/run_zsxq_pipeline.py",
+        "deploy/install_pipeline_runtime.py",
+        "deploy/launchd/zsxq-pipeline.plist.template",
     }
 
 
@@ -115,6 +139,10 @@ def main() -> int:
                 violations.append(f"{relative}: {label}")
         if is_active_download_runtime(relative):
             for label, pattern in DOWNLOAD_RUNTIME_PATTERNS.items():
+                if pattern.search(text):
+                    violations.append(f"{relative}: {label}")
+        if is_active_unified_runtime(relative):
+            for label, pattern in UNIFIED_RUNTIME_PATTERNS.items():
                 if pattern.search(text):
                     violations.append(f"{relative}: {label}")
 

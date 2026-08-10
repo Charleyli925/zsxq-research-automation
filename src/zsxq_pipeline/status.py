@@ -28,6 +28,7 @@ def doctor_state_only(database: str | Path) -> dict[str, Any]:
             "health": health,
             "counts": {
                 "documents": state.table_count("documents"),
+                "schedule_cursors": state.table_count("schedule_cursors"),
                 "artifacts": state.table_count("artifacts"),
                 "stage_attempts": state.table_count("stage_attempts"),
                 "publications": state.table_count("publications"),

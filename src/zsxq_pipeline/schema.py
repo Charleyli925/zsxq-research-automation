@@ -266,7 +266,30 @@ MIGRATION_2: tuple[str, ...] = (
     "CREATE INDEX idx_notification_outbox_due ON notification_outbox(status, available_at_epoch)",
 )
 
-MIGRATIONS: dict[int, tuple[str, ...]] = {1: MIGRATION_1, 2: MIGRATION_2}
+# Migration 3 adds only scheduler-owned metadata.  Source-window and stage
+# identities remain immutable; the cursor merely records which configured
+# clock slots were durably materialized as windows.
+MIGRATION_3: tuple[str, ...] = (
+    """
+    CREATE TABLE schedule_cursors (
+      source TEXT PRIMARY KEY,
+      cursor_iso TEXT NOT NULL,
+      cursor_epoch INTEGER NOT NULL,
+      last_window_start_iso TEXT NOT NULL,
+      last_window_start_epoch INTEGER NOT NULL,
+      last_window_end_iso TEXT NOT NULL,
+      last_window_end_epoch INTEGER NOT NULL,
+      truncated INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
+      created_at_iso TEXT NOT NULL,
+      created_at_epoch INTEGER NOT NULL,
+      updated_at_iso TEXT NOT NULL,
+      updated_at_epoch INTEGER NOT NULL
+    )
+    """,
+    "CREATE INDEX idx_schedule_cursors_updated ON schedule_cursors(updated_at_epoch)",
+)
+
+MIGRATIONS: dict[int, tuple[str, ...]] = {1: MIGRATION_1, 2: MIGRATION_2, 3: MIGRATION_3}
 
 # Rebuilding ``publications`` retains its primary keys, but SQLite updates the
 # child foreign-key declaration while a table is renamed.  Foreign-key checks

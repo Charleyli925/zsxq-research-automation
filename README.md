@@ -26,12 +26,25 @@ source scan
 The important invariant is that browser success is not archive proof. A run is
 complete only after the finalizer and manifest account for every planned file.
 
+## Unified runtime
+
+The production scheduler is one macOS user LaunchAgent with `RunAtLoad=true`
+and `StartInterval=300`. It invokes the finite command
+`zsxq-pipeline tick --config <local-pipeline.toml>`; source times, catch-up
+limits, quotas, stage recovery, and notifications are all driven by the same
+SQLite-backed pipeline rather than PID files, cron quiet windows, or directory
+mtime. See [deployment.md](docs/deployment.md) and the
+[cutover runbook](docs/cutover-runbook.md).
+
+Merging code does not install it or retire any old scheduler. Production
+cutover needs a separate explicit release decision, idle check, canary, and
+soak period.
+
 ## Repository layout
 
 - `scripts/`: download, reconciliation, report-processing, and knowledge-base tools
-- `openclaw_tasks/`: legacy-named compatibility task directories; their
-  wrappers invoke versioned Python commands directly and keep only local
-  logs, result exports, and notification rendering until scheduler cutover
+- `openclaw_tasks/`: retained legacy migration evidence; not a new-runtime
+  installation dependency and never allowed to run alongside the unified job
 - `src/zsxq_pipeline/`: durable state, extraction, direct Codex summary, and
   direct lark-cli publication adapters
 - `deploy/`: sanitized macOS LaunchAgent templates and release deployment tools
@@ -55,20 +68,16 @@ Install a local browser only if your deployment requires one:
 .venv/bin/playwright install chromium
 ```
 
-Prepare local configuration:
+Prepare a Git-ignored unified runtime configuration:
 
 ```bash
 mkdir -p config/local
-cp config/examples/job.example.json config/local/zsxq_foreign_reports_job.json
-cp config/examples/keywords.example.json config/local/interest_keywords.json
-cp openclaw_tasks/zsxq_download/config.foreign.env.example \
-  /actual/task/ZSXQ_autodownload/config.env
-cp openclaw_tasks/zsxq_pdf_digest/config.env.example \
-  /actual/task/ZSXQ_pdf_digest/config.env
+cp config/examples/pipeline.example.toml config/local/pipeline.toml
 ```
 
-Replace every placeholder before a real run. `config/local/` and `config.env`
-are ignored by Git.
+Replace every placeholder before a real run. `config/local/` is ignored by
+Git. Source job/keyword JSON, browser profiles, lark-cli profile, report
+content, and target chat identity stay external to the repository.
 
 The download path uses one authenticated Chrome for Testing CDP session per
 immutable source window. It has no model, agent, MCP, or dynamic package
@@ -107,8 +116,8 @@ lark-cli im +messages-send --help
 - GitHub `main` is the latest accepted source.
 - Changes use a branch and pull request after the initial baseline.
 - Releases use semantic version tags.
-- Production runs a reviewed tag or commit SHA from a separate deployment
-  checkout, never an uncommitted development working tree.
+- Production runs a reviewed detached tag or commit SHA from
+  `releases/<sha>/current`, never an uncommitted development working tree.
 - Runtime truth remains in task logs, manifests, and state outside Git.
 
 See [source-of-truth.md](docs/source-of-truth.md) and

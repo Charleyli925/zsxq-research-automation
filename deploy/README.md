@@ -1,58 +1,23 @@
-# Local runtime deployment
+# Unified runtime deployment
 
-`install_local_runtime.sh` turns a reviewed, detached repository checkout into
-the local runtime for the two ZSXQ download tasks. It is deliberately
-conservative:
-
-- dry-run is the default;
-- `--apply` rejects dirty and branch checkouts;
-- it refuses to replace wrappers while a task is running;
-- `config.env`, browser state, results, logs, and downloaded files are left in
-  the task directories;
-- old local wrappers are moved into `.deployment-backups/` before links are
-  installed;
-- a generated, Git-ignored `deployment.env` pins code paths to the deployed
-  checkout without copying private configuration into Git.
-
-## First deployment or upgrade
+Use `install_pipeline_runtime.py` from a clean detached release checkout. The
+new template at `launchd/zsxq-pipeline.plist.template` is the only scheduler
+installed by the unified runtime: `RunAtLoad=true`, `StartInterval=300`, no
+`KeepAlive`, explicit HOME/PATH/config/release entrypoint, and unified logs.
 
 ```bash
-git fetch --tags origin
-git checkout --detach <verified-tag-or-sha>
-
-bash deploy/install_local_runtime.sh --dry-run
-bash deploy/install_local_runtime.sh --apply \
-  --foreign-label com.example.zsxq-autodownload \
-  --domestic-label com.example.zsxq-domestic-cicc
+python3 deploy/install_pipeline_runtime.py install \
+  --release-root "$PWD" \
+  --runtime-root "$HOME/Library/Application Support/zsxq-research-automation" \
+  --config /absolute/path/to/pipeline.toml
 ```
 
-Use the existing labels when upgrading an existing machine. The defaults assume
-these task folders beneath `OPENCLAW_TASKS_ROOT` (or
-`$HOME/.openclaw/workspace/tasks`):
+Dry run is the default. `--apply` copies a release, migrates the configured
+database, runs doctor, records a sanitized manifest, and switches `current`
+only after those gates pass. `--cutover` is explicitly required before the
+installer unloads supplied legacy agents or disables supplied cron fragments.
+See `../docs/deployment.md` and `../docs/cutover-runbook.md`.
 
-- `ZSXQ_autodownload`
-- `ZSXQ_国内研报_中金公司`
-
-Pass `--foreign-task-dir` or `--domestic-task-dir` if the local names differ.
-The installation needs a private `config.env` in each folder; start from the
-sanitized examples in `openclaw_tasks/zsxq_download/`.
-
-## What the installer manages
-
-The generated LaunchAgents retain the normal four daily schedules and set
-`RunAtLoad=true`, which causes one catch-up trigger at the next login after a
-reboot. `ThrottleInterval=60` protects against launchd restart churn. The
-task-level lock prevents an overlapping trigger from starting a second run.
-
-After an install, inspect the runtime rather than assuming a scheduled job is
-healthy:
-
-```bash
-launchctl print gui/$(id -u)/com.example.zsxq-autodownload
-launchctl print gui/$(id -u)/com.example.zsxq-domestic-cicc
-```
-
-For a machine that is not currently in a GUI launchd session, use
-`--skip-launchd` to prepare links and `deployment.env`, then rerun without it
-after logging in. The `--allow-dirty` and `--allow-branch` flags are emergency
-escape hatches, not normal release workflow.
+`install_local_runtime.sh` and the two old launchd templates are retained only
+for pre-cutover migration/rollback evidence. Do not use them for a new unified
+installation and do not run them beside the new LaunchAgent.
