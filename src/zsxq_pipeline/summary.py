@@ -288,14 +288,14 @@ def _validate_entry(raw: object, *, expected_path: str) -> SummaryEntry:
     unknown = sorted(str(key) for key in keys - _ENTRY_FIELDS)
     if unknown:
         raise SummaryValidationError(f"summary has unsupported field(s): {', '.join(unknown)}")
-    required = {"path", "filename", "title", "markdown"}
+    required = {"path", "filename", "title", "quality_hint", "markdown"}
     missing = sorted(required - keys)
     if missing:
         raise SummaryValidationError(f"summary is missing required field(s): {', '.join(missing)}")
     path = _canonical_path(raw.get("path"), field="summary.path")
     if path != expected_path:
         raise SummaryValidationError(f"summary path does not match manifest order: {path}")
-    quality_hint = raw.get("quality_hint", "")
+    quality_hint = raw.get("quality_hint")
     if not isinstance(quality_hint, str):
         raise SummaryValidationError("summary.quality_hint must be a string")
     return SummaryEntry(
@@ -335,7 +335,7 @@ def validate_summary_payload(payload: Mapping[str, Any], *, expected_paths: Sequ
     unknown = sorted(str(key) for key in keys - _ROOT_FIELDS)
     if unknown:
         raise SummaryValidationError(f"summary result has unsupported field(s): {', '.join(unknown)}")
-    required = {"status", "handled_count", "handled_paths", "summaries"}
+    required = {"status", "handled_count", "handled_paths", "summaries", "error"}
     missing = sorted(required - keys)
     if missing:
         raise SummaryValidationError(f"summary result is missing required field(s): {', '.join(missing)}")
@@ -366,8 +366,8 @@ def validate_summary_payload(payload: Mapping[str, Any], *, expected_paths: Sequ
             raise SummaryValidationError("failed summary result must handle no paths and contain no summaries")
         return SummaryResult("failed", 0, (), (), error)
 
-    if "error" in keys:
-        raise SummaryValidationError("successful summary result must not contain error")
+    if payload.get("error") is not None:
+        raise SummaryValidationError("successful summary result requires error to be null")
     if handled_count != len(normalized_expected):
         raise SummaryValidationError(
             f"handled_count mismatch: expected {len(normalized_expected)}, got {handled_count}"

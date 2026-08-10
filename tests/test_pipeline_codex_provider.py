@@ -42,6 +42,7 @@ def _success_payload() -> dict[str, object]:
         "status": "success",
         "handled_count": 1,
         "handled_paths": ["/runtime/clean/report-a.md"],
+        "error": None,
         "summaries": [
             {
                 "path": "/runtime/clean/report-a.md",
@@ -162,6 +163,16 @@ def test_summary_schema_asset_forbids_free_form_root_and_entry_fields():
     assert schema["additionalProperties"] is False
     assert schema["properties"]["summaries"]["items"]["additionalProperties"] is False
     assert set(schema["properties"]) == {"status", "handled_count", "handled_paths", "summaries", "error"}
+    assert "oneOf" not in schema
+    assert set(schema["required"]) == {"status", "handled_count", "handled_paths", "summaries", "error"}
+    assert schema["properties"]["error"]["type"] == ["string", "null"]
+    assert set(schema["properties"]["summaries"]["items"]["required"]) == {
+        "path",
+        "filename",
+        "title",
+        "quality_hint",
+        "markdown",
+    }
 
 
 def test_schema_validation_rejects_extra_fields_and_manifest_mismatches():
@@ -173,6 +184,11 @@ def test_schema_validation_rejects_extra_fields_and_manifest_mismatches():
     payload = _success_payload()
     payload["handled_paths"] = ["/somewhere/else.md"]
     with pytest.raises(SummaryOutputValidationError, match="manifest"):
+        validate_summary_payload(payload, expected_paths=("/runtime/clean/report-a.md",))
+
+    payload = _success_payload()
+    payload["error"] = "unexpected failure detail"
+    with pytest.raises(SummaryOutputValidationError, match="requires error to be null"):
         validate_summary_payload(payload, expected_paths=("/runtime/clean/report-a.md",))
 
 
