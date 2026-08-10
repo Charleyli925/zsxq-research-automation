@@ -28,6 +28,15 @@ class SourceConfig:
     name: str
     kind: str
     state_path: Path | None
+    job_config_path: Path | None = None
+    keyword_path: Path | None = None
+    cdp_endpoint: str = ""
+    workflow_version: str = "download:v1"
+    cft_executable_path: Path | None = None
+    cft_user_data_dir: Path | None = None
+    cft_start_url: str = ""
+    cft_headless: bool = True
+    cft_window_size: str = "1440,1200"
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,11 +220,40 @@ def _parse_sources(root: Path, raw: Any) -> dict[str, SourceConfig]:
         if not source_name:
             raise ConfigError("sources may not contain an empty name")
         source = _as_mapping(value, field=f"sources.{source_name}")
-        _require_known(source, field=f"sources.{source_name}", allowed={"kind", "state_path"})
+        _require_known(
+            source,
+            field=f"sources.{source_name}",
+            allowed={
+                "kind",
+                "state_path",
+                "job_config",
+                "keyword_file",
+                "cdp_endpoint",
+                "workflow_version",
+                "cft_executable",
+                "cft_user_data_dir",
+                "cft_start_url",
+                "cft_headless",
+                "cft_window_size",
+            },
+        )
         result[source_name] = SourceConfig(
             name=source_name,
             kind=_required_text(source, "kind", table_name=f"sources.{source_name}"),
             state_path=_optional_within_root(root, source.get("state_path"), field=f"sources.{source_name}.state_path"),
+            job_config_path=_optional_absolute_path(source.get("job_config"), field=f"sources.{source_name}.job_config"),
+            keyword_path=_optional_absolute_path(source.get("keyword_file"), field=f"sources.{source_name}.keyword_file"),
+            cdp_endpoint=str(source.get("cdp_endpoint") or "").strip(),
+            workflow_version=str(source.get("workflow_version") or "download:v1").strip() or "download:v1",
+            cft_executable_path=_optional_absolute_path(
+                source.get("cft_executable"), field=f"sources.{source_name}.cft_executable"
+            ),
+            cft_user_data_dir=_optional_absolute_path(
+                source.get("cft_user_data_dir"), field=f"sources.{source_name}.cft_user_data_dir"
+            ),
+            cft_start_url=str(source.get("cft_start_url") or "").strip(),
+            cft_headless=_boolean(source, "cft_headless", table_name=f"sources.{source_name}", default=True),
+            cft_window_size=str(source.get("cft_window_size") or "1440,1200").strip() or "1440,1200",
         )
     return result
 

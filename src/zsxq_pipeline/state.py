@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from . import SCHEMA_VERSION
-from ._time import require_aware, to_iso_epoch, utc_now
+from ._time import from_iso, require_aware, to_iso_epoch, utc_now
 from .model import (
     ArtifactRecord,
     DocumentRecord,
@@ -295,6 +295,30 @@ class PipelineState:
             ).fetchone()
         assert row is not None
         return int(row["id"])
+
+    def latest_source_checkpoint(self, source: str) -> datetime | None:
+        """Return the last successfully committed endpoint for one source.
+
+        This is the only scheduler-facing checkpoint lookup.  Task-local JSON
+        mirrors may seed the first migration, but must not supersede this
+        durable value once a source has completed a pipeline window.
+        """
+
+        self._require_migrated()
+        normalized = str(source).strip()
+        if not normalized:
+            raise ValueError("source is required")
+        row = self._connection.execute(
+            """
+            SELECT window_end_iso
+            FROM source_windows
+            WHERE source = ? AND checkpoint_eligible = 1
+            ORDER BY window_end_epoch DESC, id DESC
+            LIMIT 1
+            """,
+            (normalized,),
+        ).fetchone()
+        return from_iso(str(row["window_end_iso"])) if row is not None else None
 
     def upsert_document(
         self,

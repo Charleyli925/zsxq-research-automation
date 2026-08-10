@@ -3,7 +3,8 @@
 This file handles the local file cleanup after browser downloading is done.
 
 Relation to other files:
-- Codex/OpenClaw first use Chrome to download PDFs into `~/Downloads`.
+- The deterministic browser pipeline first downloads PDFs into its configured
+  staging directory.
 - This script then finds the files that belong to the current run,
   moves them into the final batch folder, and updates the state file.
 """
@@ -808,9 +809,15 @@ def update_state(
     save_json(state_path, updated_state)
 
 
-def main() -> int:
+def run_finalization(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    """Run one archive/reconciliation transaction for the CLI or pipeline.
+
+    The caller supplies already-parsed arguments so the direct pipeline can
+    reuse exactly the CLI reconciliation semantics without creating a second
+    Python process or allowing this legacy helper to own durable state.
+    """
+
     # Step 1: read config, keywords, and previous state.
-    args = parse_args()
     config = load_json(Path(args.config))
     keywords = load_persistent_config(Path(args.keywords))
     state = load_json(Path(args.state))
@@ -1041,10 +1048,13 @@ def main() -> int:
         "run_manifest_path": str(run_manifest_path) if run_manifest_path else None,
         "dry_run": args.dry_run,
     }
+    return summary, 3 if args.commit_state and run_mode and not state_updated else 0
+
+
+def main() -> int:
+    summary, exit_code = run_finalization(parse_args())
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    if args.commit_state and run_mode and not state_updated:
-        return 3
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

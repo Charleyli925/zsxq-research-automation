@@ -229,10 +229,10 @@ def navigate_to_candidate_page(
     return last_state, last_navigation_error
 
 
-def download_candidate(
+def download_candidate_on_page(
     candidate: dict[str, Any],
     *,
-    cdp_endpoint: str,
+    page: Any,
     staging_dir: Path,
     timeout_ms: int,
     group_url: str = "",
@@ -260,114 +260,126 @@ def download_candidate(
             "path": str(destination),
         }
 
-    page = None
+    try:
+        page_state, navigation_error = navigate_to_candidate_page(
+            page,
+            topic_url=topic_url,
+            group_url=group_url,
+            group_name=group_name,
+            tag_name=tag_name,
+            timeout_ms=timeout_ms,
+            navigation_attempts=navigation_attempts,
+        )
+        body = page.locator("body")
+        if page_state["state"] == "login":
+            return {
+                "status": "blocked",
+                "reason_code": "need_reauth",
+                "file_id": file_id,
+                "filename": filename,
+                "topic_url": topic_url,
+            }
+        if page_state["state"] != "ready":
+            reason_code = "zsxq_page_unavailable" if page_state["state"] == "unavailable" else "zsxq_page_state_unrecognized"
+            return {
+                "status": "blocked",
+                "reason_code": reason_code,
+                "file_id": file_id,
+                "filename": filename,
+                "topic_url": topic_url,
+                "page_state": page_state,
+                "message": navigation_error,
+            }
+
+        attachment = visible_exact_text_locator(page, filename, timeout_ms)
+        attachment.click(timeout=timeout_ms)
+        page.get_by_text("文件详情", exact=True).wait_for(state="visible", timeout=timeout_ms)
+
+        detail_state, download_control = wait_for_file_detail_state(page, body, timeout_ms)
+        if detail_state == "protected":
+            return {
+                "status": "blocked",
+                "reason_code": "source_content_protected",
+                "file_id": file_id,
+                "filename": filename,
+                "topic_url": topic_url,
+                "message": "星主已开启内容保护，网页端不提供下载",
+            }
+
+        if download_control is None:
+            raise RuntimeError("downloadable detail state has no download control")
+        with page.expect_download(timeout=timeout_ms) as download_info:
+            download_control.click(timeout=timeout_ms)
+        download = download_info.value
+        failure = download.failure()
+        if failure:
+            raise RuntimeError(f"browser download failed: {failure}")
+
+        temp_handle, temp_name = tempfile.mkstemp(prefix=".zsxq-download-", suffix=".pdf", dir=staging_dir)
+        os.close(temp_handle)
+        temp_path = Path(temp_name)
+        try:
+            download.save_as(temp_path)
+            validate_pdf(temp_path)
+            temp_path.rename(destination)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+        return {
+            "status": "downloaded",
+            "reason_code": "download_completed",
+            "file_id": file_id,
+            "filename": filename,
+            "topic_url": topic_url,
+            "path": str(destination),
+            "size_bytes": destination.stat().st_size,
+        }
+    except PlaywrightTimeoutError as exc:
+        return {
+            "status": "blocked",
+            "reason_code": "playwright_action_timeout",
+            "file_id": file_id,
+            "filename": filename,
+            "topic_url": topic_url,
+            "message": " ".join(str(exc).split())[:800],
+        }
+
+
+def download_candidate(
+    candidate: dict[str, Any],
+    *,
+    cdp_endpoint: str,
+    staging_dir: Path,
+    timeout_ms: int,
+    group_url: str = "",
+    group_name: str = GROUP_MARKER,
+    tag_name: str = "",
+    navigation_attempts: int = DEFAULT_NAVIGATION_ATTEMPTS,
+) -> dict[str, Any]:
+    """Compatibility CLI adapter that owns a short-lived CDP session.
+
+    The production pipeline calls :func:`download_candidate_on_page` so one
+    scan and all plan-bound downloads share one persistent BrowserSession.
+    """
+
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(cdp_endpoint, timeout=timeout_ms)
         if not browser.contexts:
             raise RuntimeError("dedicated browser has no persistent context")
-        context = browser.contexts[0]
-        page = context.new_page()
+        page = browser.contexts[0].new_page()
         try:
-            page_state, navigation_error = navigate_to_candidate_page(
-                page,
-                topic_url=topic_url,
+            return download_candidate_on_page(
+                candidate,
+                page=page,
+                staging_dir=staging_dir,
+                timeout_ms=timeout_ms,
                 group_url=group_url,
                 group_name=group_name,
                 tag_name=tag_name,
-                timeout_ms=timeout_ms,
                 navigation_attempts=navigation_attempts,
             )
-            body = page.locator("body")
-            if page_state["state"] == "login":
-                return {
-                    "status": "blocked",
-                    "reason_code": "need_reauth",
-                    "file_id": file_id,
-                    "filename": filename,
-                    "topic_url": topic_url,
-                }
-            if page_state["state"] != "ready":
-                reason_code = (
-                    "zsxq_page_unavailable"
-                    if page_state["state"] == "unavailable"
-                    else "zsxq_page_state_unrecognized"
-                )
-                return {
-                    "status": "blocked",
-                    "reason_code": reason_code,
-                    "file_id": file_id,
-                    "filename": filename,
-                    "topic_url": topic_url,
-                    "page_state": page_state,
-                    "message": navigation_error,
-                }
-
-            attachment = visible_exact_text_locator(page, filename, timeout_ms)
-            attachment.click(timeout=timeout_ms)
-            page.get_by_text("文件详情", exact=True).wait_for(
-                state="visible",
-                timeout=timeout_ms,
-            )
-
-            detail_state, download_control = wait_for_file_detail_state(
-                page,
-                body,
-                timeout_ms,
-            )
-            if detail_state == "protected":
-                return {
-                    "status": "blocked",
-                    "reason_code": "source_content_protected",
-                    "file_id": file_id,
-                    "filename": filename,
-                    "topic_url": topic_url,
-                    "message": "星主已开启内容保护，网页端不提供下载",
-                }
-
-            if download_control is None:
-                raise RuntimeError("downloadable detail state has no download control")
-            with page.expect_download(timeout=timeout_ms) as download_info:
-                download_control.click(timeout=timeout_ms)
-            download = download_info.value
-            failure = download.failure()
-            if failure:
-                raise RuntimeError(f"browser download failed: {failure}")
-
-            temp_handle, temp_name = tempfile.mkstemp(
-                prefix=".zsxq-download-",
-                suffix=".pdf",
-                dir=staging_dir,
-            )
-            os.close(temp_handle)
-            temp_path = Path(temp_name)
-            try:
-                download.save_as(temp_path)
-                validate_pdf(temp_path)
-                temp_path.rename(destination)
-            finally:
-                temp_path.unlink(missing_ok=True)
-
-            return {
-                "status": "downloaded",
-                "reason_code": "download_completed",
-                "file_id": file_id,
-                "filename": filename,
-                "topic_url": topic_url,
-                "path": str(destination),
-                "size_bytes": destination.stat().st_size,
-            }
-        except PlaywrightTimeoutError as exc:
-            return {
-                "status": "blocked",
-                "reason_code": "playwright_action_timeout",
-                "file_id": file_id,
-                "filename": filename,
-                "topic_url": topic_url,
-                "message": " ".join(str(exc).split())[:800],
-            }
         finally:
-            if page is not None:
-                page.close()
+            page.close()
 
 
 def build_parser() -> argparse.ArgumentParser:

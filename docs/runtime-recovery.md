@@ -14,9 +14,9 @@
   文件依靠文件指纹和 manifest 去重。
 - PDF 只有在 publish `success` 或明确 content quarantine 后才被确认。未确认
   的 PDF 会在下次扫描中再次出现；已生成的正文和摘要 artifact 会被复用。
-- digest 保留既有 `run.cron-safe.sh -> run.sh` 调度入口，但 `run.sh` 只读取
-  本地配置并启动 Python pipeline。它不快照或清理 OpenClaw agent、session、
-  registry 或 auth 文件。
+- 下载和 digest 暂时保留各自的 `run.cron-safe.sh -> run.sh` 调度兼容入口，
+  但 `run.sh` 只读取本地配置并启动对应 Python pipeline。下载在同一 CDP session
+  内完成 scan/download；它们都不快照或清理 Agent、session、registry 或 auth 文件。
 
 ## 并发与假死防护
 
@@ -34,7 +34,8 @@
 
 ## 中断后的预期行为
 
-1. 用户登录 macOS 后，两个下载 LaunchAgent 因 `RunAtLoad=true` 各触发一次。
+1. 用户登录 macOS 后，两个下载 LaunchAgent 因 `RunAtLoad=true` 各触发一次，
+   每次从 durable checkpoint 建立一个新的 immutable plan。
 2. 共享浏览器锁只允许一条下载链进入；另一条等待或返回 `busy`。
 3. 下载任务从最后已提交 checkpoint 重建时间窗口，对照 scan plan 和 manifest
    补齐缺失文件。

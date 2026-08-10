@@ -17,8 +17,7 @@ FOREIGN_TEMPLATE = ROOT / "deploy" / "launchd" / "zsxq-autodownload.plist.templa
 DOMESTIC_TEMPLATE = ROOT / "deploy" / "launchd" / "zsxq-domestic-cicc.plist.template"
 RUNNER = ROOT / "openclaw_tasks" / "zsxq_download" / "run.sh"
 CRON_WRAPPER = ROOT / "openclaw_tasks" / "zsxq_download" / "run.cron-safe.sh"
-FOREIGN_LAUNCHER = ROOT / "scripts" / "run_zsxq_task_via_codex.sh"
-DOMESTIC_LAUNCHER = ROOT / "scripts" / "run_zsxq_domestic_cicc_task_via_codex.sh"
+DOWNLOAD_ENTRY = ROOT / "scripts" / "run_zsxq_download_pipeline.py"
 DIGEST_RUNNER = ROOT / "openclaw_tasks" / "zsxq_pdf_digest" / "run.sh"
 DIGEST_CRON_WRAPPER = ROOT / "openclaw_tasks" / "zsxq_pdf_digest" / "run.cron-safe.sh"
 
@@ -148,10 +147,27 @@ class LocalRuntimeDeploymentTests(unittest.TestCase):
 
             foreign_deployment_env = (foreign / "deployment.env").read_text(encoding="utf-8")
             domestic_deployment_env = (domestic / "deployment.env").read_text(encoding="utf-8")
-            self.assertIn(f"CODEX_SCRIPT_PATH={shlex.quote(str(FOREIGN_LAUNCHER))}", foreign_deployment_env)
-            self.assertIn(f"CODEX_SCRIPT_PATH={shlex.quote(str(DOMESTIC_LAUNCHER))}", domestic_deployment_env)
-            self.assertNotIn(f"CODEX_SCRIPT_PATH={shlex.quote(str(RUNNER))}", foreign_deployment_env)
-            self.assertNotIn(f"CODEX_SCRIPT_PATH={shlex.quote(str(RUNNER))}", domestic_deployment_env)
+            expected_download_keys = {
+                "AUTOMATION_ROOT",
+                "DOWNLOAD_RUNNER_PATH",
+                "ZSXQ_SOURCE_NAME",
+                "NOTIFICATION_PIPELINE",
+                "NOTIFICATION_POLICY_PATH",
+                "PIPELINE_RESULT_PATH",
+            }
+            for deployment_env, source_name in (
+                (foreign_deployment_env, "foreign_reports"),
+                (domestic_deployment_env, "domestic_cicc"),
+            ):
+                actual_download_keys = {
+                    line.split("=", 1)[0]
+                    for line in deployment_env.splitlines()
+                    if line and not line.startswith("#")
+                }
+                self.assertEqual(actual_download_keys, expected_download_keys)
+                self.assertIn(f"DOWNLOAD_RUNNER_PATH={shlex.quote(str(DOWNLOAD_ENTRY))}", deployment_env)
+                self.assertIn(f"ZSXQ_SOURCE_NAME={source_name}", deployment_env)
+                self.assertNotIn("CODEX_SCRIPT_PATH", deployment_env)
 
             record = json.loads(
                 (tasks_root / ".deployment" / "investment-reports-automation.json").read_text(encoding="utf-8")
@@ -206,7 +222,7 @@ class LocalRuntimeDeploymentTests(unittest.TestCase):
                     self.assertIn(str(canonical_task), completed.stderr)
                     self.assertFalse((active_task / "deployment.env").exists())
 
-    def test_runner_creates_current_failure_result_when_launcher_is_missing(self) -> None:
+    def test_runner_creates_current_failure_result_when_direct_runner_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
             task_dir = tmp / "task"
@@ -216,8 +232,14 @@ class LocalRuntimeDeploymentTests(unittest.TestCase):
             config = "\n".join(
                 [
                     f"AUTOMATION_ROOT={shlex.quote(str(ROOT))}",
-                    f"CODEX_SCRIPT_PATH={shlex.quote(str(tmp / 'missing-launcher.sh'))}",
-                    f"CODEX_STRUCTURED_REPORT_PATH={shlex.quote(str(canonical))}",
+                    f"DOWNLOAD_RUNNER_PATH={shlex.quote(str(tmp / 'missing-download-runner.py'))}",
+                    'ZSXQ_SOURCE_NAME="foreign_reports"',
+                    f"ZSXQ_JOB_CONFIG_FILE={shlex.quote(str(tmp / 'job.json'))}",
+                    f"ZSXQ_KEYWORDS_FILE={shlex.quote(str(tmp / 'keywords.json'))}",
+                    f"ZSXQ_LEGACY_STATE_FILE={shlex.quote(str(tmp / 'state.json'))}",
+                    f"PIPELINE_RESULT_PATH={shlex.quote(str(canonical))}",
+                    "CFT_EXECUTABLE_PATH=/bin/true",
+                    f"CFT_USER_DATA_DIR={shlex.quote(str(tmp / 'cft-profile'))}",
                     'NOTIFICATION_PIPELINE="foreign_download"',
                     f"NOTIFICATION_POLICY_PATH={shlex.quote(str(tmp / 'missing-policy.py'))}",
                     'LOG_FILE="cron.log"',
@@ -244,29 +266,25 @@ class LocalRuntimeDeploymentTests(unittest.TestCase):
             canonical_result = json.loads(canonical.read_text(encoding="utf-8"))
             self.assertEqual(canonical_result["run_id"], result["run_id"])
             self.assertEqual(canonical_result["status"], "failed")
-            self.assertTrue(canonical_result["recovered_stale_result"])
+            self.assertEqual(canonical_result["reason_code"], "missing_download_runner")
 
-    def test_runner_refuses_nested_invocation_without_touching_task_state(self) -> None:
+    def test_runner_requires_private_task_config_before_touching_task_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
             task_dir = tmp / "task"
             task_dir.mkdir()
             (task_dir / "run.sh").symlink_to(RUNNER)
 
-            env = os.environ.copy()
-            env["ZSXQ_OUTER_RUNNER_ACTIVE"] = "1"
             completed = subprocess.run(
                 ["bash", str(task_dir / "run.sh")],
                 cwd=task_dir,
-                env=env,
                 capture_output=True,
                 text=True,
                 check=False,
             )
 
-            self.assertEqual(completed.returncode, 75, completed.stderr)
-            self.assertIn("refusing nested ZSXQ outer-runner invocation", completed.stderr)
-            self.assertFalse((task_dir / "startup_debug.log").exists())
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            self.assertIn("missing task configuration", completed.stderr)
             self.assertFalse((task_dir / "last_result.json").exists())
 
     def test_cron_wrapper_passes_task_directory_to_an_overridden_runner(self) -> None:
@@ -287,8 +305,14 @@ class LocalRuntimeDeploymentTests(unittest.TestCase):
             config = "\n".join(
                 [
                     f"AUTOMATION_ROOT={shlex.quote(str(ROOT))}",
-                    f"CODEX_SCRIPT_PATH={shlex.quote(str(tmp / 'missing-launcher.sh'))}",
-                    f"CODEX_STRUCTURED_REPORT_PATH={shlex.quote(str(canonical))}",
+                    f"DOWNLOAD_RUNNER_PATH={shlex.quote(str(tmp / 'missing-download-runner.py'))}",
+                    'ZSXQ_SOURCE_NAME="foreign_reports"',
+                    f"ZSXQ_JOB_CONFIG_FILE={shlex.quote(str(tmp / 'job.json'))}",
+                    f"ZSXQ_KEYWORDS_FILE={shlex.quote(str(tmp / 'keywords.json'))}",
+                    f"ZSXQ_LEGACY_STATE_FILE={shlex.quote(str(tmp / 'state.json'))}",
+                    f"PIPELINE_RESULT_PATH={shlex.quote(str(canonical))}",
+                    "CFT_EXECUTABLE_PATH=/bin/true",
+                    f"CFT_USER_DATA_DIR={shlex.quote(str(tmp / 'cft-profile'))}",
                     f"TASK_RUN_ENTRY_PATH={shlex.quote(str(source_runner))}",
                     f"PYTHON_BIN={shlex.quote(sys.executable)}",
                     'NOTIFICATION_PIPELINE="foreign_download"',

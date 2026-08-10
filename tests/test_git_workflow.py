@@ -52,6 +52,21 @@ class GitWorkflowTests(unittest.TestCase):
     def test_workflow_selects_a_focused_test_for_its_own_changes(self) -> None:
         self.assertEqual(select_test_targets(ROOT, ["scripts/git_workflow.py"]), ["tests/test_git_workflow.py"])
 
+    def test_workflow_maps_direct_download_and_config_changes_to_their_contract_tests(self) -> None:
+        self.assertEqual(
+            select_test_targets(ROOT, ["src/zsxq_pipeline/download.py"]),
+            [
+                "tests/test_download_zsxq_plan_file.py",
+                "tests/test_finalize_download_batch.py",
+                "tests/test_pipeline_browser.py",
+                "tests/test_pipeline_download.py",
+                "tests/test_pipeline_download_result.py",
+                "tests/test_scan_zsxq_download_candidates.py",
+                "tests/test_zsxq_preflight.py",
+            ],
+        )
+        self.assertEqual(select_test_targets(ROOT, ["src/zsxq_pipeline/config.py"]), ["tests/test_pipeline_cli.py"])
+
 
 if __name__ == "__main__":
     unittest.main()

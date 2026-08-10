@@ -6,36 +6,37 @@
 - 摘要发布链：扫描已归档 PDF、提取正文、生成本地摘要，再发布到飞书。
 - 资料库链：把 PDF、正文、摘要、飞书链接和 Obsidian 阅读入口关联起来。
 
-这里的重点是摘要发布链已经不再依赖 OpenClaw 的 binary、旧模型注册表、
-session、credential artifact 或模型配置。保留在
-`openclaw_tasks/zsxq_pdf_digest/` 下的文件名只是既有 scheduler 兼容目录；
-cron 仍调用 `run.cron-safe.sh -> run.sh`，而 `run.sh` 只会启动
-`python -m zsxq_pipeline.cli process`。
+下载链和摘要发布链都由版本化 Python pipeline 执行。下载在一个已授权的
+Chrome for Testing CDP session 中生成 immutable plan、逐项下载并完成归档对账；
+不依赖 Agent、MCP 或动态 npm 包。保留在 `openclaw_tasks/` 下的文件名只是既有
+scheduler 兼容目录：下载 wrapper 调用 `zsxq-pipeline download`，digest wrapper
+调用 `zsxq-pipeline process`，两者都不读取旧模型注册表、session 或 auth artifact。
 
 ## 1. 总体流向
 
 ```mermaid
 flowchart TD
-    A["下载计划和浏览器下载"] --> B["归档 PDF + batch manifest"]
-    B --> C["digest cron wrapper"]
-    C --> D["zsxq-pipeline process"]
-    D --> E["提取正文 + 质量门禁"]
-    E --> F{"正文可用吗"}
-    F -- "否" --> G["quarantine / blocked_release"]
-    F -- "是" --> H{"summary cache 命中吗"}
-    H -- "是" --> I["复用本地 JSON / Markdown"]
-    H -- "否" --> J["codex exec\n临时、只读、schema 输出"]
-    J --> K["原子写本地摘要 artifact"]
-    I --> R["ResearchLibrary 可读摘要投影\n（best effort）"]
-    K --> R
-    I --> L["确定性发布分组"]
-    K --> L
-    L --> M["lark-cli docs/drive --as user"]
-    M --> N{"fetch / 权限校验完成吗"}
-    N -- "否" --> O["remote_written 后续恢复"]
-    N -- "是" --> P["publication success"]
-    P --> Q["outbox: lark-cli im --as bot"]
-    P --> S["Obsidian 阅读入口投影\n（best effort）"]
+    A["冻结窗口 + immutable scan plan"] --> B["单一 CDP session 的计划内下载"]
+    B --> C["归档 PDF + batch manifest"]
+    C --> D["digest cron compatibility wrapper"]
+    D --> E["zsxq-pipeline process"]
+    E --> F["提取正文 + 质量门禁"]
+    F --> G{"正文可用吗"}
+    G -- "否" --> H["quarantine / blocked_release"]
+    G -- "是" --> I{"summary cache 命中吗"}
+    I -- "是" --> J["复用本地 JSON / Markdown"]
+    I -- "否" --> K["codex exec\n临时、只读、schema 输出"]
+    K --> L["原子写本地摘要 artifact"]
+    J --> R["ResearchLibrary 可读摘要投影\n（best effort）"]
+    L --> R
+    J --> M["确定性发布分组"]
+    L --> M
+    M --> N["lark-cli docs/drive --as user"]
+    N --> O{"fetch / 权限校验完成吗"}
+    O -- "否" --> P["remote_written 后续恢复"]
+    O -- "是" --> Q["publication success"]
+    Q --> T["outbox: lark-cli im --as bot"]
+    Q --> U["Obsidian 阅读入口投影\n（best effort）"]
 ```
 
 一句话：只让模型读取已经提取并通过质量门禁的正文；本地 Markdown 摘要
@@ -50,9 +51,9 @@ flowchart TD
 
 | 组件 | 负责什么 | 不负责什么 |
 | --- | --- | --- |
-| 下载脚本 / Chrome for Testing | 固定窗口、候选计划、授权下载和归档 | 摘要、飞书写入 |
-| `run.cron-safe.sh` | 按既有日历唤醒任务、日志轮转、避免重叠触发 | 执行摘要模型或飞书 API |
-| `run.sh` | 读取任务本地配置并转交 Python pipeline | 快照 agent、清 session、同步 auth |
+| `zsxq_pipeline.download` / Chrome for Testing | 固定窗口、候选计划、授权下载、归档对账和 SQLite 阶段记录 | 摘要、飞书写入 |
+| 下载 `run.cron-safe.sh` | 按既有日历唤醒、日志轮转、避免重叠触发 | 浏览器业务判断、摘要模型或飞书 API |
+| 下载 `run.sh` | 读取任务本地配置并转交 Python 下载命令 | 启动 Agent、解析 Prompt、清 session 或同步 auth |
 | `zsxq_pipeline.extract` | 文本提取、OCR fallback、正文质量门禁 | 让模型直接读 PDF |
 | `zsxq_pipeline.providers.codex` | 通过固定 argv 调用 `codex exec` | 访问浏览器、飞书、仓库写入、外部事实 |
 | `zsxq_pipeline.publish` / `lark` | 确定性分组、文档创建/追加/fetch/授权 | 重做摘要 |

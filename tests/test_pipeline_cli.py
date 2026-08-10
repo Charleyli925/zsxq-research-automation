@@ -175,3 +175,38 @@ target_document = "daily-doc-logical-id"
     )
     with pytest.raises(ConfigError, match="1..2"):
         load_pipeline_config(config_path)
+
+
+def test_download_source_cft_startup_options_are_typed(tmp_path):
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir()
+    config_path = tmp_path / "pipeline.toml"
+    _write_config(config_path, tmp_path / "runtime", legacy_root)
+    executable = tmp_path / "Google Chrome for Testing"
+    profile = tmp_path / "cft-profile"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            'state_path = "state/foreign.json"',
+            "\n".join(
+                [
+                    'state_path = "state/foreign.json"',
+                    'job_config = "/absolute/path/to/job.json"',
+                    'keyword_file = "/absolute/path/to/keywords.json"',
+                    'cdp_endpoint = "http://127.0.0.1:9223"',
+                    f'cft_executable = "{executable}"',
+                    f'cft_user_data_dir = "{profile}"',
+                    'cft_start_url = "https://wx.zsxq.com/group/example"',
+                    "cft_headless = false",
+                    'cft_window_size = "1280,800"',
+                ]
+            ),
+        ),
+        encoding="utf-8",
+    )
+
+    source = load_pipeline_config(config_path).sources["foreign"]
+    assert source.cft_executable_path == executable
+    assert source.cft_user_data_dir == profile
+    assert source.cft_start_url.endswith("/example")
+    assert source.cft_headless is False
+    assert source.cft_window_size == "1280,800"

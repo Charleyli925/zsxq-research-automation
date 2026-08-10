@@ -27,8 +27,15 @@ jobs:
         run: python -m pip install -e ".[dev]"
       - name: Check shell syntax
         run: |
-          bash -n scripts/*.sh
-          bash -n openclaw_tasks/zsxq_pdf_digest/*.sh
+          shopt -s nullglob
+          script_shell_files=(scripts/*.sh)
+          if ((${#script_shell_files[@]})); then
+            bash -n "${script_shell_files[@]}"
+          fi
+          digest_shell_files=(openclaw_tasks/zsxq_pdf_digest/*.sh)
+          if ((${#digest_shell_files[@]})); then
+            bash -n "${digest_shell_files[@]}"
+          fi
       - name: Check repository hygiene
         run: python scripts/check_repository_hygiene.py
       - name: Run tests
