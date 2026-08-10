@@ -111,12 +111,13 @@ def test_direct_codex_call_uses_isolated_argv_and_only_last_message_output(tmp_p
     assert result.output["status"] == "success"
     assert result.usage == {"input_tokens": 123}
     assert result.workdir is not None
-    assert popen.argv[:8] == (
+    assert popen.argv[:9] == (
         "codex",
         "exec",
         "--ephemeral",
         "--ignore-user-config",
         "--ignore-rules",
+        "--skip-git-repo-check",
         "--sandbox",
         "read-only",
         "--model",
