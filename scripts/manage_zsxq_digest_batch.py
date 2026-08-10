@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-This file handles the small helper steps around the ZSXQ PDF digest batch.
+This file retains legacy-compatible, side-effect-free helper commands for
+historical ZSXQ digest artifacts.  The active runtime is
+``zsxq_pipeline.process``; it does not call this module to orchestrate Codex,
+Lark, sessions, or publication.
 
 Relation to other files:
 - `scan_new_zsxq_pdfs.py` finds which PDFs are still waiting to be summarized.
-- `run.sh` calls this helper to split a big batch into small chunks.
-- `summary_prompt.md` is the template; this helper fills in the real file paths.
+- Existing archived batches may use this helper to split or inspect local
+  artifacts during an explicit import.
 - `extract_pdf_text.py` writes the cleaned text path that this helper checks before summary.
 """
 
@@ -35,6 +38,9 @@ except ModuleNotFoundError:  # pragma: no cover
         record_event = None  # type: ignore[assignment]
         upsert_report = None  # type: ignore[assignment]
 
+# Historical artifacts produced before PR4 may have this prefix.  The active
+# direct-Codex path emits raw schema JSON and never calls this compatibility
+# parser.
 SUMMARY_PREFIX = "ZSXQ_SUMMARY_JSON:"
 SUMMARY_CACHE_VERSION = os.environ.get("ZSXQ_SUMMARY_CACHE_VERSION", "2026-03-28-v1").strip() or "2026-03-28-v1"
 MAX_SUMMARY_INPUT_LINE_CHARS = 1200
@@ -122,9 +128,6 @@ def parse_args() -> argparse.Namespace:
 
     ready_parser = subparsers.add_parser("check-text-ready", help="Check whether one chunk already has usable text files.")
     ready_parser.add_argument("--batch-file", required=True)
-
-    inspect_parser = subparsers.add_parser("inspect-output", help="Extract normalized text and usage from one agent output file.")
-    inspect_parser.add_argument("--result-file", required=True)
 
     create_markdown_parser = subparsers.add_parser(
         "build-lark-cli-create-markdown",
@@ -1148,10 +1151,7 @@ def build_quarantine_command(path: str) -> str:
     if not value:
         return ""
     quoted = shlex.quote(value)
-    return (
-        "bash ${OPENCLAW_TASKS_ROOT:-$HOME/.openclaw/workspace/tasks}/ZSXQ_pdf_digest/run.sh "
-        f"--dry-run --file {quoted}"
-    )
+    return f"bash <digest-task-dir>/run.sh --dry-run --file {quoted}"
 
 
 def normalize_quarantine_entry(entry: dict[str, Any]) -> dict[str, Any]:
@@ -1556,70 +1556,6 @@ def render_prompt(
     return 0
 
 
-def parse_agent_output_json(raw_text: str) -> dict[str, Any] | None:
-    offsets: list[int] = []
-    cursor = 0
-    for line in raw_text.splitlines(keepends=True):
-        stripped = line.lstrip()
-        if stripped.startswith("{"):
-            offsets.append(cursor + (len(line) - len(stripped)))
-        cursor += len(line)
-
-    for start in reversed(offsets):
-        snippet = raw_text[start:].strip()
-        if not snippet:
-            continue
-        try:
-            data = json.loads(snippet)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict):
-            return data
-    return None
-
-
-def _extract_payload_items(run_payload: dict[str, Any] | None) -> list[dict[str, Any]]:
-    if not run_payload:
-        return []
-
-    # OpenClaw 的 JSON 输出有过两种形状：
-    # 旧版放在 result.payloads，新版直接放在顶层 payloads。
-    candidate_lists = [
-        run_payload.get("payloads"),
-        ((run_payload.get("result") or {}).get("payloads") or []),
-    ]
-    for items in candidate_lists:
-        if isinstance(items, list):
-            return [item for item in items if isinstance(item, dict)]
-    return []
-
-
-def _extract_meta(run_payload: dict[str, Any] | None) -> dict[str, Any]:
-    if not run_payload:
-        return {}
-
-    top_level_meta = run_payload.get("meta")
-    if isinstance(top_level_meta, dict):
-        return top_level_meta
-
-    nested_meta = ((run_payload.get("result") or {}).get("meta") or {})
-    return nested_meta if isinstance(nested_meta, dict) else {}
-
-
-def extract_agent_payload_text(run_payload: dict[str, Any] | None, raw_text: str) -> str:
-    if not run_payload:
-        return raw_text
-
-    payloads = _extract_payload_items(run_payload)
-    texts: list[str] = []
-    for item in payloads:
-        text = str(item.get("text") or "").strip()
-        if text:
-            texts.append(text)
-    normalized_text = "\n\n".join(texts).strip()
-    return normalized_text or raw_text
-
-
 def extract_doc_url(text: str) -> str:
     match = re.search(r"https?://[^\s)]+feishu\.cn/[^\s)]+", text)
     if not match:
@@ -1627,48 +1563,18 @@ def extract_doc_url(text: str) -> str:
     return match.group(0) if match else ""
 
 
-def inspect_agent_output(result_file: Path) -> int:
-    raw_text = result_file.read_text(encoding="utf-8", errors="replace")
-    run_payload = parse_agent_output_json(raw_text)
-    normalized_text = extract_agent_payload_text(run_payload, raw_text)
-    meta = _extract_meta(run_payload)
-    agent_meta = meta.get("agentMeta") or {}
-    usage = agent_meta.get("lastCallUsage") or agent_meta.get("usage") or {}
-    system_prompt_report = meta.get("systemPromptReport") or {}
-    system_prompt = system_prompt_report.get("systemPrompt") or {}
-    skills = system_prompt_report.get("skills") or {}
-    tools = system_prompt_report.get("tools") or {}
-
-    payload = {
-        "has_json_wrapper": run_payload is not None,
-        "doc_url": extract_doc_url(normalized_text) or extract_doc_url(raw_text),
-        "text_chars": len(normalized_text),
-        "payload_count": len(_extract_payload_items(run_payload)),
-        "session_id": str(agent_meta.get("sessionId") or "").strip(),
-        "provider": str(agent_meta.get("provider") or "").strip(),
-        "model": str(agent_meta.get("model") or "").strip(),
-        "prompt_tokens": int(agent_meta.get("promptTokens") or 0),
-        "usage": {
-            "input": int(usage.get("input") or 0),
-            "output": int(usage.get("output") or 0),
-            "cacheRead": int(usage.get("cacheRead") or 0),
-            "cacheWrite": int(usage.get("cacheWrite") or 0),
-            "total": int(usage.get("total") or 0),
-        },
-        "system_prompt_chars": int(system_prompt.get("chars") or 0),
-        "skills_prompt_chars": int(skills.get("promptChars") or 0),
-        "tools_list_chars": int(tools.get("listChars") or 0),
-        "tools_schema_chars": int(tools.get("schemaChars") or 0),
-        "workspace_dir": str(system_prompt_report.get("workspaceDir") or "").strip(),
-        "response_text": normalized_text,
-    }
-    print(json.dumps(payload, ensure_ascii=False))
-    return 0
-
-
 def extract_prefixed_payload(result_file: Path, prefix: str, missing_message: str) -> dict[str, Any]:
     raw_text = result_file.read_text(encoding="utf-8", errors="replace")
-    lines = extract_agent_payload_text(parse_agent_output_json(raw_text), raw_text).splitlines()
+    # Direct-Codex artifacts are plain strict JSON.  Keep only the simple
+    # historical line-prefix fallback for explicit legacy imports; never
+    # unwrap an agent envelope or inspect session/provider metadata.
+    try:
+        direct = json.loads(raw_text.strip())
+    except json.JSONDecodeError:
+        direct = None
+    if isinstance(direct, dict):
+        return direct
+    lines = raw_text.splitlines()
     for line in reversed(lines):
         stripped = line.strip()
         if not stripped.startswith(prefix):
@@ -2599,7 +2505,7 @@ def validate_summary_result(batch_file: Path, result_file: Path) -> int:
 
     status = str(result.get("status", "")).strip().lower()
     if status != "success":
-        error = str(result.get("error", "")).strip() or "summary agent did not report success"
+        error = str(result.get("error", "")).strip() or "summary provider did not report success"
         raise SystemExit(error)
 
     batch_items = list(batch.get("files", []))
@@ -2923,11 +2829,6 @@ def main() -> int:
     if args.command == "check-text-ready":
         return check_batch_text_ready(
             batch_file=Path(args.batch_file).expanduser().resolve(),
-        )
-
-    if args.command == "inspect-output":
-        return inspect_agent_output(
-            result_file=Path(args.result_file).expanduser().resolve(),
         )
 
     if args.command == "build-lark-cli-create-markdown":

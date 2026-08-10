@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ZSXQ summary output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "handled_count",
+    "handled_paths",
+    "summaries"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["success", "failed"]
+    },
+    "handled_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "handled_paths": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "summaries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "filename", "title", "markdown"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "filename": {"type": "string", "minLength": 1},
+          "title": {"type": "string", "minLength": 1},
+          "quality_hint": {"type": "string"},
+          "markdown": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "error": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "status": {"const": "success"}
+      },
+      "not": {
+        "required": ["error"]
+      }
+    },
+    {
+      "properties": {
+        "status": {"const": "failed"},
+        "handled_count": {"const": 0},
+        "handled_paths": {"maxItems": 0},
+        "summaries": {"maxItems": 0}
+      },
+      "required": ["error"]
+    }
+  ]
+}

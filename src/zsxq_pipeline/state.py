@@ -12,7 +12,7 @@ import json
 import sqlite3
 import unicodedata
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,6 +24,7 @@ from .model import (
     ArtifactRecord,
     DocumentRecord,
     ErrorCategory,
+    NotificationClaim,
     NotificationRecord,
     PipelineHealth,
     PublicationRecord,
@@ -31,6 +32,7 @@ from .model import (
     Stage,
     StageClaim,
     StageState,
+    SummaryIdentity,
     as_error_category,
     as_stage,
     as_stage_state,
@@ -124,6 +126,63 @@ def _row_artifact(row: sqlite3.Row) -> ArtifactRecord:
         extractor_version=str(row["extractor_version"]),
         prompt_version=str(row["prompt_version"]),
         model=str(row["model"]),
+        reasoning=str(row["reasoning"]),
+    )
+
+
+def _row_publication(row: sqlite3.Row) -> PublicationRecord:
+    try:
+        decoded_details = json.loads(str(row["details_json"]))
+    except (TypeError, ValueError):
+        decoded_details = {}
+    details = decoded_details if isinstance(decoded_details, dict) else {}
+    return PublicationRecord(
+        id=int(row["id"]),
+        summary_sha256=str(row["summary_sha256"]),
+        target=str(row["target"]),
+        partition_key=str(row["partition_key"]),
+        state=PublicationState(str(row["state"])),
+        remote_reference=str(row["remote_reference"]) if row["remote_reference"] else None,
+        target_document=str(row["target_document"]),
+        details=details,
+    )
+
+
+def _row_notification(row: sqlite3.Row, *, created: bool) -> NotificationRecord:
+    try:
+        decoded = json.loads(str(row["payload_json"]))
+        payload = decoded if isinstance(decoded, dict) else {}
+    except (TypeError, ValueError):
+        payload = {}
+    return NotificationRecord(
+        id=int(row["id"]),
+        idempotency_key=str(row["idempotency_key"]),
+        event=str(row["event"]),
+        status=str(row["status"]),
+        created=created,
+        publication_id=int(row["publication_id"]) if row["publication_id"] is not None else None,
+        payload=payload,
+        attempt_count=int(row["attempt_count"]),
+    )
+
+
+def _summary_identity(
+    pdf_sha256: str | SummaryIdentity,
+    extractor_version: str | None = None,
+    prompt_version: str | None = None,
+    model: str | None = None,
+    reasoning: str | None = None,
+) -> SummaryIdentity:
+    if isinstance(pdf_sha256, SummaryIdentity):
+        if any(value is not None for value in (extractor_version, prompt_version, model, reasoning)):
+            raise ValueError("do not combine SummaryIdentity with individual summary identity fields")
+        return pdf_sha256
+    return SummaryIdentity(
+        pdf_sha256=_validate_sha256(pdf_sha256, field="pdf_sha256", required=True) or "",
+        extractor_version=str(extractor_version or "").strip(),
+        prompt_version=str(prompt_version or "").strip(),
+        model=str(model or "").strip(),
+        reasoning=str(reasoning or "").strip(),
     )
 
 
@@ -317,6 +376,7 @@ class PipelineState:
         extractor_version: str = "",
         prompt_version: str = "",
         model: str = "",
+        reasoning: str = "",
         size_bytes: int | None = None,
         metadata: Mapping[str, Any] | None = None,
         now: datetime | None = None,
@@ -347,8 +407,14 @@ class PipelineState:
         extractor_version = str(extractor_version).strip()
         prompt_version = str(prompt_version).strip()
         model = str(model).strip()
+        reasoning = str(reasoning).strip()
         if kind == "summary" and (pdf_digest is None or not extractor_version or not prompt_version or not model):
             raise ValueError("summary artifacts require pdf_sha256, extractor_version, prompt_version, and model")
+        summary_identity = (
+            SummaryIdentity(pdf_digest or "", extractor_version, prompt_version, model, reasoning)
+            if kind == "summary"
+            else None
+        )
         if size_bytes is not None and int(size_bytes) < 0:
             raise ValueError("size_bytes must not be negative")
         _, now_iso, now_epoch = _timestamp(now)
@@ -369,9 +435,15 @@ class PipelineState:
                     """
                     SELECT * FROM artifacts
                     WHERE kind = 'summary' AND pdf_sha256 = ? AND extractor_version = ?
-                      AND prompt_version = ? AND model = ?
+                      AND prompt_version = ? AND model = ? AND reasoning = ?
                     """,
-                    (pdf_digest, extractor_version, prompt_version, model),
+                    (
+                        summary_identity.pdf_sha256 if summary_identity is not None else pdf_digest,
+                        summary_identity.extractor_version if summary_identity is not None else extractor_version,
+                        summary_identity.prompt_version if summary_identity is not None else prompt_version,
+                        summary_identity.model if summary_identity is not None else model,
+                        summary_identity.reasoning if summary_identity is not None else reasoning,
+                    ),
                 ).fetchone()
             else:
                 artifact = self._connection.execute(
@@ -386,10 +458,10 @@ class PipelineState:
                 cursor = self._connection.execute(
                     """
                     INSERT INTO artifacts(
-                      kind, pdf_sha256, content_sha256, extractor_version, prompt_version, model,
+                      kind, pdf_sha256, content_sha256, extractor_version, prompt_version, model, reasoning,
                       canonical_path, size_bytes, metadata_json,
                       created_at_iso, created_at_epoch, updated_at_iso, updated_at_epoch
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         kind,
@@ -398,6 +470,7 @@ class PipelineState:
                         extractor_version,
                         prompt_version,
                         model,
+                        reasoning,
                         canonical_path,
                         int(size_bytes) if size_bytes is not None else None,
                         _json(metadata_value),
@@ -467,6 +540,64 @@ class PipelineState:
         assert artifact is not None
         return _row_artifact(artifact)
 
+    def find_summary_artifact(
+        self,
+        pdf_sha256: str | SummaryIdentity | None = None,
+        extractor_version: str | None = None,
+        prompt_version: str | None = None,
+        model: str | None = None,
+        reasoning: str | None = None,
+        *,
+        identity: SummaryIdentity | None = None,
+    ) -> ArtifactRecord | None:
+        """Find a reusable summary only when its complete invocation identity matches.
+
+        Passing a :class:`~zsxq_pipeline.model.SummaryIdentity` is preferred;
+        individual fields are retained for small adapters that do not need to
+        construct a separate value first.  A different reasoning level is a
+        deliberate cache miss.
+        """
+
+        if identity is not None:
+            if pdf_sha256 is not None or any(value is not None for value in (extractor_version, prompt_version, model, reasoning)):
+                raise ValueError("do not combine identity with individual summary identity fields")
+            summary_identity = identity
+        else:
+            if pdf_sha256 is None:
+                raise ValueError("summary identity is required")
+            summary_identity = _summary_identity(pdf_sha256, extractor_version, prompt_version, model, reasoning)
+        self._require_migrated()
+        row = self._connection.execute(
+            """
+            SELECT * FROM artifacts
+            WHERE kind = 'summary' AND pdf_sha256 = ? AND extractor_version = ?
+              AND prompt_version = ? AND model = ? AND reasoning = ?
+            ORDER BY id
+            LIMIT 1
+            """,
+            (
+                summary_identity.pdf_sha256,
+                summary_identity.extractor_version,
+                summary_identity.prompt_version,
+                summary_identity.model,
+                summary_identity.reasoning,
+            ),
+        ).fetchone()
+        return _row_artifact(row) if row is not None else None
+
+    def get_artifact(self, artifact_id: int) -> ArtifactRecord | None:
+        """Return one durable artifact by primary key.
+
+        Worker recovery uses this narrow lookup to rehydrate an already
+        completed extraction without rerunning a non-idempotent external
+        tool.  The caller still validates the artifact kind, identity, and
+        local payload before treating it as usable.
+        """
+
+        self._require_migrated()
+        row = self._connection.execute("SELECT * FROM artifacts WHERE id = ?", (int(artifact_id),)).fetchone()
+        return _row_artifact(row) if row is not None else None
+
     def ensure_stage(
         self,
         document_id: int,
@@ -523,10 +654,16 @@ class PipelineState:
         stage: Stage | str,
         workflow_version: str,
         *,
+        document_ids: Iterable[int] | None = None,
         lease_seconds: int = 300,
         now: datetime | None = None,
     ) -> StageClaim | None:
-        """Atomically claim one runnable stage, including expired crash leases."""
+        """Atomically claim one runnable stage, including expired crash leases.
+
+        ``document_ids`` scopes a worker to the documents it actually owns.
+        A batch worker must never claim, much less block, another batch's
+        matching workflow row merely because both use the same stage version.
+        """
 
         normalized_stage = as_stage(stage)
         workflow_version = str(workflow_version).strip()
@@ -534,17 +671,30 @@ class PipelineState:
             raise ValueError("workflow_version is required")
         if int(lease_seconds) <= 0:
             raise ValueError("lease_seconds must be positive")
+        scoped_document_ids: tuple[int, ...] | None = None
+        if document_ids is not None:
+            scoped_document_ids = tuple(sorted({int(document_id) for document_id in document_ids}))
+            if not scoped_document_ids:
+                return None
         current, now_iso, now_epoch = _timestamp(now)
         expiry = current + timedelta(seconds=int(lease_seconds))
         _, expiry_iso, expiry_epoch = _timestamp(expiry)
         with self._write_transaction():
             self._connection.execute("DELETE FROM leases WHERE expires_at_epoch <= ?", (now_epoch,))
+            document_scope = ""
+            scope_parameters: tuple[int, ...] = ()
+            if scoped_document_ids is not None:
+                document_scope = " AND stage_attempts.document_id IN (" + ", ".join("?" for _ in scoped_document_ids) + ")"
+                scope_parameters = scoped_document_ids
             row = self._connection.execute(
                 """
                 SELECT stage_attempts.*, documents.source, documents.source_file_id
                 FROM stage_attempts
                 JOIN documents ON documents.id = stage_attempts.document_id
                 WHERE stage_attempts.stage = ? AND stage_attempts.workflow_version = ?
+                """
+                + document_scope
+                + """
                   AND (
                     (stage_attempts.state = ? AND (stage_attempts.available_at_epoch IS NULL OR stage_attempts.available_at_epoch <= ?))
                     OR (stage_attempts.state = ? AND stage_attempts.available_at_epoch <= ?)
@@ -565,6 +715,7 @@ class PipelineState:
                 (
                     normalized_stage.value,
                     workflow_version,
+                    *scope_parameters,
                     StageState.QUEUED.value,
                     now_epoch,
                     StageState.RETRY_WAIT.value,
@@ -800,18 +951,62 @@ class PipelineState:
         ).fetchone()
         return dict(row) if row is not None else None
 
+    def requeue_succeeded_stage(
+        self,
+        document_id: int,
+        stage: Stage | str,
+        workflow_version: str,
+        *,
+        reason: str,
+        now: datetime | None = None,
+    ) -> bool:
+        """Reopen a success only when its required local artifact is missing.
+
+        This narrow repair path is deliberately not a general retry API.  It
+        prevents a stale ``succeeded`` stage from becoming permanently
+        unclaimable after an artifact cache was lost, while retaining the
+        diagnostic reason in the durable row.
+        """
+
+        self._require_migrated()
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            cursor = self._connection.execute(
+                """
+                UPDATE stage_attempts
+                SET state=?, error_category=NULL, error_code='artifact_recovery', error_detail=?,
+                    available_at_iso=NULL, available_at_epoch=NULL,
+                    lease_token=NULL, lease_expires_at_iso=NULL, lease_expires_at_epoch=NULL,
+                    output_artifact_id=NULL, updated_at_iso=?, updated_at_epoch=?
+                WHERE document_id=? AND stage=? AND workflow_version=? AND state=?
+                """,
+                (
+                    StageState.QUEUED.value,
+                    str(reason).strip() or "required local artifact is unavailable",
+                    now_iso,
+                    now_epoch,
+                    int(document_id),
+                    as_stage(stage).value,
+                    str(workflow_version),
+                    StageState.SUCCEEDED.value,
+                ),
+            )
+        return cursor.rowcount == 1
+
     def record_publication_intent(
         self,
         summary_sha256: str,
         target: str,
         partition_key: str,
         *,
+        target_document: str = "",
         details: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> PublicationRecord:
         summary_digest = _validate_sha256(summary_sha256, field="summary_sha256", required=True)
         target = str(target).strip()
         partition_key = str(partition_key).strip()
+        target_document = str(target_document).strip()
         if not target or not partition_key:
             raise ValueError("target and partition_key are required")
         _, now_iso, now_epoch = _timestamp(now)
@@ -819,14 +1014,15 @@ class PipelineState:
             self._connection.execute(
                 """
                 INSERT INTO publications(
-                  summary_sha256, target, partition_key, state, details_json,
+                  summary_sha256, target, target_document, partition_key, state, details_json,
                   created_at_iso, created_at_epoch, updated_at_iso, updated_at_epoch
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(summary_sha256, target, partition_key) DO NOTHING
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(summary_sha256, target, target_document, partition_key) DO NOTHING
                 """,
                 (
                     summary_digest,
                     target,
+                    target_document,
                     partition_key,
                     PublicationState.INTENT.value,
                     _json(details),
@@ -837,18 +1033,11 @@ class PipelineState:
                 ),
             )
             row = self._connection.execute(
-                "SELECT * FROM publications WHERE summary_sha256=? AND target=? AND partition_key=?",
-                (summary_digest, target, partition_key),
+                "SELECT * FROM publications WHERE summary_sha256=? AND target=? AND target_document=? AND partition_key=?",
+                (summary_digest, target, target_document, partition_key),
             ).fetchone()
         assert row is not None
-        return PublicationRecord(
-            id=int(row["id"]),
-            summary_sha256=str(row["summary_sha256"]),
-            target=str(row["target"]),
-            partition_key=str(row["partition_key"]),
-            state=PublicationState(str(row["state"])),
-            remote_reference=str(row["remote_reference"]) if row["remote_reference"] else None,
-        )
+        return _row_publication(row)
 
     def record_remote_write(
         self,
@@ -857,6 +1046,7 @@ class PipelineState:
         partition_key: str,
         *,
         remote_reference: str,
+        target_document: str = "",
         details: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> PublicationRecord:
@@ -865,12 +1055,70 @@ class PipelineState:
         remote_reference = str(remote_reference).strip()
         if not remote_reference:
             raise ValueError("remote_reference is required for remote_written")
-        intent = self.record_publication_intent(
-            summary_sha256, target, partition_key, details=details, now=now
-        )
+        summary_digest = _validate_sha256(summary_sha256, field="summary_sha256", required=True)
+        target = str(target).strip()
+        partition_key = str(partition_key).strip()
+        target_document = str(target_document).strip()
+        if not target or not partition_key:
+            raise ValueError("target and partition_key are required")
         _, now_iso, now_epoch = _timestamp(now)
         with self._write_transaction():
-            row = self._connection.execute("SELECT * FROM publications WHERE id = ?", (intent.id,)).fetchone()
+            row = self._connection.execute(
+                """
+                SELECT * FROM publications
+                WHERE summary_sha256=? AND target=? AND target_document=? AND partition_key=?
+                """,
+                (summary_digest, target, target_document, partition_key),
+            ).fetchone()
+            if row is None and target_document:
+                # A create intent cannot know its eventual document URL.  Bind
+                # that pending v2 intent exactly once when the remote write
+                # discovers the document, instead of making a second intent.
+                pending = self._connection.execute(
+                    """
+                    SELECT * FROM publications
+                    WHERE summary_sha256=? AND target=? AND target_document='' AND partition_key=?
+                      AND state=?
+                    """,
+                    (summary_digest, target, partition_key, PublicationState.INTENT.value),
+                ).fetchone()
+                if pending is not None:
+                    self._connection.execute(
+                        """
+                        UPDATE publications SET target_document=?, updated_at_iso=?, updated_at_epoch=?
+                        WHERE id=?
+                        """,
+                        (target_document, now_iso, now_epoch, int(pending["id"])),
+                    )
+                    row = self._connection.execute("SELECT * FROM publications WHERE id=?", (int(pending["id"]),)).fetchone()
+            if row is None:
+                self._connection.execute(
+                    """
+                    INSERT INTO publications(
+                      summary_sha256, target, target_document, partition_key, state, details_json,
+                      created_at_iso, created_at_epoch, updated_at_iso, updated_at_epoch
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        summary_digest,
+                        target,
+                        target_document,
+                        partition_key,
+                        PublicationState.INTENT.value,
+                        _json(details),
+                        now_iso,
+                        now_epoch,
+                        now_iso,
+                        now_epoch,
+                    ),
+                )
+                row = self._connection.execute(
+                    """
+                    SELECT * FROM publications
+                    WHERE summary_sha256=? AND target=? AND target_document=? AND partition_key=?
+                    """,
+                    (summary_digest, target, target_document, partition_key),
+                ).fetchone()
             assert row is not None
             current = PublicationState(str(row["state"]))
             existing_reference = str(row["remote_reference"] or "")
@@ -886,18 +1134,11 @@ class PipelineState:
                     UPDATE publications SET state=?, remote_reference=?, details_json=?, updated_at_iso=?, updated_at_epoch=?
                     WHERE id=?
                     """,
-                    (PublicationState.REMOTE_WRITTEN.value, remote_reference, _json(details), now_iso, now_epoch, intent.id),
+                    (PublicationState.REMOTE_WRITTEN.value, remote_reference, _json(details), now_iso, now_epoch, int(row["id"])),
                 )
-            row = self._connection.execute("SELECT * FROM publications WHERE id = ?", (intent.id,)).fetchone()
+            row = self._connection.execute("SELECT * FROM publications WHERE id = ?", (int(row["id"]),)).fetchone()
         assert row is not None
-        return PublicationRecord(
-            id=int(row["id"]),
-            summary_sha256=str(row["summary_sha256"]),
-            target=str(row["target"]),
-            partition_key=str(row["partition_key"]),
-            state=PublicationState(str(row["state"])),
-            remote_reference=str(row["remote_reference"]) if row["remote_reference"] else None,
-        )
+        return _row_publication(row)
 
     def complete_publication(
         self,
@@ -905,16 +1146,23 @@ class PipelineState:
         target: str,
         partition_key: str,
         *,
+        target_document: str = "",
         now: datetime | None = None,
     ) -> PublicationRecord:
         """Commit local publication success only after a durable remote-written row exists."""
 
         summary_digest = _validate_sha256(summary_sha256, field="summary_sha256", required=True)
+        target = str(target).strip()
+        partition_key = str(partition_key).strip()
+        target_document = str(target_document).strip()
         _, now_iso, now_epoch = _timestamp(now)
         with self._write_transaction():
             row = self._connection.execute(
-                "SELECT * FROM publications WHERE summary_sha256=? AND target=? AND partition_key=?",
-                (summary_digest, str(target).strip(), str(partition_key).strip()),
+                """
+                SELECT * FROM publications
+                WHERE summary_sha256=? AND target=? AND target_document=? AND partition_key=?
+                """,
+                (summary_digest, target, target_document, partition_key),
             ).fetchone()
             if row is None:
                 raise InvariantViolation("cannot complete a publication without a remote_written record")
@@ -928,32 +1176,90 @@ class PipelineState:
                 )
                 row = self._connection.execute("SELECT * FROM publications WHERE id=?", (int(row["id"]),)).fetchone()
         assert row is not None
-        return PublicationRecord(
-            id=int(row["id"]),
-            summary_sha256=str(row["summary_sha256"]),
-            target=str(row["target"]),
-            partition_key=str(row["partition_key"]),
-            state=PublicationState(str(row["state"])),
-            remote_reference=str(row["remote_reference"]) if row["remote_reference"] else None,
-        )
+        return _row_publication(row)
 
-    def get_publication(self, summary_sha256: str, target: str, partition_key: str) -> PublicationRecord | None:
+    def get_publication(
+        self,
+        summary_sha256: str,
+        target: str,
+        partition_key: str,
+        *,
+        target_document: str = "",
+    ) -> PublicationRecord | None:
         self._require_migrated()
         digest = _validate_sha256(summary_sha256, field="summary_sha256", required=True)
+        target = str(target).strip()
+        partition_key = str(partition_key).strip()
+        target_document = str(target_document).strip()
         row = self._connection.execute(
-            "SELECT * FROM publications WHERE summary_sha256=? AND target=? AND partition_key=?",
-            (digest, str(target).strip(), str(partition_key).strip()),
+            """
+            SELECT * FROM publications
+            WHERE summary_sha256=? AND target=? AND target_document=? AND partition_key=?
+            """,
+            (digest, target, target_document, partition_key),
         ).fetchone()
-        if row is None:
-            return None
-        return PublicationRecord(
-            id=int(row["id"]),
-            summary_sha256=str(row["summary_sha256"]),
-            target=str(row["target"]),
-            partition_key=str(row["partition_key"]),
-            state=PublicationState(str(row["state"])),
-            remote_reference=str(row["remote_reference"]) if row["remote_reference"] else None,
-        )
+        return _row_publication(row) if row is not None else None
+
+    def find_publications(
+        self,
+        summary_sha256: str,
+        target: str,
+        partition_key: str,
+    ) -> tuple[PublicationRecord, ...]:
+        """Return every publication variant for a recoverable logical partition.
+
+        A caller that did not know the target document before create can use
+        this recovery query, then resume only the matching `intent` or
+        `remote_written` transaction without blindly writing another document.
+        """
+
+        self._require_migrated()
+        digest = _validate_sha256(summary_sha256, field="summary_sha256", required=True)
+        rows = self._connection.execute(
+            """
+            SELECT * FROM publications
+            WHERE summary_sha256=? AND target=? AND partition_key=?
+            ORDER BY id
+            """,
+            (digest, str(target).strip(), str(partition_key).strip()),
+        ).fetchall()
+        return tuple(_row_publication(row) for row in rows)
+
+    def list_publications(
+        self,
+        *,
+        target: str,
+        states: Iterable[PublicationState | str] | None = None,
+        partition_prefix: str = "",
+    ) -> tuple[PublicationRecord, ...]:
+        """List durable publications for bounded recovery/capacity decisions.
+
+        Callers deliberately receive no mutable database rows.  ``partition``
+        is a logical namespace (for example ``2026-08-10:``), rather than a
+        filesystem location, so same-day capacity lookup remains deterministic
+        after a runtime directory moves.
+        """
+
+        self._require_migrated()
+        normalized_target = str(target).strip()
+        if not normalized_target:
+            raise ValueError("target is required")
+        clauses = ["target=?"]
+        parameters: list[Any] = [normalized_target]
+        if partition_prefix:
+            clauses.append("partition_key LIKE ?")
+            parameters.append(f"{str(partition_prefix)}%")
+        normalized_states = tuple(PublicationState(str(value)).value for value in (states or ()))
+        if normalized_states:
+            placeholders = ", ".join("?" for _ in normalized_states)
+            clauses.append(f"state IN ({placeholders})")
+            parameters.extend(normalized_states)
+        rows = self._connection.execute(
+            f"SELECT * FROM publications WHERE {' AND '.join(clauses)} "
+            "ORDER BY updated_at_epoch DESC, id DESC",
+            parameters,
+        ).fetchall()
+        return tuple(_row_publication(row) for row in rows)
 
     def enqueue_notification(
         self,
@@ -988,13 +1294,90 @@ class PipelineState:
                 "SELECT * FROM notification_outbox WHERE idempotency_key = ?", (key,)
             ).fetchone()
         assert row is not None
-        return NotificationRecord(
-            id=int(row["id"]),
-            idempotency_key=str(row["idempotency_key"]),
-            event=str(row["event"]),
-            status=str(row["status"]),
-            created=cursor.rowcount == 1,
-        )
+        return _row_notification(row, created=cursor.rowcount == 1)
+
+    def get_notification(self, idempotency_key: str) -> NotificationRecord | None:
+        """Read an outbox item without changing its delivery state."""
+
+        key = str(idempotency_key).strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        self._require_migrated()
+        row = self._connection.execute(
+            "SELECT * FROM notification_outbox WHERE idempotency_key=?", (key,)
+        ).fetchone()
+        return _row_notification(row, created=False) if row is not None else None
+
+    def list_notifications(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+        event_prefix: str | None = None,
+        publication_id: int | None = None,
+    ) -> tuple[NotificationRecord, ...]:
+        """List durable outbox rows without claiming or changing any lease.
+
+        Notification orchestration can use this to keep a terminal event behind
+        an earlier document event for the same run.  The API deliberately
+        exposes payloads but does not prescribe product-specific scope keys.
+        """
+
+        self._require_migrated()
+        clauses: list[str] = []
+        values: list[Any] = []
+        if statuses is not None:
+            raw_statuses = (statuses,) if isinstance(statuses, str) else statuses
+            normalized_statuses = tuple(sorted({str(value).strip() for value in raw_statuses if str(value).strip()}))
+            if not normalized_statuses:
+                return ()
+            clauses.append(f"status IN ({','.join('?' for _ in normalized_statuses)})")
+            values.extend(normalized_statuses)
+        if event_prefix is not None:
+            prefix = str(event_prefix).strip()
+            if not prefix:
+                return ()
+            clauses.append("event LIKE ? ESCAPE '\\'")
+            values.append(prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+        if publication_id is not None:
+            clauses.append("publication_id=?")
+            values.append(int(publication_id))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._connection.execute(
+            f"SELECT * FROM notification_outbox{where} ORDER BY created_at_epoch, id",
+            tuple(values),
+        ).fetchall()
+        return tuple(_row_notification(row, created=False) for row in rows)
+
+    def supersede_pending_notifications(
+        self,
+        *,
+        events: Iterable[str],
+        superseded_by: str,
+        now: datetime | None = None,
+    ) -> int:
+        """Retire queued/retrying stale conclusions before a newer one lands."""
+
+        names = tuple(sorted({str(event).strip() for event in events if str(event).strip()}))
+        replacement = str(superseded_by).strip()
+        if not names or not replacement:
+            return 0
+        _, now_iso, now_epoch = _timestamp(now)
+        placeholders = ", ".join("?" for _ in names)
+        with self._write_transaction():
+            cursor = self._connection.execute(
+                f"""
+                UPDATE notification_outbox
+                SET status='superseded', error_code='superseded', error_detail=?,
+                    available_at_iso=NULL, available_at_epoch=NULL,
+                    lease_token=NULL, lease_expires_at_iso=NULL, lease_expires_at_epoch=NULL,
+                    updated_at_iso=?, updated_at_epoch=?
+                WHERE event IN ({placeholders})
+                  AND idempotency_key <> ?
+                  AND status IN ('queued', 'pending', 'retry_wait')
+                """,
+                (f"superseded by {replacement}", now_iso, now_epoch, *names, replacement),
+            )
+        return int(cursor.rowcount)
 
     def set_notification_status(self, idempotency_key: str, status: str, *, now: datetime | None = None) -> None:
         """Compatibility importer transition; delivery workers will gain a dedicated API later."""
@@ -1010,6 +1393,153 @@ class PipelineState:
             )
             if cursor.rowcount != 1:
                 raise InvariantViolation(f"notification {key} does not exist")
+
+    def claim_due_notification(
+        self,
+        *,
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+    ) -> NotificationClaim | None:
+        """Atomically lease one due notification for a side-effecting sender.
+
+        Delivery is intentionally independent from publication completion.  A
+        crashed sender is reclaimable after its lease expires; a failed send is
+        retried only when :meth:`fail_notification` supplies a retry time.
+        Rows are FIFO within the same due class, so callers that enqueue a
+        document notification before a terminal notification retain that order.
+        """
+
+        if int(lease_seconds) <= 0:
+            raise ValueError("lease_seconds must be positive")
+        current, now_iso, now_epoch = _timestamp(now)
+        expiry = current + timedelta(seconds=int(lease_seconds))
+        _, expiry_iso, expiry_epoch = _timestamp(expiry)
+        with self._write_transaction():
+            row = self._connection.execute(
+                """
+                SELECT * FROM notification_outbox
+                WHERE (
+                  status IN ('queued', 'pending')
+                  AND (available_at_epoch IS NULL OR available_at_epoch <= ?)
+                ) OR (
+                  status = 'retry_wait'
+                  AND (available_at_epoch IS NULL OR available_at_epoch <= ?)
+                ) OR (
+                  status = 'running'
+                  AND (lease_expires_at_epoch IS NULL OR lease_expires_at_epoch <= ?)
+                )
+                ORDER BY
+                  CASE status
+                    WHEN 'queued' THEN 0
+                    WHEN 'pending' THEN 0
+                    WHEN 'retry_wait' THEN 1
+                    ELSE 2
+                  END,
+                  COALESCE(available_at_epoch, created_at_epoch),
+                  id
+                LIMIT 1
+                """,
+                (now_epoch, now_epoch, now_epoch),
+            ).fetchone()
+            if row is None:
+                return None
+            token = uuid.uuid4().hex
+            notification_id = int(row["id"])
+            self._connection.execute(
+                """
+                UPDATE notification_outbox
+                SET status='running', attempt_count=attempt_count + 1,
+                    lease_token=?, lease_expires_at_iso=?, lease_expires_at_epoch=?,
+                    updated_at_iso=?, updated_at_epoch=?
+                WHERE id=?
+                """,
+                (token, expiry_iso, expiry_epoch, now_iso, now_epoch, notification_id),
+            )
+            row = self._connection.execute("SELECT * FROM notification_outbox WHERE id=?", (notification_id,)).fetchone()
+        assert row is not None
+        notification = _row_notification(row, created=False)
+        return NotificationClaim(
+            id=notification.id,
+            idempotency_key=notification.idempotency_key,
+            event=notification.event,
+            payload=notification.payload,
+            publication_id=notification.publication_id,
+            lease_token=token,
+            claimed_at=current,
+            lease_expires_at=expiry,
+            attempt_count=notification.attempt_count,
+        )
+
+    def _assert_notification_claim(self, claim: NotificationClaim) -> sqlite3.Row:
+        row = self._connection.execute("SELECT * FROM notification_outbox WHERE id=?", (int(claim.id),)).fetchone()
+        if row is None:
+            raise LeaseLostError(f"notification {claim.idempotency_key} no longer exists")
+        if str(row["status"]) != "running" or str(row["lease_token"] or "") != claim.lease_token:
+            raise LeaseLostError(f"notification lease for {claim.idempotency_key} is no longer held by this worker")
+        return row
+
+    def complete_notification(self, claim: NotificationClaim, *, now: datetime | None = None) -> NotificationRecord:
+        """Acknowledge a sent notification while holding its delivery lease."""
+
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            self._assert_notification_claim(claim)
+            self._connection.execute(
+                """
+                UPDATE notification_outbox
+                SET status='sent', available_at_iso=NULL, available_at_epoch=NULL,
+                    lease_token=NULL, lease_expires_at_iso=NULL, lease_expires_at_epoch=NULL,
+                    error_code='', error_detail='', updated_at_iso=?, updated_at_epoch=?
+                WHERE id=?
+                """,
+                (now_iso, now_epoch, int(claim.id)),
+            )
+            row = self._connection.execute("SELECT * FROM notification_outbox WHERE id=?", (int(claim.id),)).fetchone()
+        assert row is not None
+        return _row_notification(row, created=False)
+
+    def fail_notification(
+        self,
+        claim: NotificationClaim,
+        *,
+        retry_at: datetime | None = None,
+        error_code: str = "",
+        error_detail: str = "",
+        now: datetime | None = None,
+    ) -> NotificationRecord:
+        """Release a failed delivery lease, optionally making it retryable later."""
+
+        if retry_at is not None:
+            _, available_iso, available_epoch = _timestamp(retry_at)
+            next_status = "retry_wait"
+        else:
+            available_iso = available_epoch = None
+            next_status = "failed"
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            self._assert_notification_claim(claim)
+            self._connection.execute(
+                """
+                UPDATE notification_outbox
+                SET status=?, available_at_iso=?, available_at_epoch=?,
+                    lease_token=NULL, lease_expires_at_iso=NULL, lease_expires_at_epoch=NULL,
+                    error_code=?, error_detail=?, updated_at_iso=?, updated_at_epoch=?
+                WHERE id=?
+                """,
+                (
+                    next_status,
+                    available_iso,
+                    available_epoch,
+                    str(error_code).strip(),
+                    str(error_detail).strip(),
+                    now_iso,
+                    now_epoch,
+                    int(claim.id),
+                ),
+            )
+            row = self._connection.execute("SELECT * FROM notification_outbox WHERE id=?", (int(claim.id),)).fetchone()
+        assert row is not None
+        return _row_notification(row, created=False)
 
     def derive_health(self, *, now: datetime | None = None) -> dict[str, Any]:
         """Derive operational health from all durable stage rows, never a last exit code."""

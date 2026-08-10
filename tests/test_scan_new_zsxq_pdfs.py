@@ -209,6 +209,39 @@ class ScanNewZsxqPdfsTests(unittest.TestCase):
             self.assertIn(sha, state["known_sha256s"])
             self.assertEqual(state["pending_sha256s"], {})
 
+    def test_quiet_window_keeps_recent_pdf_pending_without_emitting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            root = tmp_path / "pdfs"
+            root.mkdir()
+            recent = root / "recent.pdf"
+            older = root / "older.pdf"
+            recent.write_bytes(b"recent")
+            older.write_bytes(b"older")
+            batch_path = tmp_path / "batch.json"
+            now_epoch = 1_700_000_000
+            pending = {
+                str(recent): {"size": 6, "mtime": now_epoch - 30, "sha256": "a" * 64, "root": str(root)},
+                str(older): {"size": 5, "mtime": now_epoch - 901, "sha256": "b" * 64, "root": str(root)},
+            }
+
+            eligible, deferred = MODULE.build_batch(
+                root,
+                [root],
+                batch_path,
+                tmp_path / "state.json",
+                pending,
+                False,
+                quiet_window_minutes=15,
+                now_epoch=now_epoch,
+            )
+
+            batch = json.loads(batch_path.read_text(encoding="utf-8"))
+            self.assertEqual((eligible, deferred), (1, 1))
+            self.assertEqual([item["filename"] for item in batch["files"]], ["older.pdf"])
+            self.assertEqual(batch["pending_pdf_count"], 2)
+            self.assertEqual(batch["deferred_recent_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
