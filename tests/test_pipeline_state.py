@@ -225,6 +225,11 @@ def test_processing_selector_returns_only_due_work_and_excludes_terminal_stages(
         succeed(due_summary, Stage.TEXT_EXTRACT, workflow)
         state.ensure_stage(due_summary.id, Stage.SUMMARY, "summary:v1", now=NOW)
 
+        due_publish = document("due-publish", "1")
+        succeed(due_publish, Stage.TEXT_EXTRACT, workflow)
+        succeed(due_publish, Stage.SUMMARY, "summary:v1")
+        state.ensure_stage(due_publish.id, Stage.PUBLISH, "publish:v1", now=NOW)
+
         selected = state.list_documents_for_processing(
             "zsxq_digest",
             extractor_workflow=workflow,
@@ -232,7 +237,11 @@ def test_processing_selector_returns_only_due_work_and_excludes_terminal_stages(
             now=NOW,
         )
 
-        assert [item["filename"] for item in selected] == ["missing-extract.pdf", "due-summary.pdf"]
+        assert [item["filename"] for item in selected] == [
+            "due-publish.pdf",
+            "due-summary.pdf",
+            "missing-extract.pdf",
+        ]
 
 
 def test_missing_artifact_repair_requeues_only_a_successful_stage(tmp_path):
