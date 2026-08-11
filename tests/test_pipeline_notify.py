@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from zsxq_pipeline.model import PublicationState
 from zsxq_pipeline.notify import (
     BATCH_COMPLETE_EVENT,
+    DOWNLOAD_BLOCKED_EVENT,
     DOWNLOAD_COMPLETE_EVENT,
     SUMMARY_PROGRESS_EVENT,
     SUMMARY_STARTED_EVENT,
@@ -14,6 +15,7 @@ from zsxq_pipeline.notify import (
     enqueue_terminal_notification,
     notification_idempotency_key,
     render_batch_complete_notice,
+    render_download_blocked_notice,
     render_download_complete_notice,
     render_summary_progress_notice,
     render_summary_started_notice,
@@ -241,6 +243,38 @@ def test_pipeline_statuses_are_concise_window_scoped_and_idempotent(tmp_path):
         assert "总结 **12/19**｜发布 **7/19**" in progress.payload["markdown"]
         assert started.payload["terminal"] is False
         assert complete.payload["terminal"] is True
+
+
+def test_download_blocked_notice_is_reason_specific_and_deduplicated(tmp_path):
+    scope = "source-window:42"
+    identity = f"{scope}:blocked_browser_cdp_unresponsive"
+    markdown = render_download_blocked_notice(
+        source="zsxq_foreign",
+        reason_code="blocked_browser_cdp_unresponsive",
+    )
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        first = enqueue_pipeline_status_notification(
+            state,
+            event=DOWNLOAD_BLOCKED_EVENT,
+            identity=identity,
+            chat_id="oc_test",
+            markdown=markdown,
+            scope_key=scope,
+        )
+        duplicate = enqueue_pipeline_status_notification(
+            state,
+            event=DOWNLOAD_BLOCKED_EVENT,
+            identity=identity,
+            chat_id="oc_test",
+            markdown=markdown,
+            scope_key=scope,
+        )
+
+        assert first.created is True
+        assert duplicate.created is False
+        assert "系统已执行有界自愈" in first.payload["markdown"]
+        assert "`blocked_browser_cdp_unresponsive`" in first.payload["markdown"]
 
 
 def test_batch_completion_waits_for_its_document_link(tmp_path):

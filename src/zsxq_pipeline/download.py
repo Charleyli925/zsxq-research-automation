@@ -113,6 +113,10 @@ def _reason_text(code: str) -> str:
         "scan_failed": "扫描阶段没有建立可执行的 immutable plan。",
         "download_completed": "所有可下载候选均已完成归档对账。",
         "plan_only": "已生成 immutable scan plan，未执行下载。",
+        "blocked_browser_cdp_unresponsive": "浏览器会话暂时不可用；有界自愈仍未恢复，系统将继续重试。",
+        "blocked_browser_endpoint_unavailable": "Chrome for Testing 调试端点不可用，系统将继续重试。",
+        "blocked_browser_missing": "Chrome for Testing 可执行文件不存在，需要检查运行配置。",
+        "blocked_browser_configuration_invalid": "Chrome for Testing 运行配置无效，需要人工修复配置。",
     }
     return known.get(str(code).strip(), "下载事务未完成，请检查结构化结果和 durable stage state。")
 
@@ -171,6 +175,7 @@ class DownloadOutcome:
     missing_entries: tuple[Mapping[str, Any], ...] = ()
     checkpoint_eligible: bool = False
     state_updated: bool = False
+    error_detail: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         downloaded_files = [str(entry.get("filename") or "").strip() for entry in self.downloaded_entries]
@@ -222,6 +227,7 @@ class DownloadOutcome:
             "api_probe_status": self.plan.get("api_probe_status"),
             "checkpoint_eligible": self.checkpoint_eligible,
             "state_updated": self.state_updated,
+            "error_detail": self.error_detail,
         }
 
 
@@ -351,6 +357,7 @@ class DownloadPipeline:
         missing: list[Mapping[str, Any]] | None = None,
         checkpoint_eligible: bool = False,
         state_updated: bool = False,
+        error_detail: str = "",
     ) -> DownloadOutcome:
         return DownloadOutcome(
             run_id=run_id,
@@ -370,6 +377,7 @@ class DownloadPipeline:
             missing_entries=tuple(missing or []),
             checkpoint_eligible=checkpoint_eligible,
             state_updated=state_updated,
+            error_detail=" ".join(str(error_detail).split())[:1200],
         )
 
     def run(self, request: DownloadRequest) -> DownloadOutcome:
@@ -646,7 +654,14 @@ class DownloadPipeline:
                 "window_start": request.window_start.isoformat(),
                 "window_end": request.window_end.isoformat(),
                 "plan_hash": "",
+                "scan_mode": "not_started",
+                "api_probe_status": "not_started",
+                "blocked_reason": exc.code,
+                "blocked_detail": exc.detail,
+                "window_new_docs_count": 0,
+                "keyword_matched_docs_count": 0,
                 "download_candidate_count": 0,
+                "download_candidates": [],
             }
             _write_json(plan_path, plan)
             outcome = self._outcome(
@@ -657,6 +672,7 @@ class DownloadPipeline:
                 plan=plan,
                 status="blocked",
                 reason_code=exc.code,
+                error_detail=exc.detail,
             )
             if request.result_path:
                 _write_json(request.result_path, outcome.to_dict())

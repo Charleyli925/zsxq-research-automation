@@ -28,3 +28,7 @@ All notable changes will be documented here.
 - Restored concise source-window notifications for exact non-empty download
   counts, one summary start, bounded 25/50/75 percent summary/publication
   milestones, and one terminal batch completion.
+- Bounded dedicated CFT page targets, retried transient CDP page creation with
+  a fresh transport, forced local CDP HTTP to bypass ambient system proxies,
+  closed the API-discovery diagnostic page, persisted exact blocked-browser
+  evidence, and added one deduplicated retry alert per source window and reason.

@@ -22,12 +22,14 @@ from .state import PipelineState
 DOCUMENT_EVENT = "document_ready"
 TERMINAL_EVENTS = frozenset({"run_complete", "run_partial", "run_failed"})
 DOWNLOAD_COMPLETE_EVENT = "download_complete"
+DOWNLOAD_BLOCKED_EVENT = "download_blocked"
 SUMMARY_STARTED_EVENT = "summary_started"
 SUMMARY_PROGRESS_EVENT = "summary_progress"
 BATCH_COMPLETE_EVENT = "batch_complete"
 PIPELINE_STATUS_EVENTS = frozenset(
     {
         DOWNLOAD_COMPLETE_EVENT,
+        DOWNLOAD_BLOCKED_EVENT,
         SUMMARY_STARTED_EVENT,
         SUMMARY_PROGRESS_EVENT,
         BATCH_COMPLETE_EVENT,
@@ -190,6 +192,31 @@ def render_download_complete_notice(*, source: str, count: int) -> str:
     return (
         "## 知识星球研报｜下载完成\n\n"
         f"{_source_label(source)}：本轮新增 **{total}** 份 PDF，已进入待总结队列。"
+    )
+
+
+def render_download_blocked_notice(*, source: str, reason_code: str) -> str:
+    """Render one deduplicated alert while a source window stays retryable."""
+
+    normalized = "".join(
+        character if character.isalnum() or character in "_-" else "_"
+        for character in str(reason_code).strip()
+    )[:80]
+    if not normalized:
+        raise NotificationError("download blocked notice requires a reason code")
+    if normalized == "need_reauth":
+        action = "需要恢复专用浏览器登录态；该窗口不会被跳过。"
+    elif normalized in {
+        "blocked_browser_missing",
+        "blocked_browser_configuration_invalid",
+    }:
+        action = "需要检查专用浏览器运行配置；该窗口不会被跳过。"
+    else:
+        action = "系统已执行有界自愈并保留窗口，将在后续调度中自动重试。"
+    return (
+        "## ⚠️ 知识星球研报｜下载暂时受阻\n\n"
+        f"{_source_label(source)}：本轮尚未完成。{action}\n\n"
+        f"诊断码：`{normalized}`"
     )
 
 
@@ -380,6 +407,7 @@ class NotificationDrainer:
 __all__ = [
     "BATCH_COMPLETE_EVENT",
     "DOCUMENT_EVENT",
+    "DOWNLOAD_BLOCKED_EVENT",
     "DOWNLOAD_COMPLETE_EVENT",
     "PIPELINE_STATUS_EVENTS",
     "SUMMARY_PROGRESS_EVENT",
@@ -395,6 +423,7 @@ __all__ = [
     "export_notification_audit",
     "notification_idempotency_key",
     "render_batch_complete_notice",
+    "render_download_blocked_notice",
     "render_download_complete_notice",
     "render_document_notice",
     "render_summary_progress_notice",

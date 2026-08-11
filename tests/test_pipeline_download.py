@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from zsxq_pipeline.browser import BrowserSessionError
 from zsxq_pipeline.download import DownloadPipeline, DownloadRequest
 from zsxq_pipeline.model import Stage, StageState
 from zsxq_pipeline.state import PipelineState
@@ -70,6 +72,14 @@ class FakeSession:
 
     def __exit__(self, *_args) -> None:
         return None
+
+
+class FailingSession(FakeSession):
+    def __enter__(self):
+        raise BrowserSessionError(
+            "blocked_browser_cdp_unresponsive",
+            "Target.createTarget timed out; connect_attempts=2; retry-1[observed=97,owned=97,closed=96,failed=0]",
+        )
 
 
 def _request(tmp_path: Path) -> DownloadRequest:
@@ -168,3 +178,28 @@ def test_content_protection_is_terminal_but_allows_the_window_to_checkpoint(tmp_
         attempt = state.get_stage_attempt(1, Stage.DOWNLOAD, request.workflow_version)
         assert attempt is not None
         assert attempt["state"] == StageState.QUARANTINED.value
+
+
+def test_browser_failure_persists_exact_diagnostics_before_scanning(tmp_path):
+    scanner = FakeScanner(_plan())
+    result_path = tmp_path / "result.json"
+    request = replace(_request(tmp_path), result_path=result_path)
+
+    outcome = DownloadPipeline(
+        browser_session_factory=FailingSession,
+        scanner=scanner,
+        downloader=FakeDownloader(tmp_path / "staging"),
+    ).run(request)
+
+    assert outcome.status == "blocked"
+    assert outcome.reason_code == "blocked_browser_cdp_unresponsive"
+    assert "Target.createTarget timed out" in outcome.error_detail
+    assert scanner.page is None
+    plan = json.loads(outcome.plan_path.read_text(encoding="utf-8"))
+    assert plan["blocked_reason"] == "blocked_browser_cdp_unresponsive"
+    assert plan["blocked_detail"] == outcome.error_detail
+    assert plan["scan_mode"] == "not_started"
+    assert plan["api_probe_status"] == "not_started"
+    assert plan["download_candidates"] == []
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["error_detail"] == outcome.error_detail
