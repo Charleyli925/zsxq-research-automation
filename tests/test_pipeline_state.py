@@ -126,6 +126,115 @@ def test_document_scoped_stage_claim_never_mutates_another_batch(tmp_path):
         assert foreign["state"] == StageState.QUEUED.value
 
 
+def test_processing_selector_returns_only_due_work_and_excludes_terminal_stages(tmp_path):
+    database = tmp_path / "pipeline.sqlite3"
+    workflow = "extract:v1"
+    with PipelineState.open(database) as state:
+        state.migrate()
+
+        def document(name: str, seed: str):
+            item = state.upsert_document(
+                "zsxq_digest",
+                name,
+                filename=f"{name}.pdf",
+                source_path=f"/library/{name}.pdf",
+                now=NOW,
+            )
+            state.record_artifact(
+                item.id,
+                kind="pdf",
+                path=f"/library/{name}.pdf",
+                pdf_sha256=seed * 64,
+                now=NOW,
+            )
+            return item
+
+        def succeed(item, stage: Stage, version: str) -> None:
+            state.ensure_stage(item.id, stage, version, now=NOW)
+            claim = state.claim_due_stage(stage, version, document_ids=(item.id,), now=NOW)
+            assert claim is not None
+            state.complete_stage(claim, now=NOW)
+
+        document("missing-extract", "a")
+        future_extract = document("future-extract", "b")
+        state.ensure_stage(
+            future_extract.id,
+            Stage.TEXT_EXTRACT,
+            workflow,
+            available_at=NOW + timedelta(minutes=10),
+            now=NOW,
+        )
+
+        quarantined_extract = document("quarantined-extract", "c")
+        state.ensure_stage(quarantined_extract.id, Stage.TEXT_EXTRACT, workflow, now=NOW)
+        extract_claim = state.claim_due_stage(
+            Stage.TEXT_EXTRACT,
+            workflow,
+            document_ids=(quarantined_extract.id,),
+            now=NOW,
+        )
+        assert extract_claim is not None
+        assert state.fail_stage(
+            extract_claim,
+            category=ErrorCategory.CONTENT,
+            error_code="no_usable_text",
+            error_detail="fixture",
+            now=NOW,
+        ) is StageState.QUARANTINED
+
+        blocked_summary = document("blocked-summary", "d")
+        succeed(blocked_summary, Stage.TEXT_EXTRACT, workflow)
+        succeed(blocked_summary, Stage.SUMMARY, "summary:old")
+        succeed(blocked_summary, Stage.PUBLISH, "publish:old")
+        state.ensure_stage(blocked_summary.id, Stage.SUMMARY, "summary:v1", now=NOW)
+        summary_claim = state.claim_due_stage(
+            Stage.SUMMARY,
+            "summary:v1",
+            document_ids=(blocked_summary.id,),
+            now=NOW,
+        )
+        assert summary_claim is not None
+        assert state.fail_stage(
+            summary_claim,
+            category=ErrorCategory.INVARIANT,
+            error_code="invalid_summary",
+            error_detail="fixture",
+            now=NOW,
+        ) is StageState.BLOCKED_RELEASE
+
+        blocked_publish = document("blocked-publish", "e")
+        succeed(blocked_publish, Stage.TEXT_EXTRACT, workflow)
+        succeed(blocked_publish, Stage.SUMMARY, "summary:v1")
+        state.ensure_stage(blocked_publish.id, Stage.PUBLISH, "publish:v1", now=NOW)
+        publish_claim = state.claim_due_stage(
+            Stage.PUBLISH,
+            "publish:v1",
+            document_ids=(blocked_publish.id,),
+            now=NOW,
+        )
+        assert publish_claim is not None
+        assert state.fail_stage(
+            publish_claim,
+            category=ErrorCategory.RELEASE_CONTRACT,
+            error_code="invalid_publish",
+            error_detail="fixture",
+            now=NOW,
+        ) is StageState.BLOCKED_RELEASE
+
+        due_summary = document("due-summary", "f")
+        succeed(due_summary, Stage.TEXT_EXTRACT, workflow)
+        state.ensure_stage(due_summary.id, Stage.SUMMARY, "summary:v1", now=NOW)
+
+        selected = state.list_documents_for_processing(
+            "zsxq_digest",
+            extractor_workflow=workflow,
+            limit=20,
+            now=NOW,
+        )
+
+        assert [item["filename"] for item in selected] == ["missing-extract.pdf", "due-summary.pdf"]
+
+
 def test_missing_artifact_repair_requeues_only_a_successful_stage(tmp_path):
     with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
         state.migrate()

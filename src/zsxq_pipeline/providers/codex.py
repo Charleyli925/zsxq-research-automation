@@ -302,6 +302,45 @@ def _is_nonnegative_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def _bind_single_input_identity(payload: Any, request: CodexSummaryRequest) -> Any:
+    """Bind a structurally present single-result identity to controlled input.
+
+    A one-input job has no model-side identity decision to make.  The runtime
+    already owns its logical path and filename, so accepting a non-empty echo
+    and replacing it with those trusted values avoids brittle Unicode/path
+    transcription without relaxing multi-input ordering or schema checks.
+    """
+
+    if len(request.inputs) != 1 or len(request.expected_paths) != 1 or not isinstance(payload, Mapping):
+        return payload
+    value = dict(payload)
+    handled_paths = value.get("handled_paths")
+    summaries = value.get("summaries")
+    if (
+        value.get("status") != "success"
+        or value.get("handled_count") != 1
+        or not isinstance(handled_paths, list)
+        or len(handled_paths) != 1
+        or not isinstance(handled_paths[0], str)
+        or not handled_paths[0]
+        or not isinstance(summaries, list)
+        or len(summaries) != 1
+        or not isinstance(summaries[0], Mapping)
+    ):
+        return value
+    summary = dict(summaries[0])
+    if not isinstance(summary.get("path"), str) or not summary["path"]:
+        return value
+    if not isinstance(summary.get("filename"), str) or not summary["filename"]:
+        return value
+    controlled = request.inputs[0]
+    value["handled_paths"] = [controlled.path]
+    summary["path"] = controlled.path
+    summary["filename"] = controlled.filename
+    value["summaries"] = [summary]
+    return value
+
+
 class CodexSummaryProvider:
     """Run one schema-constrained summary with no user config or session state."""
 
@@ -367,7 +406,8 @@ class CodexSummaryProvider:
                 payload = json.loads(output_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise SummaryOutputValidationError("output-last-message is not one complete JSON object") from exc
-            validated = validate_summary_payload(payload, expected_paths=request.expected_paths)
+            bound_payload = _bind_single_input_identity(payload, request)
+            validated = validate_summary_payload(bound_payload, expected_paths=request.expected_paths)
             return CodexSummaryResult(
                 output=validated,
                 usage=_extract_usage(stdout),

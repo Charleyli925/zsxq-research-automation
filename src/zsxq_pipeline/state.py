@@ -484,13 +484,14 @@ class PipelineState:
         *,
         extractor_workflow: str,
         limit: int,
+        now: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        """Return a bounded, priority-ordered set of PDF-backed documents.
+        """Return a bounded, priority-ordered set of due PDF-backed documents.
 
         The processor owns the detailed workflow identities for summary and
-        publication.  This query only avoids feeding fully settled documents
-        back into every tick while prioritising extraction and downstream
-        recovery work that has not reached a durable terminal result.
+        publication.  Only a missing next stage or the latest due runnable
+        attempt is returned.  Terminal attempts stay visible for an explicit
+        retry plan instead of being reported as fresh failures on every tick.
         """
 
         self._require_migrated()
@@ -500,51 +501,71 @@ class PipelineState:
             raise ValueError("source and extractor_workflow are required")
         if int(limit) < 1:
             return []
+        _, _, now_epoch = _timestamp(now)
         rows = self._connection.execute(
             """
+            WITH runtime(now_epoch) AS (VALUES (?))
             SELECT d.id, d.source, d.source_file_id, d.source_window_id, d.filename, d.source_path,
                    a.pdf_sha256, a.canonical_path,
                    extract.state AS extract_state,
-                   EXISTS(
-                     SELECT 1 FROM stage_attempts s
-                     WHERE s.document_id=d.id AND s.stage='summary'
-                   ) AS has_summary,
-                   EXISTS(
-                     SELECT 1 FROM stage_attempts s
-                     WHERE s.document_id=d.id AND s.stage='summary' AND s.state <> 'succeeded'
-                   ) AS has_unsettled_summary,
-                   EXISTS(
-                     SELECT 1 FROM stage_attempts p
-                     WHERE p.document_id=d.id AND p.stage='publish'
-                   ) AS has_publish,
-                   EXISTS(
-                     SELECT 1 FROM stage_attempts p
-                     WHERE p.document_id=d.id AND p.stage='publish' AND p.state <> 'succeeded'
-                   ) AS has_unsettled_publish
+                   summary.state AS summary_state,
+                   publish.state AS publish_state
             FROM documents d
+            CROSS JOIN runtime
             JOIN artifacts a ON a.id=d.artifact_id AND a.kind='pdf'
             LEFT JOIN stage_attempts extract
               ON extract.document_id=d.id AND extract.stage='text_extract' AND extract.workflow_version=?
+            LEFT JOIN stage_attempts summary
+              ON summary.id=(
+                SELECT s.id FROM stage_attempts s
+                WHERE s.document_id=d.id AND s.stage='summary'
+                ORDER BY s.id DESC LIMIT 1
+              )
+            LEFT JOIN stage_attempts publish
+              ON publish.id=(
+                SELECT p.id FROM stage_attempts p
+                WHERE p.document_id=d.id AND p.stage='publish'
+                ORDER BY p.id DESC LIMIT 1
+              )
             WHERE d.source=?
               AND (
-                extract.id IS NULL OR extract.state <> 'succeeded'
-                OR NOT EXISTS(SELECT 1 FROM stage_attempts s0 WHERE s0.document_id=d.id AND s0.stage='summary')
-                OR EXISTS(SELECT 1 FROM stage_attempts s1 WHERE s1.document_id=d.id AND s1.stage='summary' AND s1.state <> 'succeeded')
-                OR NOT EXISTS(SELECT 1 FROM stage_attempts p0 WHERE p0.document_id=d.id AND p0.stage='publish')
-                OR EXISTS(SELECT 1 FROM stage_attempts p1 WHERE p1.document_id=d.id AND p1.stage='publish' AND p1.state <> 'succeeded')
+                extract.id IS NULL
+                OR (
+                  (extract.state='queued' AND (extract.available_at_epoch IS NULL OR extract.available_at_epoch <= runtime.now_epoch))
+                  OR (extract.state='retry_wait' AND extract.available_at_epoch <= runtime.now_epoch)
+                  OR (extract.state='running' AND (extract.lease_expires_at_epoch IS NULL OR extract.lease_expires_at_epoch <= runtime.now_epoch))
+                )
+                OR (
+                  extract.state='succeeded'
+                  AND (
+                    summary.id IS NULL
+                    OR (
+                      (summary.state='queued' AND (summary.available_at_epoch IS NULL OR summary.available_at_epoch <= runtime.now_epoch))
+                      OR (summary.state='retry_wait' AND summary.available_at_epoch <= runtime.now_epoch)
+                      OR (summary.state='running' AND (summary.lease_expires_at_epoch IS NULL OR summary.lease_expires_at_epoch <= runtime.now_epoch))
+                    )
+                    OR (
+                      summary.state='succeeded'
+                      AND (
+                        publish.id IS NULL
+                        OR (publish.state='queued' AND (publish.available_at_epoch IS NULL OR publish.available_at_epoch <= runtime.now_epoch))
+                        OR (publish.state='retry_wait' AND publish.available_at_epoch <= runtime.now_epoch)
+                        OR (publish.state='running' AND (publish.lease_expires_at_epoch IS NULL OR publish.lease_expires_at_epoch <= runtime.now_epoch))
+                      )
+                    )
+                  )
+                )
               )
             ORDER BY
               CASE
                 WHEN extract.id IS NULL OR extract.state <> 'succeeded' THEN 0
-                WHEN has_unsettled_summary THEN 1
-                WHEN has_unsettled_publish THEN 2
-                WHEN has_summary = 0 THEN 3
-                ELSE 4
+                WHEN summary.id IS NULL OR summary.state <> 'succeeded' THEN 1
+                ELSE 2
               END,
               d.id
             LIMIT ?
             """,
-            (workflow, normalized, int(limit)),
+            (now_epoch, workflow, normalized, int(limit)),
         ).fetchall()
         return [dict(row) for row in rows]
 

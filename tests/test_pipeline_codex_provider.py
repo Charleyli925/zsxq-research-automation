@@ -195,6 +195,23 @@ def test_schema_validation_rejects_extra_fields_and_manifest_mismatches():
         validate_summary_payload(payload, expected_paths=("/runtime/clean/report-a.md",))
 
 
+def test_single_input_provider_binds_model_echo_to_controlled_identity(tmp_path):
+    payload = _success_payload()
+    payload["handled_paths"] = ["/model/misquoted/report-a.md"]
+    payload["summaries"][0]["path"] = "/model/misquoted/report-a.md"
+    payload["summaries"][0]["filename"] = "model-renamed.pdf"
+    provider = CodexSummaryProvider(
+        CodexProviderConfig(model="gpt-test", work_root=tmp_path),
+        popen_factory=_RecordingPopen(payload),
+    )
+
+    result = provider.summarize(_request())
+
+    assert result.output["handled_paths"] == ["/runtime/clean/report-a.md"]
+    assert result.output["summaries"][0]["path"] == "/runtime/clean/report-a.md"
+    assert result.output["summaries"][0]["filename"] == "report-a.pdf"
+
+
 def test_invalid_last_message_is_rejected_before_any_artifact_can_be_accepted(tmp_path):
     invalid = _success_payload()
     invalid["summaries"] = [{"path": "/runtime/clean/report-a.md"}]
