@@ -82,11 +82,14 @@ def _run(*args: str):
 
 def test_unified_template_is_one_shot_and_has_explicit_runtime_contract():
     payload = plistlib.loads(TEMPLATE.read_bytes())
+    environment = payload["EnvironmentVariables"]
     assert payload["RunAtLoad"] is True
     assert payload["StartInterval"] == 300
     assert "KeepAlive" not in payload
     assert payload["ProgramArguments"][-2:] == ["--config", "__CONFIG_PATH__"]
-    assert {"HOME", "PATH", "ZSXQ_PIPELINE_RUNTIME_ROOT"}.issubset(payload["EnvironmentVariables"])
+    assert {"HOME", "PATH", "ZSXQ_PIPELINE_RUNTIME_ROOT"}.issubset(environment)
+    assert environment["NO_PROXY"] == "127.0.0.1,localhost"
+    assert environment["no_proxy"] == "127.0.0.1,localhost"
 
 
 def test_install_and_rollback_switch_only_release_entrypoint(tmp_path):
