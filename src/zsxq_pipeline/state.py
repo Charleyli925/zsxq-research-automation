@@ -490,8 +490,10 @@ class PipelineState:
 
         The processor owns the detailed workflow identities for summary and
         publication.  Only a missing next stage or the latest due runnable
-        attempt is returned.  Terminal attempts stay visible for an explicit
-        retry plan instead of being reported as fresh failures on every tick.
+        attempt is returned.  Downstream work is closed before new extraction
+        so explicit recoveries cannot starve behind a source backlog. Terminal
+        attempts stay visible for an explicit retry plan instead of being
+        reported as fresh failures on every tick.
         """
 
         self._require_migrated()
@@ -558,8 +560,8 @@ class PipelineState:
               )
             ORDER BY
               CASE
-                WHEN extract.id IS NULL OR extract.state <> 'succeeded' THEN 0
-                WHEN summary.id IS NULL OR summary.state <> 'succeeded' THEN 1
+                WHEN extract.state='succeeded' AND summary.state='succeeded' THEN 0
+                WHEN extract.state='succeeded' THEN 1
                 ELSE 2
               END,
               d.id
