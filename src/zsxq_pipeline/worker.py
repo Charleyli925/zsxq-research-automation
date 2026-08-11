@@ -20,6 +20,7 @@ from .lark import LarkCliConfig, LarkNotifier
 from .lock import runtime_lock
 from .notify import (
     BATCH_COMPLETE_EVENT,
+    DOWNLOAD_BLOCKED_EVENT,
     DOWNLOAD_COMPLETE_EVENT,
     SUMMARY_PROGRESS_EVENT,
     SUMMARY_STARTED_EVENT,
@@ -28,6 +29,7 @@ from .notify import (
     enqueue_pipeline_status_notification,
     export_notification_audit,
     render_batch_complete_notice,
+    render_download_blocked_notice,
     render_download_complete_notice,
     render_summary_progress_notice,
     render_summary_started_notice,
@@ -202,7 +204,14 @@ class PipelineWorker:
                     except Exception as exc:
                         failures.append(f"notify:{outcome.source}:download_complete:{type(exc).__name__}")
                 elif outcome.status != "busy":
-                    failures.append(f"download:{outcome.source}:{outcome.status}")
+                    reason_code = str(getattr(outcome, "reason_code", "") or "").strip()
+                    suffix = f":{reason_code}" if reason_code else ""
+                    failures.append(f"download:{outcome.source}:{outcome.status}{suffix}")
+                    if outcome.status == "blocked" and reason_code:
+                        try:
+                            self._queue_download_blocked(row, outcome)
+                        except Exception as exc:
+                            failures.append(f"notify:{outcome.source}:download_blocked:{type(exc).__name__}")
 
         # A processor can legitimately run beyond the soft tick deadline while
         # finishing a model request.  Drain durable work from the prior tick
@@ -320,6 +329,30 @@ class PipelineWorker:
                 identity=scope,
                 chat_id=self.config.lark.target_chat_id,
                 markdown=render_download_complete_notice(source=outcome.source, count=len(entries)),
+                scope_key=scope,
+            )
+
+    def _queue_download_blocked(self, row: Mapping[str, Any], outcome: DownloadOutcome) -> None:
+        """Queue one reason-specific alert while retaining the source window."""
+
+        if not self._notifications_configured():
+            return
+        reason_code = str(getattr(outcome, "reason_code", "") or "").strip()
+        if not reason_code:
+            raise WorkerError("download blocked notification requires a reason code")
+        try:
+            window_id = int(row["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorkerError("download blocked notification requires a durable source window id") from exc
+        scope = self._window_scope(window_id)
+        with PipelineState.open(self.config.runtime.database) as state:
+            state.migrate()
+            enqueue_pipeline_status_notification(
+                state,
+                event=DOWNLOAD_BLOCKED_EVENT,
+                identity=f"{scope}:{reason_code}",
+                chat_id=self.config.lark.target_chat_id,
+                markdown=render_download_blocked_notice(source=outcome.source, reason_code=reason_code),
                 scope_key=scope,
             )
 

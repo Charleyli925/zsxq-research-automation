@@ -9,6 +9,7 @@ from zsxq_pipeline.lock import runtime_lock
 from zsxq_pipeline.model import Stage
 from zsxq_pipeline.notify import (
     BATCH_COMPLETE_EVENT,
+    DOWNLOAD_BLOCKED_EVENT,
     DOWNLOAD_COMPLETE_EVENT,
     SUMMARY_PROGRESS_EVENT,
     SUMMARY_STARTED_EVENT,
@@ -283,6 +284,43 @@ def test_successful_nonempty_download_queues_one_exact_count_status(tmp_path):
         notifications = state.list_notifications()
         assert [item.event for item in notifications] == [DOWNLOAD_COMPLETE_EVENT]
         assert "本轮新增 **3** 份 PDF" in notifications[0].payload["markdown"]
+
+
+def test_blocked_download_exposes_reason_and_queues_one_retry_alert(tmp_path):
+    config = _notification_config(tmp_path)
+    start = datetime(2026, 8, 10, 7, 0, tzinfo=UTC)
+    end = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        state.schedule_source_window(
+            "foreign",
+            start,
+            end,
+            due_cursor=end,
+            truncated=False,
+        )
+
+    def download(request):
+        return SimpleNamespace(
+            status="blocked",
+            source=request.source,
+            reason_code="blocked_browser_cdp_unresponsive",
+            checkpoint_eligible=False,
+            downloaded_entries=(),
+        )
+
+    worker = PipelineWorker(config, download_runner=download, outbox_runner=lambda max_items: ())
+    first = worker.run_stage("download")
+    second = worker.run_stage("download")
+
+    assert first.failures == (
+        "download:foreign:blocked:blocked_browser_cdp_unresponsive",
+    )
+    assert second.failures == first.failures
+    with PipelineState.open(config.runtime.database) as state:
+        notifications = state.list_notifications()
+        assert [item.event for item in notifications] == [DOWNLOAD_BLOCKED_EVENT]
+        assert "`blocked_browser_cdp_unresponsive`" in notifications[0].payload["markdown"]
 
 
 def test_process_statuses_are_one_start_one_milestone_then_one_completion(tmp_path):

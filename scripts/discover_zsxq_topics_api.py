@@ -49,43 +49,50 @@ def main() -> int:
             browser = p.chromium.connect_over_cdp(args.cdp_endpoint, timeout=30_000)
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = context.new_page()
+            try:
 
-            def on_response(resp) -> None:
-                url = resp.url
-                if not TOPICS_URL_RE.match(url):
-                    return
-                if url not in seen_urls:
-                    seen_urls.append(url)
-                content_type = (resp.headers.get("content-type") or "").lower()
-                if "json" not in content_type:
-                    return
+                def on_response(resp) -> None:
+                    url = resp.url
+                    if not TOPICS_URL_RE.match(url):
+                        return
+                    if url not in seen_urls:
+                        seen_urls.append(url)
+                    content_type = (resp.headers.get("content-type") or "").lower()
+                    if "json" not in content_type:
+                        return
+                    try:
+                        payload = resp.json()
+                    except Exception:
+                        return
+                    if not isinstance(payload, dict):
+                        return
+                    resp_data = payload.get("resp_data")
+                    if not isinstance(resp_data, dict):
+                        return
+                    topics = resp_data.get("topics")
+                    if not isinstance(topics, list):
+                        return
+                    if topics:
+                        first = topics[0]
+                        if not isinstance(first, dict):
+                            return
+                        if "topic_id" not in first or "create_time" not in first:
+                            return
+                    if url not in validated_urls:
+                        validated_urls.append(url)
+
+                page.on("response", on_response)
+                page.goto(args.tag_url, wait_until="domcontentloaded", timeout=90_000)
+                page.wait_for_timeout(2_000)
+                for _ in range(max(0, args.scroll_rounds)):
+                    page.mouse.wheel(0, 4_500)
+                    page.wait_for_timeout(1_200)
+            finally:
                 try:
-                    payload = resp.json()
-                except Exception:
-                    return
-                if not isinstance(payload, dict):
-                    return
-                resp_data = payload.get("resp_data")
-                if not isinstance(resp_data, dict):
-                    return
-                topics = resp_data.get("topics")
-                if not isinstance(topics, list):
-                    return
-                if topics:
-                    first = topics[0]
-                    if not isinstance(first, dict):
-                        return
-                    if "topic_id" not in first or "create_time" not in first:
-                        return
-                if url not in validated_urls:
-                    validated_urls.append(url)
-
-            page.on("response", on_response)
-            page.goto(args.tag_url, wait_until="domcontentloaded", timeout=90_000)
-            page.wait_for_timeout(2_000)
-            for _ in range(max(0, args.scroll_rounds)):
-                page.mouse.wheel(0, 4_500)
-                page.wait_for_timeout(1_200)
+                    page.close()
+                except PlaywrightError:
+                    # A disconnected browser has already destroyed the target.
+                    pass
     except PlaywrightError as exc:
         result = {
             "found": False,
@@ -100,7 +107,6 @@ def main() -> int:
             Path(args.output).write_text(output + "\n", encoding="utf-8")
         print(output)
         return 2
-
     preferred = validated_urls[-1] if validated_urls else None
     supports_end_time = False
     if preferred:

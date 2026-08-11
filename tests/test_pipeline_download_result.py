@@ -29,3 +29,4 @@ def test_download_result_exports_process_exit_code_and_deprecated_compatibility_
     assert payload["codex_exit_code"] == 0
     assert payload["downloaded_files"] == ["fixture.pdf"]
     assert payload["scan_plan_hash"] == "a" * 64
+    assert payload["error_detail"] == ""

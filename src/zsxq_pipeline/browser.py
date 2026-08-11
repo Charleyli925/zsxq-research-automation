@@ -3,13 +3,16 @@
 The session reuses the dedicated Chrome for Testing profile and can start its
 CDP endpoint when a release-owned task configuration explicitly supplies the
 browser executable and profile path. It never clears cookies, storage, or
-profile data. The only cleanup is a confirmed-dead Chrome singleton marker.
+profile data. Cleanup is limited to a confirmed-dead Chrome singleton marker
+and surplus page targets proven to share the configured dedicated start
+origin; targets from every other origin are preserved.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import tempfile
 import time
@@ -22,6 +25,12 @@ from typing import Any, Callable
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
+
+
+# macOS system proxy settings can route even 127.0.0.1 through an HTTP proxy.
+# CDP is explicitly restricted to a local endpoint below, so every readiness,
+# target-list, create, and close request must bypass ambient proxies.
+_DIRECT_CDP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class BrowserSessionError(RuntimeError):
@@ -42,7 +51,8 @@ class CftLaunchOptions:
     start_url: str = ""
     headless: bool = True
     window_size: str = "1440,1200"
-    startup_timeout_seconds: float = 25.0
+    startup_timeout_seconds: float = 60.0
+    shutdown_timeout_seconds: float = 10.0
 
     def __post_init__(self) -> None:
         if not self.executable_path.is_absolute():
@@ -51,6 +61,8 @@ class CftLaunchOptions:
             raise ValueError("CFT user_data_dir must be absolute")
         if float(self.startup_timeout_seconds) <= 0:
             raise ValueError("CFT startup_timeout_seconds must be positive")
+        if float(self.shutdown_timeout_seconds) <= 0:
+            raise ValueError("CFT shutdown_timeout_seconds must be positive")
         if not str(self.window_size).strip():
             raise ValueError("CFT window_size is required")
 
@@ -67,8 +79,28 @@ class BrowserDoctorResult:
         return {"ok": self.ok, "code": self.code, "page_state": self.page_state}
 
 
+@dataclass(frozen=True, slots=True)
+class _TargetCleanupResult:
+    """Sanitized evidence from one bounded dedicated-target cleanup pass."""
+
+    observed_pages: int = 0
+    owned_pages: int = 0
+    closed_pages: int = 0
+    failed_closes: int = 0
+    error: str = ""
+
+    def diagnostic(self, phase: str) -> str:
+        detail = (
+            f"{phase}[observed={self.observed_pages},owned={self.owned_pages},"
+            f"closed={self.closed_pages},failed={self.failed_closes}"
+        )
+        if self.error:
+            detail += f",error={self.error}"
+        return detail + "]"
+
+
 class BrowserSession:
-    """Connect exactly once and lend one page to scan and download stages."""
+    """Lend one page with bounded reconnect and dedicated-profile recovery."""
 
     def __init__(
         self,
@@ -77,16 +109,30 @@ class BrowserSession:
         connect_timeout_ms: int = 45_000,
         cft_launch_options: CftLaunchOptions | None = None,
         playwright_factory: Callable[[], Any] = sync_playwright,
+        connect_attempts: int = 2,
+        owned_page_limit: int = 4,
+        retry_delay_seconds: float = 0.25,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         endpoint = str(cdp_endpoint).strip()
         if not endpoint:
             raise ValueError("cdp_endpoint is required")
         if int(connect_timeout_ms) < 1_000:
             raise ValueError("connect_timeout_ms must be at least 1000")
+        if not 1 <= int(connect_attempts) <= 5:
+            raise ValueError("connect_attempts must be between 1 and 5")
+        if int(owned_page_limit) < 1:
+            raise ValueError("owned_page_limit must be positive")
+        if not 0 <= float(retry_delay_seconds) <= 5:
+            raise ValueError("retry_delay_seconds must be between 0 and 5")
         self.cdp_endpoint = endpoint
         self.connect_timeout_ms = int(connect_timeout_ms)
         self.cft_launch_options = cft_launch_options
         self._playwright_factory = playwright_factory
+        self.connect_attempts = int(connect_attempts)
+        self.owned_page_limit = int(owned_page_limit)
+        self.retry_delay_seconds = float(retry_delay_seconds)
+        self._sleep = sleep
         self._manager: Any | None = None
         self._browser: Any | None = None
         self._page: Any | None = None
@@ -98,26 +144,56 @@ class BrowserSession:
         return self._page
 
     def __enter__(self) -> "BrowserSession":
-        try:
+        if self.cft_launch_options is not None:
+            self._ensure_cft_ready()
+
+        cleanup_evidence: list[tuple[str, _TargetCleanupResult]] = []
+        cleanup_evidence.append(("preconnect", self._compact_owned_targets(limit=self.owned_page_limit)))
+        last_error: BrowserSessionError | None = None
+        last_cause: Exception | None = None
+        for attempt in range(1, self.connect_attempts + 1):
+            try:
+                self._connect_page_once()
+                return self
+            except BrowserSessionError as exc:
+                last_error = exc
+                last_cause = exc
+            except (PlaywrightError, OSError, RuntimeError) as exc:
+                last_error = BrowserSessionError("blocked_browser_cdp_unresponsive", str(exc))
+                last_cause = exc
+            self.close()
+            if attempt >= self.connect_attempts:
+                break
+            # A live CDP endpoint can still carry too many or unhealthy page
+            # targets.  Collapse only pages proven to belong to this dedicated
+            # CFT origin, preserve one keepalive target, then reconnect through
+            # a fresh Playwright transport.  Cookies/storage/profile bytes are
+            # never touched.
             if self.cft_launch_options is not None:
                 self._ensure_cft_ready()
-            self._manager = self._playwright_factory()
-            playwright = self._manager.__enter__()
-            self._browser = playwright.chromium.connect_over_cdp(
-                self.cdp_endpoint,
-                timeout=self.connect_timeout_ms,
-            )
-            contexts = list(getattr(self._browser, "contexts", []) or [])
-            if not contexts:
-                raise BrowserSessionError("blocked_browser_cdp_unresponsive", "dedicated browser has no persistent context")
-            self._page = contexts[0].new_page()
-            return self
-        except BrowserSessionError:
-            self.close()
-            raise
-        except (PlaywrightError, OSError, RuntimeError) as exc:
-            self.close()
-            raise BrowserSessionError("blocked_browser_cdp_unresponsive", str(exc)) from exc
+            cleanup_evidence.append((f"retry-{attempt}", self._compact_owned_targets(limit=1)))
+            self._ensure_keepalive_page()
+            if self.retry_delay_seconds:
+                self._sleep(self.retry_delay_seconds)
+
+        assert last_error is not None  # connect_attempts is validated positive
+        diagnostics = "; ".join(result.diagnostic(phase) for phase, result in cleanup_evidence)
+        detail = f"{last_error.detail[:700]}; connect_attempts={self.connect_attempts}; {diagnostics}"
+        raise BrowserSessionError(last_error.code, detail) from last_cause
+
+    def _connect_page_once(self) -> None:
+        """Create one fresh transport and one caller-owned page."""
+
+        self._manager = self._playwright_factory()
+        playwright = self._manager.__enter__()
+        self._browser = playwright.chromium.connect_over_cdp(
+            self.cdp_endpoint,
+            timeout=self.connect_timeout_ms,
+        )
+        contexts = list(getattr(self._browser, "contexts", []) or [])
+        if not contexts:
+            raise BrowserSessionError("blocked_browser_cdp_unresponsive", "dedicated browser has no persistent context")
+        self._page = contexts[0].new_page()
 
     def _endpoint_base(self) -> tuple[str, int]:
         parsed = urllib.parse.urlparse(self.cdp_endpoint)
@@ -136,8 +212,14 @@ class BrowserSession:
 
     @staticmethod
     def _http_json(url: str, *, timeout_seconds: float = 1.5) -> Any:
-        with urllib.request.urlopen(url, timeout=timeout_seconds) as response:  # nosec B310 - fixed local CDP endpoint
+        with _DIRECT_CDP_OPENER.open(url, timeout=timeout_seconds) as response:  # nosec B310 - fixed local CDP endpoint
             return json.loads(response.read().decode("utf-8", errors="replace"))
+
+    @staticmethod
+    def _http_put(url: str, *, timeout_seconds: float = 2.0) -> bytes:
+        request = urllib.request.Request(url, method="PUT")
+        with _DIRECT_CDP_OPENER.open(request, timeout=timeout_seconds) as response:  # nosec B310 - fixed local CDP endpoint
+            return response.read()
 
     def _cdp_ready(self) -> bool:
         base, _port = self._endpoint_base()
@@ -148,22 +230,133 @@ class BrowserSession:
         return isinstance(payload, dict) and bool(str(payload.get("webSocketDebuggerUrl") or "").strip())
 
     @staticmethod
-    def _remove_confirmed_dead_singletons(user_data_dir: Path) -> bool:
-        """Remove singleton markers only when their owner PID is known dead."""
+    def _same_origin(left: str, right: str) -> bool:
+        try:
+            left_url = urllib.parse.urlparse(str(left).strip())
+            right_url = urllib.parse.urlparse(str(right).strip())
+            left_port = left_url.port or (443 if left_url.scheme == "https" else 80)
+            right_port = right_url.port or (443 if right_url.scheme == "https" else 80)
+        except ValueError:
+            return False
+        return (
+            left_url.scheme in {"http", "https"}
+            and left_url.scheme == right_url.scheme
+            and (left_url.hostname or "").casefold() == (right_url.hostname or "").casefold()
+            and left_port == right_port
+        )
 
+    def _is_owned_page_target(self, target: Any) -> bool:
+        options = self.cft_launch_options
+        if options is None or not options.start_url or not isinstance(target, dict):
+            return False
+        if str(target.get("type") or "").strip() != "page":
+            return False
+        url = str(target.get("url") or "").strip()
+        return url == "about:blank" or self._same_origin(url, options.start_url)
+
+    def _compact_owned_targets(self, *, limit: int) -> _TargetCleanupResult:
+        """Bound page targets from the explicitly configured dedicated origin.
+
+        Raw CDP HTTP is used deliberately: it remains available when a
+        Playwright transport or ``context.new_page`` is the failing layer.
+        Targets from other origins and every non-page target are preserved.
+        """
+
+        options = self.cft_launch_options
+        if options is None or not options.start_url:
+            return _TargetCleanupResult()
+        base, _port = self._endpoint_base()
+        try:
+            payload = self._http_json(f"{base}/json/list")
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
+            return _TargetCleanupResult(error=" ".join(str(exc).split())[:120] or type(exc).__name__)
+        if not isinstance(payload, list):
+            return _TargetCleanupResult(error="CDP target list was not an array")
+        pages = [item for item in payload if isinstance(item, dict) and str(item.get("type") or "") == "page"]
+        owned = [item for item in pages if self._is_owned_page_target(item)]
+        effective_limit = max(1, int(limit))
+        if len(owned) <= effective_limit:
+            return _TargetCleanupResult(observed_pages=len(pages), owned_pages=len(owned))
+
+        preferred = [
+            item
+            for item in owned
+            if str(item.get("url") or "").strip().startswith(str(options.start_url).strip())
+        ]
+        ordered = preferred + [item for item in owned if item not in preferred]
+        keep_ids: set[str] = set()
+        for item in ordered:
+            target_id = str(item.get("id") or "").strip()
+            if target_id:
+                keep_ids.add(target_id)
+            if len(keep_ids) >= effective_limit:
+                break
+
+        closed = 0
+        failed = 0
+        for item in owned:
+            target_id = str(item.get("id") or "").strip()
+            if not target_id or target_id in keep_ids:
+                if not target_id:
+                    failed += 1
+                continue
+            encoded = urllib.parse.quote(target_id, safe="")
+            try:
+                self._http_put(f"{base}/json/close/{encoded}")
+            except (OSError, urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+                failed += 1
+            else:
+                closed += 1
+        return _TargetCleanupResult(
+            observed_pages=len(pages),
+            owned_pages=len(owned),
+            closed_pages=closed,
+            failed_closes=failed,
+        )
+
+    @staticmethod
+    def _singleton_owner_pid(user_data_dir: Path) -> int | None:
         lock_path = user_data_dir / "SingletonLock"
         try:
             target = os.readlink(lock_path)
-            owner_pid = int(target.rsplit("-", 1)[-1])
+            return int(target.rsplit("-", 1)[-1])
         except (FileNotFoundError, OSError, TypeError, ValueError):
-            return False
+            return None
+
+    @staticmethod
+    def _process_alive(pid: int) -> bool:
         try:
-            os.kill(owner_pid, 0)
+            os.kill(int(pid), 0)
         except ProcessLookupError:
-            pass
-        except PermissionError:
             return False
-        else:
+        except PermissionError:
+            return True
+        return True
+
+    @staticmethod
+    def _process_command(pid: int) -> str:
+        try:
+            completed = subprocess.run(  # noqa: S603 - fixed local process inspection
+                ["/bin/ps", "-p", str(int(pid)), "-o", "command="],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return " ".join(completed.stdout.split()) if completed.returncode == 0 else ""
+
+    @staticmethod
+    def _signal_process(pid: int, value: signal.Signals) -> None:
+        os.kill(int(pid), value)
+
+    @classmethod
+    def _remove_confirmed_dead_singletons(cls, user_data_dir: Path) -> bool:
+        """Remove singleton markers only when their owner PID is known dead."""
+
+        owner_pid = cls._singleton_owner_pid(user_data_dir)
+        if owner_pid is None or cls._process_alive(owner_pid):
             return False
         for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
             try:
@@ -173,6 +366,70 @@ class BrowserSession:
             except OSError:
                 return False
         return True
+
+    def _owned_unresponsive_cft_pid(self) -> int | None:
+        """Resolve an exact release-owned singleton or fail closed."""
+
+        options = self.cft_launch_options
+        if options is None:
+            return None
+        profile = options.user_data_dir.expanduser()
+        owner_pid = self._singleton_owner_pid(profile)
+        if owner_pid is None or not self._process_alive(owner_pid):
+            return None
+        command = self._process_command(owner_pid)
+        _base, port = self._endpoint_base()
+        executable = str(options.executable_path.expanduser())
+        profile_argument = f"--user-data-dir={profile}"
+        port_argument = f"--remote-debugging-port={port}"
+        if not command:
+            raise BrowserSessionError(
+                "blocked_browser_owner_unverified",
+                f"cannot inspect live CFT singleton owner pid={owner_pid}; refusing automatic termination",
+            )
+        if not (
+            command.startswith(f"{executable} ")
+            and profile_argument in command
+            and port_argument in command
+        ):
+            raise BrowserSessionError(
+                "blocked_browser_owner_unverified",
+                f"live singleton owner pid={owner_pid} does not match configured executable/profile/port",
+            )
+        return owner_pid
+
+    def _stop_owned_unresponsive_cft(self, owner_pid: int) -> bool:
+        """TERM one exact dedicated CFT owner; never escalate to SIGKILL."""
+
+        if self._cdp_ready():
+            return False
+        try:
+            self._signal_process(owner_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except (OSError, PermissionError) as exc:
+            raise BrowserSessionError(
+                "blocked_browser_restart_failed",
+                f"cannot terminate verified CFT owner pid={owner_pid}: {exc}",
+            ) from exc
+        options = self.cft_launch_options
+        assert options is not None
+        deadline = time.monotonic() + float(options.shutdown_timeout_seconds)
+        while time.monotonic() < deadline:
+            if self._cdp_ready():
+                # Some hung CFT builds recover their listener while handling
+                # TERM without exiting. Reuse that exact verified owner rather
+                # than escalating or starting a competing profile process.
+                return False
+            if not self._process_alive(owner_pid):
+                self._remove_confirmed_dead_singletons(options.user_data_dir.expanduser())
+                return True
+            self._sleep(0.1)
+        raise BrowserSessionError(
+            "blocked_browser_restart_failed",
+            f"verified CFT owner pid={owner_pid} did not exit after SIGTERM within "
+            f"{float(options.shutdown_timeout_seconds):g}s; refusing SIGKILL",
+        )
 
     def _launch_cft(self) -> None:
         options = self.cft_launch_options
@@ -227,7 +484,7 @@ class BrowserSession:
             return
         encoded = urllib.parse.quote(options.start_url, safe="")
         try:
-            urllib.request.urlopen(f"{base}/json/new?{encoded}", timeout=2.0).read()  # nosec B310 - fixed local CDP endpoint
+            self._http_put(f"{base}/json/new?{encoded}")
         except (OSError, urllib.error.URLError, urllib.error.HTTPError):
             # Newer Chrome builds may refuse this optional endpoint. The real
             # browser session remains the authority for readiness.
@@ -237,6 +494,12 @@ class BrowserSession:
         if self._cdp_ready():
             self._ensure_keepalive_page()
             return
+        owner_pid = self._owned_unresponsive_cft_pid()
+        if owner_pid is not None:
+            stopped = self._stop_owned_unresponsive_cft(owner_pid)
+            if not stopped and self._cdp_ready():
+                self._ensure_keepalive_page()
+                return
         self._launch_cft()
         options = self.cft_launch_options
         assert options is not None  # narrowed above
@@ -246,7 +509,10 @@ class BrowserSession:
                 self._ensure_keepalive_page()
                 return
             time.sleep(0.25)
-        raise BrowserSessionError("blocked_browser_endpoint_unavailable", "CFT CDP endpoint did not become ready")
+        raise BrowserSessionError(
+            "blocked_browser_endpoint_unavailable",
+            f"CFT CDP endpoint did not become ready within {float(options.startup_timeout_seconds):g}s",
+        )
 
     def close(self) -> None:
         """Close only the page/CDP client, never the user-owned CFT process."""

@@ -16,6 +16,28 @@ on source content protection, validates PDF bytes, and atomically places the
 file in staging. No model, agent, browser MCP, or dynamic package installation
 is involved.
 
+Before attaching, `BrowserSession` bounds only page targets proven to belong
+to the configured dedicated CFT origin. A transient CDP/page-creation failure
+gets one fresh transport retry after a stricter owned-target compaction; other
+origins, cookies, storage, and profile bytes are never touched. Every
+caller-created page is closed. A final failure preserves the exact sanitized
+exception, retry count, and target-cleanup counters in the blocked scan plan,
+while the source window remains scheduled for a later retry.
+
+All CDP HTTP probes and target actions use a proxy-free opener. This is a
+correctness boundary, not a network preference: macOS system proxy settings
+can otherwise route `127.0.0.1` through an HTTP proxy and turn a healthy local
+listener into a false timeout, causing repeated competing CFT launches.
+
+If the CDP endpoint is absent while the profile singleton owner remains alive,
+automatic restart is allowed only after that PID's command matches all three
+release-owned facts: configured executable, profile path, and debugging port.
+The worker sends that exact PID `SIGTERM`, waits for exit, removes only the now
+confirmed-dead singleton markers, and relaunches CFT. If the same owner becomes
+CDP-ready while handling TERM, it is reused without a competing launch. Owner
+mismatch or a timeout with neither exit nor CDP recovery fails closed; the
+pipeline never escalates to `SIGKILL`.
+
 ## 3. Reconciliation
 
 `finalize_download_batch.py` archives only planned files and appends evidence
