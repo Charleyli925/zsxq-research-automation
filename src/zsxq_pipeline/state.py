@@ -571,6 +571,79 @@ class PipelineState:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def source_window_progress(self, source_window_id: int) -> dict[str, Any] | None:
+        """Return exact PDF, summary, and publication counts for one source window.
+
+        A scheduled source window is the durable user-facing cohort.  Counting
+        its latest per-document stage rows avoids inventing progress from a
+        worker invocation, which may process only a quota-bounded slice or be
+        resumed after a crash.
+        """
+
+        self._require_migrated()
+        window_id = int(source_window_id)
+        window = self._connection.execute(
+            "SELECT id, source FROM source_windows WHERE id=?", (window_id,)
+        ).fetchone()
+        if window is None:
+            return None
+        row = self._connection.execute(
+            """
+            WITH window_documents AS (
+              SELECT documents.id
+              FROM documents
+              JOIN artifacts ON artifacts.id=documents.artifact_id AND artifacts.kind='pdf'
+              WHERE documents.source_window_id=?
+            ),
+            latest AS (
+              SELECT
+                stage_attempts.document_id,
+                stage_attempts.stage,
+                stage_attempts.state,
+                ROW_NUMBER() OVER (
+                  PARTITION BY stage_attempts.document_id, stage_attempts.stage
+                  ORDER BY stage_attempts.id DESC
+                ) AS row_number
+              FROM stage_attempts
+              JOIN window_documents ON window_documents.id=stage_attempts.document_id
+            )
+            SELECT
+              COUNT(window_documents.id) AS total,
+              COALESCE(SUM(CASE WHEN summary_stage.state='succeeded' THEN 1 ELSE 0 END), 0) AS summarized,
+              COALESCE(SUM(CASE WHEN publish_stage.state='succeeded' THEN 1 ELSE 0 END), 0) AS published,
+              COALESCE(SUM(
+                CASE WHEN
+                  extract_stage.state IN ('blocked_auth', 'blocked_release', 'quarantined')
+                  OR summary_stage.state IN ('blocked_auth', 'blocked_release', 'quarantined')
+                  OR publish_stage.state IN ('blocked_auth', 'blocked_release', 'quarantined')
+                THEN 1 ELSE 0 END
+              ), 0) AS blocked
+            FROM window_documents
+            LEFT JOIN latest extract_stage
+              ON extract_stage.document_id=window_documents.id
+             AND extract_stage.stage='text_extract'
+             AND extract_stage.row_number=1
+            LEFT JOIN latest summary_stage
+              ON summary_stage.document_id=window_documents.id
+             AND summary_stage.stage='summary'
+             AND summary_stage.row_number=1
+            LEFT JOIN latest publish_stage
+              ON publish_stage.document_id=window_documents.id
+             AND publish_stage.stage='publish'
+             AND publish_stage.row_number=1
+            """,
+            (window_id,),
+        ).fetchone()
+        assert row is not None
+        return {
+            "source_window_id": window_id,
+            "source": str(window["source"]),
+            "total": int(row["total"]),
+            "summarized": int(row["summarized"]),
+            "published": int(row["published"]),
+            "blocked": int(row["blocked"]),
+        }
+
     def upsert_document(
         self,
         source: str,

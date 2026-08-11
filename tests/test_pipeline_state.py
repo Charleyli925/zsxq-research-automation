@@ -73,6 +73,60 @@ def test_documents_keep_source_identity_while_pdf_content_is_deduplicated(tmp_pa
             state.record_artifact(changed.id, kind="pdf", path="/library/a.pdf", pdf_sha256="b" * 64, now=NOW)
 
 
+def test_source_window_progress_uses_latest_durable_document_stages(tmp_path):
+    database = tmp_path / "pipeline.sqlite3"
+    with PipelineState.open(database) as state:
+        state.migrate()
+        window = state.register_source_window("zsxq_foreign", NOW - timedelta(hours=1), NOW, now=NOW)
+        documents = []
+        for index, seed in enumerate("abcd", start=1):
+            document = state.upsert_document(
+                "zsxq_foreign",
+                f"file-{index}",
+                filename=f"report-{index}.pdf",
+                source_path=f"/library/report-{index}.pdf",
+                source_window_id=window,
+                now=NOW,
+            )
+            state.record_artifact(
+                document.id,
+                kind="pdf",
+                path=f"/library/report-{index}.pdf",
+                pdf_sha256=seed * 64,
+                now=NOW,
+            )
+            documents.append(document)
+
+        def succeed(document, stage: Stage, workflow: str) -> None:
+            state.ensure_stage(document.id, stage, workflow, now=NOW)
+            claim = state.claim_due_stage(stage, workflow, document_ids=(document.id,), now=NOW)
+            assert claim is not None
+            state.complete_stage(claim, now=NOW)
+
+        for document in documents[:2]:
+            succeed(document, Stage.SUMMARY, "summary:v1")
+            succeed(document, Stage.PUBLISH, "publish:v1")
+        state.ensure_stage(documents[2].id, Stage.TEXT_EXTRACT, "extract:v1", now=NOW)
+        blocked = state.claim_due_stage(
+            Stage.TEXT_EXTRACT,
+            "extract:v1",
+            document_ids=(documents[2].id,),
+            now=NOW,
+        )
+        assert blocked is not None
+        state.fail_stage(blocked, category=ErrorCategory.CONTENT, error_code="no_usable_text", now=NOW)
+
+        assert state.source_window_progress(window) == {
+            "source_window_id": window,
+            "source": "zsxq_foreign",
+            "total": 4,
+            "summarized": 2,
+            "published": 2,
+            "blocked": 1,
+        }
+        assert state.source_window_progress(window + 999) is None
+
+
 def test_claim_is_exclusive_and_expired_leases_are_recoverable_after_a_crash(tmp_path):
     database = tmp_path / "pipeline.sqlite3"
     first = PipelineState.open(database)

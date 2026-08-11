@@ -4,10 +4,19 @@ from datetime import datetime, timedelta, timezone
 
 from zsxq_pipeline.model import PublicationState
 from zsxq_pipeline.notify import (
+    BATCH_COMPLETE_EVENT,
+    DOWNLOAD_COMPLETE_EVENT,
+    SUMMARY_PROGRESS_EVENT,
+    SUMMARY_STARTED_EVENT,
     NotificationDrainer,
     enqueue_document_notification,
+    enqueue_pipeline_status_notification,
     enqueue_terminal_notification,
     notification_idempotency_key,
+    render_batch_complete_notice,
+    render_download_complete_notice,
+    render_summary_progress_notice,
+    render_summary_started_notice,
 )
 from zsxq_pipeline.state import PipelineState
 
@@ -170,3 +179,97 @@ def test_notification_keys_are_stable_and_fit_lark_limit():
     first = notification_idempotency_key("document_ready", "x" * 1000)
     assert first == notification_idempotency_key("document_ready", "x" * 1000)
     assert len(first) <= 50
+
+
+def test_pipeline_statuses_are_concise_window_scoped_and_idempotent(tmp_path):
+    scope = "source-window:42"
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        download = enqueue_pipeline_status_notification(
+            state,
+            event=DOWNLOAD_COMPLETE_EVENT,
+            identity=scope,
+            chat_id="oc_test",
+            markdown=render_download_complete_notice(source="zsxq_foreign", count=19),
+            scope_key=scope,
+        )
+        duplicate = enqueue_pipeline_status_notification(
+            state,
+            event=DOWNLOAD_COMPLETE_EVENT,
+            identity=scope,
+            chat_id="oc_test",
+            markdown=render_download_complete_notice(source="zsxq_foreign", count=19),
+            scope_key=scope,
+        )
+        started = enqueue_pipeline_status_notification(
+            state,
+            event=SUMMARY_STARTED_EVENT,
+            identity=scope,
+            chat_id="oc_test",
+            markdown=render_summary_started_notice(source="zsxq_foreign", total=19),
+            scope_key=scope,
+        )
+        progress = enqueue_pipeline_status_notification(
+            state,
+            event=SUMMARY_PROGRESS_EVENT,
+            identity=f"{scope}:milestone:50",
+            chat_id="oc_test",
+            markdown=render_summary_progress_notice(
+                source="zsxq_foreign", total=19, summarized=12, published=7, milestone=50
+            ),
+            scope_key=scope,
+        )
+        complete = enqueue_pipeline_status_notification(
+            state,
+            event=BATCH_COMPLETE_EVENT,
+            identity=scope,
+            chat_id="oc_test",
+            markdown=render_batch_complete_notice(source="zsxq_foreign", total=19, summarized=19, published=19),
+            scope_key=scope,
+            terminal=True,
+        )
+
+        assert download.created is True
+        assert duplicate.created is False
+        assert [item.event for item in state.list_notifications()] == [
+            DOWNLOAD_COMPLETE_EVENT,
+            SUMMARY_STARTED_EVENT,
+            SUMMARY_PROGRESS_EVENT,
+            BATCH_COMPLETE_EVENT,
+        ]
+        assert "本轮新增 **19** 份 PDF" in download.payload["markdown"]
+        assert "总结 **12/19**｜发布 **7/19**" in progress.payload["markdown"]
+        assert started.payload["terminal"] is False
+        assert complete.payload["terminal"] is True
+
+
+def test_batch_completion_waits_for_its_document_link(tmp_path):
+    scope = "source-window:42"
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        publication = _publication(state)
+        document = enqueue_document_notification(
+            state,
+            publication,
+            chat_id="oc_test",
+            markdown="document",
+            scope_key=scope,
+        )
+        complete = enqueue_pipeline_status_notification(
+            state,
+            event=BATCH_COMPLETE_EVENT,
+            identity=scope,
+            chat_id="oc_test",
+            markdown=render_batch_complete_notice(source="zsxq_foreign", total=1, summarized=1, published=1),
+            scope_key=scope,
+            terminal=True,
+        )
+        claim = state.claim_due_notification(now=NOW)
+        assert claim is not None and claim.idempotency_key == document.idempotency_key
+        state.fail_notification(claim, retry_at=NOW + timedelta(minutes=1), now=NOW)
+
+        notifier = FakeNotifier()
+        deliveries = NotificationDrainer(state, notifier, clock=lambda: NOW).drain()
+        assert len(deliveries) == 1 and deliveries[0].deferred is True
+        assert notifier.calls == []
+        assert state.get_notification(complete.idempotency_key).status == "retry_wait"  # type: ignore[union-attr]

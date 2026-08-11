@@ -25,3 +25,6 @@ All notable changes will be documented here.
   so launchd never depends on protected-folder TCC prompts.
 - Propagated partial processor outcomes into the top-level tick result instead
   of allowing projection failures to appear as a successful scheduler run.
+- Restored concise source-window notifications for exact non-empty download
+  counts, one summary start, bounded 25/50/75 percent summary/publication
+  milestones, and one terminal batch completion.
