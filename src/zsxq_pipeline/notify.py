@@ -209,8 +209,6 @@ def render_download_blocked_notice(*, source: str, reason_code: str) -> str:
     elif normalized in {
         "blocked_browser_missing",
         "blocked_browser_configuration_invalid",
-        "blocked_browser_owner_unverified",
-        "blocked_browser_restart_failed",
     }:
         action = "需要检查专用浏览器运行配置；该窗口不会被跳过。"
     else:

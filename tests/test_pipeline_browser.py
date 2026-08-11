@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 
 import pytest
 
@@ -154,7 +153,7 @@ def test_session_rechecks_full_cft_readiness_before_connection_retry(tmp_path, m
         executable_path=tmp_path / "cft",
         user_data_dir=tmp_path / "profile",
     )
-    assert options.startup_timeout_seconds == 60.0
+    assert options.startup_timeout_seconds == 25.0
     session = BrowserSession(
         "http://127.0.0.1:9223",
         cft_launch_options=options,
@@ -287,102 +286,3 @@ def test_cft_startup_requires_an_executable_only_when_cdp_is_unavailable(tmp_pat
 
     with pytest.raises(BrowserSessionError, match="blocked_browser_missing"):
         session._ensure_cft_ready()
-
-
-def test_unresponsive_verified_cft_owner_is_terminated_before_relaunch(tmp_path, monkeypatch):
-    executable = tmp_path / "Google Chrome for Testing"
-    profile = tmp_path / "profile"
-    profile.mkdir()
-    owner_pid = 4242
-    (profile / "SingletonLock").symlink_to(f"host-{owner_pid}")
-    (profile / "SingletonCookie").write_text("stale", encoding="utf-8")
-    (profile / "SingletonSocket").write_text("stale", encoding="utf-8")
-    options = CftLaunchOptions(executable_path=executable, user_data_dir=profile)
-    session = BrowserSession("http://127.0.0.1:9223", cft_launch_options=options, sleep=lambda _seconds: None)
-    alive = {"value": True}
-    ready = {"value": False}
-    signals: list[tuple[int, signal.Signals]] = []
-    launches: list[bool] = []
-    command = f"{executable} --remote-debugging-port=9223 --user-data-dir={profile}"
-    monkeypatch.setattr(BrowserSession, "_process_alive", staticmethod(lambda pid: alive["value"]))
-    monkeypatch.setattr(BrowserSession, "_process_command", staticmethod(lambda pid: command))
-
-    def send_signal(pid: int, value: signal.Signals) -> None:
-        signals.append((pid, value))
-        alive["value"] = False
-
-    def launch() -> None:
-        launches.append(True)
-        ready["value"] = True
-
-    monkeypatch.setattr(BrowserSession, "_signal_process", staticmethod(send_signal))
-    monkeypatch.setattr(session, "_launch_cft", launch)
-    monkeypatch.setattr(session, "_cdp_ready", lambda: ready["value"])
-
-    session._ensure_cft_ready()
-
-    assert signals == [(owner_pid, signal.SIGTERM)]
-    assert launches == [True]
-    assert not any(
-        (profile / name).exists() or (profile / name).is_symlink()
-        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket")
-    )
-
-
-def test_verified_cft_that_recovers_cdp_while_handling_term_is_reused(tmp_path, monkeypatch):
-    executable = tmp_path / "Google Chrome for Testing"
-    profile = tmp_path / "profile"
-    profile.mkdir()
-    owner_pid = 4242
-    (profile / "SingletonLock").symlink_to(f"host-{owner_pid}")
-    options = CftLaunchOptions(executable_path=executable, user_data_dir=profile)
-    session = BrowserSession("http://127.0.0.1:9223", cft_launch_options=options, sleep=lambda _seconds: None)
-    ready = {"value": False}
-    signals: list[tuple[int, signal.Signals]] = []
-    launches: list[bool] = []
-    command = f"{executable} --remote-debugging-port=9223 --user-data-dir={profile}"
-    monkeypatch.setattr(BrowserSession, "_process_alive", staticmethod(lambda pid: True))
-    monkeypatch.setattr(BrowserSession, "_process_command", staticmethod(lambda pid: command))
-
-    def send_signal(pid: int, value: signal.Signals) -> None:
-        signals.append((pid, value))
-        ready["value"] = True
-
-    monkeypatch.setattr(BrowserSession, "_signal_process", staticmethod(send_signal))
-    monkeypatch.setattr(session, "_launch_cft", lambda: launches.append(True))
-    monkeypatch.setattr(session, "_cdp_ready", lambda: ready["value"])
-
-    session._ensure_cft_ready()
-
-    assert signals == [(owner_pid, signal.SIGTERM)]
-    assert launches == []
-    assert (profile / "SingletonLock").is_symlink()
-
-
-def test_unresponsive_unverified_singleton_owner_is_never_signalled(tmp_path, monkeypatch):
-    executable = tmp_path / "Google Chrome for Testing"
-    profile = tmp_path / "profile"
-    profile.mkdir()
-    owner_pid = 4242
-    (profile / "SingletonLock").symlink_to(f"host-{owner_pid}")
-    options = CftLaunchOptions(executable_path=executable, user_data_dir=profile)
-    session = BrowserSession("http://127.0.0.1:9223", cft_launch_options=options)
-    signals: list[tuple[int, signal.Signals]] = []
-    monkeypatch.setattr(session, "_cdp_ready", lambda: False)
-    monkeypatch.setattr(BrowserSession, "_process_alive", staticmethod(lambda pid: True))
-    monkeypatch.setattr(
-        BrowserSession,
-        "_process_command",
-        staticmethod(lambda pid: "/Applications/Other Browser --remote-debugging-port=9223"),
-    )
-    monkeypatch.setattr(
-        BrowserSession,
-        "_signal_process",
-        staticmethod(lambda pid, value: signals.append((pid, value))),
-    )
-
-    with pytest.raises(BrowserSessionError) as captured:
-        session._ensure_cft_ready()
-
-    assert captured.value.code == "blocked_browser_owner_unverified"
-    assert signals == []

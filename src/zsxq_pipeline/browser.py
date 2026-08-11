@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import tempfile
 import time
@@ -51,8 +50,7 @@ class CftLaunchOptions:
     start_url: str = ""
     headless: bool = True
     window_size: str = "1440,1200"
-    startup_timeout_seconds: float = 60.0
-    shutdown_timeout_seconds: float = 10.0
+    startup_timeout_seconds: float = 25.0
 
     def __post_init__(self) -> None:
         if not self.executable_path.is_absolute():
@@ -61,8 +59,6 @@ class CftLaunchOptions:
             raise ValueError("CFT user_data_dir must be absolute")
         if float(self.startup_timeout_seconds) <= 0:
             raise ValueError("CFT startup_timeout_seconds must be positive")
-        if float(self.shutdown_timeout_seconds) <= 0:
-            raise ValueError("CFT shutdown_timeout_seconds must be positive")
         if not str(self.window_size).strip():
             raise ValueError("CFT window_size is required")
 
@@ -315,48 +311,22 @@ class BrowserSession:
         )
 
     @staticmethod
-    def _singleton_owner_pid(user_data_dir: Path) -> int | None:
+    def _remove_confirmed_dead_singletons(user_data_dir: Path) -> bool:
+        """Remove singleton markers only when their owner PID is known dead."""
+
         lock_path = user_data_dir / "SingletonLock"
         try:
             target = os.readlink(lock_path)
-            return int(target.rsplit("-", 1)[-1])
+            owner_pid = int(target.rsplit("-", 1)[-1])
         except (FileNotFoundError, OSError, TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _process_alive(pid: int) -> bool:
-        try:
-            os.kill(int(pid), 0)
-        except ProcessLookupError:
             return False
-        except PermissionError:
-            return True
-        return True
-
-    @staticmethod
-    def _process_command(pid: int) -> str:
         try:
-            completed = subprocess.run(  # noqa: S603 - fixed local process inspection
-                ["/bin/ps", "-p", str(int(pid)), "-o", "command="],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=2.0,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return ""
-        return " ".join(completed.stdout.split()) if completed.returncode == 0 else ""
-
-    @staticmethod
-    def _signal_process(pid: int, value: signal.Signals) -> None:
-        os.kill(int(pid), value)
-
-    @classmethod
-    def _remove_confirmed_dead_singletons(cls, user_data_dir: Path) -> bool:
-        """Remove singleton markers only when their owner PID is known dead."""
-
-        owner_pid = cls._singleton_owner_pid(user_data_dir)
-        if owner_pid is None or cls._process_alive(owner_pid):
+            os.kill(owner_pid, 0)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return False
+        else:
             return False
         for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
             try:
@@ -366,70 +336,6 @@ class BrowserSession:
             except OSError:
                 return False
         return True
-
-    def _owned_unresponsive_cft_pid(self) -> int | None:
-        """Resolve an exact release-owned singleton or fail closed."""
-
-        options = self.cft_launch_options
-        if options is None:
-            return None
-        profile = options.user_data_dir.expanduser()
-        owner_pid = self._singleton_owner_pid(profile)
-        if owner_pid is None or not self._process_alive(owner_pid):
-            return None
-        command = self._process_command(owner_pid)
-        _base, port = self._endpoint_base()
-        executable = str(options.executable_path.expanduser())
-        profile_argument = f"--user-data-dir={profile}"
-        port_argument = f"--remote-debugging-port={port}"
-        if not command:
-            raise BrowserSessionError(
-                "blocked_browser_owner_unverified",
-                f"cannot inspect live CFT singleton owner pid={owner_pid}; refusing automatic termination",
-            )
-        if not (
-            command.startswith(f"{executable} ")
-            and profile_argument in command
-            and port_argument in command
-        ):
-            raise BrowserSessionError(
-                "blocked_browser_owner_unverified",
-                f"live singleton owner pid={owner_pid} does not match configured executable/profile/port",
-            )
-        return owner_pid
-
-    def _stop_owned_unresponsive_cft(self, owner_pid: int) -> bool:
-        """TERM one exact dedicated CFT owner; never escalate to SIGKILL."""
-
-        if self._cdp_ready():
-            return False
-        try:
-            self._signal_process(owner_pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        except (OSError, PermissionError) as exc:
-            raise BrowserSessionError(
-                "blocked_browser_restart_failed",
-                f"cannot terminate verified CFT owner pid={owner_pid}: {exc}",
-            ) from exc
-        options = self.cft_launch_options
-        assert options is not None
-        deadline = time.monotonic() + float(options.shutdown_timeout_seconds)
-        while time.monotonic() < deadline:
-            if self._cdp_ready():
-                # Some hung CFT builds recover their listener while handling
-                # TERM without exiting. Reuse that exact verified owner rather
-                # than escalating or starting a competing profile process.
-                return False
-            if not self._process_alive(owner_pid):
-                self._remove_confirmed_dead_singletons(options.user_data_dir.expanduser())
-                return True
-            self._sleep(0.1)
-        raise BrowserSessionError(
-            "blocked_browser_restart_failed",
-            f"verified CFT owner pid={owner_pid} did not exit after SIGTERM within "
-            f"{float(options.shutdown_timeout_seconds):g}s; refusing SIGKILL",
-        )
 
     def _launch_cft(self) -> None:
         options = self.cft_launch_options
@@ -494,12 +400,6 @@ class BrowserSession:
         if self._cdp_ready():
             self._ensure_keepalive_page()
             return
-        owner_pid = self._owned_unresponsive_cft_pid()
-        if owner_pid is not None:
-            stopped = self._stop_owned_unresponsive_cft(owner_pid)
-            if not stopped and self._cdp_ready():
-                self._ensure_keepalive_page()
-                return
         self._launch_cft()
         options = self.cft_launch_options
         assert options is not None  # narrowed above

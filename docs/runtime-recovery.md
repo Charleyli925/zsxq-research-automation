@@ -17,13 +17,10 @@ the next tick can safely proceed.
   notifications retain their independent identities and recovery paths.
 - The dedicated CFT session bounds same-origin automation pages before attach
   and retries one transient CDP/page-creation failure through a fresh
-  Playwright transport. If a live profile singleton has lost its CDP listener,
-  it is restarted only when executable, profile, and port all match the
-  release configuration; restart uses TERM only, reuses the same owner if its
-  listener recovers during shutdown, and fails closed on owner mismatch or a
-  timeout with no recovery. If recovery still fails, the blocked plan keeps the
+  Playwright transport. If recovery still fails, the blocked plan keeps the
   sanitized browser exception and cleanup counters, the source window remains
-  scheduled, and one reason-specific alert is deduplicated per window.
+  scheduled, and one reason-specific alert is deduplicated per window. The
+  worker never terminates a live browser process automatically.
 - Codex failure does not prevent a later source download; Lark failure does
   not discard local summary artifacts; notification delivery drains from its
   own outbox even when no PDF is due.

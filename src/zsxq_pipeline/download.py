@@ -117,8 +117,6 @@ def _reason_text(code: str) -> str:
         "blocked_browser_endpoint_unavailable": "Chrome for Testing 调试端点不可用，系统将继续重试。",
         "blocked_browser_missing": "Chrome for Testing 可执行文件不存在，需要检查运行配置。",
         "blocked_browser_configuration_invalid": "Chrome for Testing 运行配置无效，需要人工修复配置。",
-        "blocked_browser_owner_unverified": "无法确认失活浏览器进程的归属，已拒绝自动终止。",
-        "blocked_browser_restart_failed": "专用浏览器未能安全重启，需要人工检查进程状态。",
     }
     return known.get(str(code).strip(), "下载事务未完成，请检查结构化结果和 durable stage state。")
 
