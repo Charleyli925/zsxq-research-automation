@@ -21,6 +21,18 @@ from .state import PipelineState
 
 DOCUMENT_EVENT = "document_ready"
 TERMINAL_EVENTS = frozenset({"run_complete", "run_partial", "run_failed"})
+DOWNLOAD_COMPLETE_EVENT = "download_complete"
+SUMMARY_STARTED_EVENT = "summary_started"
+SUMMARY_PROGRESS_EVENT = "summary_progress"
+BATCH_COMPLETE_EVENT = "batch_complete"
+PIPELINE_STATUS_EVENTS = frozenset(
+    {
+        DOWNLOAD_COMPLETE_EVENT,
+        SUMMARY_STARTED_EVENT,
+        SUMMARY_PROGRESS_EVENT,
+        BATCH_COMPLETE_EVENT,
+    }
+)
 _ACTIVE_NOTIFICATION_STATES = frozenset({"queued", "pending", "retry_wait", "running"})
 
 
@@ -93,6 +105,37 @@ def enqueue_document_notification(
     )
 
 
+def enqueue_pipeline_status_notification(
+    state: PipelineState,
+    *,
+    event: str,
+    identity: str,
+    chat_id: str,
+    markdown: str,
+    scope_key: str,
+    terminal: bool = False,
+) -> NotificationRecord:
+    """Queue one low-frequency pipeline status with a durable cohort identity.
+
+    Status notifications are deliberately independent from a process run ID.
+    A source window can span multiple bounded worker invocations, so its start,
+    milestones, and completion must deduplicate across every invocation while
+    remaining recoverable through the shared outbox.
+    """
+
+    event_name = str(event).strip()
+    if event_name not in PIPELINE_STATUS_EVENTS:
+        raise NotificationError(f"unsupported pipeline status event: {event_name}")
+    normalized_identity = str(identity).strip()
+    if not normalized_identity:
+        raise NotificationError("pipeline status identity is required")
+    return state.enqueue_notification(
+        notification_idempotency_key(event_name, normalized_identity),
+        event=event_name,
+        payload=_payload(chat_id=chat_id, markdown=markdown, scope_key=scope_key, terminal=terminal),
+    )
+
+
 def enqueue_terminal_notification(
     state: PipelineState,
     *,
@@ -126,6 +169,78 @@ def render_document_notice(publication: PublicationRecord, *, title: str, count:
         raise NotificationError("successful publication has no remote reference")
     noun = "篇" if int(count) == 1 else "篇研报"
     return f"## 知识星球研报总结\n\n已发布《{str(title).strip() or '研报总结'}》：{int(count)} {noun}\n\n[打开文档]({reference})"
+
+
+def _source_label(source: str) -> str:
+    normalized = str(source).strip()
+    lowered = normalized.casefold()
+    if "cicc" in lowered or "domestic" in lowered or "中金" in normalized:
+        return "中金研报"
+    if "foreign" in lowered or "海外" in normalized or "外资" in normalized:
+        return "海外研报"
+    return normalized or "知识星球研报"
+
+
+def render_download_complete_notice(*, source: str, count: int) -> str:
+    """Render one exact, non-empty download result."""
+
+    total = int(count)
+    if total < 1:
+        raise NotificationError("download completion requires at least one PDF")
+    return (
+        "## 知识星球研报｜下载完成\n\n"
+        f"{_source_label(source)}：本轮新增 **{total}** 份 PDF，已进入待总结队列。"
+    )
+
+
+def render_summary_started_notice(*, source: str, total: int) -> str:
+    """Render the single start notice for one durable source window."""
+
+    count = int(total)
+    if count < 1:
+        raise NotificationError("summary start requires at least one PDF")
+    return (
+        "## 知识星球研报｜开始总结\n\n"
+        f"{_source_label(source)}：本批共 **{count}** 份 PDF。后续仅在关键进度和完成时更新。"
+    )
+
+
+def render_summary_progress_notice(
+    *,
+    source: str,
+    total: int,
+    summarized: int,
+    published: int,
+    milestone: int,
+) -> str:
+    """Render one of the bounded 25/50/75 percent progress milestones."""
+
+    count = int(total)
+    summary_count = int(summarized)
+    publish_count = int(published)
+    percentage = int(milestone)
+    if count < 1 or not (0 <= summary_count <= count) or not (0 <= publish_count <= count):
+        raise NotificationError("pipeline progress counts are inconsistent")
+    if percentage not in {25, 50, 75}:
+        raise NotificationError("pipeline progress milestone must be 25, 50, or 75")
+    return (
+        f"## 知识星球研报｜进度 {percentage}%\n\n"
+        f"{_source_label(source)}｜总结 **{summary_count}/{count}**｜发布 **{publish_count}/{count}**"
+    )
+
+
+def render_batch_complete_notice(*, source: str, total: int, summarized: int, published: int) -> str:
+    """Render the one terminal success notice for a durable source window."""
+
+    count = int(total)
+    summary_count = int(summarized)
+    publish_count = int(published)
+    if count < 1 or summary_count != count or publish_count != count:
+        raise NotificationError("batch completion requires every PDF to be summarized and published")
+    return (
+        "## ✅ 知识星球研报｜本批完成\n\n"
+        f"{_source_label(source)}｜总结 **{summary_count}/{count}**｜发布 **{publish_count}/{count}**"
+    )
 
 
 def export_notification_audit(state: PipelineState, path: str | Path) -> None:
@@ -263,15 +378,25 @@ class NotificationDrainer:
 
 
 __all__ = [
+    "BATCH_COMPLETE_EVENT",
     "DOCUMENT_EVENT",
+    "DOWNLOAD_COMPLETE_EVENT",
+    "PIPELINE_STATUS_EVENTS",
+    "SUMMARY_PROGRESS_EVENT",
+    "SUMMARY_STARTED_EVENT",
     "TERMINAL_EVENTS",
     "LarkNotificationClient",
     "NotificationDelivery",
     "NotificationDrainer",
     "NotificationError",
     "enqueue_document_notification",
+    "enqueue_pipeline_status_notification",
     "enqueue_terminal_notification",
     "export_notification_audit",
     "notification_idempotency_key",
+    "render_batch_complete_notice",
+    "render_download_complete_notice",
     "render_document_notice",
+    "render_summary_progress_notice",
+    "render_summary_started_notice",
 ]

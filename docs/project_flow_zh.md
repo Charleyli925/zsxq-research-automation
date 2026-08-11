@@ -103,7 +103,9 @@ blocked 或 retry 状态。一个坏 PDF 不应阻塞同批其余文件。
 
 群通知与业务事务分离。`lark-cli im +messages-send --as bot` 必须附稳定
 idempotency key；消息失败只留在 notification outbox 里按退避重试，不撤销
-已成功的文档。每份文档链接优先于批次终态消息投递。
+已成功的文档。非空下载窗口只发送一次精确 PDF 数量和一次总结开始；大批次只在
+综合总结/发布进度首次跨过 25/50/75% 时发送最高新里程碑，小批次可直接进入完成。
+每份文档链接优先于批次终态消息投递；空跑、busy、冷却和逐 PDF 进度保持静默。
 
 `LARKSUITE_CLI_CONFIG_DIR` 可以继续指向已有已验证的 profile，即使路径名
 含有 `openclaw`；这只是 profile 的历史名字，本 PR 不迁移或删除它。

@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from zsxq_pipeline.config import load_pipeline_config
 from zsxq_pipeline.lock import runtime_lock
+from zsxq_pipeline.model import Stage
+from zsxq_pipeline.notify import (
+    BATCH_COMPLETE_EVENT,
+    DOWNLOAD_COMPLETE_EVENT,
+    SUMMARY_PROGRESS_EVENT,
+    SUMMARY_STARTED_EVENT,
+)
 from zsxq_pipeline.state import PipelineState
 from zsxq_pipeline.worker import PipelineWorker
 
@@ -54,6 +62,14 @@ target = "test"
         encoding="utf-8",
     )
     return load_pipeline_config(path)
+
+
+def _notification_config(tmp_path):
+    config = _config(tmp_path)
+    return replace(
+        config,
+        lark=replace(config.lark, notifications_enabled=True, target_chat_id="oc_test"),
+    )
 
 
 def test_tick_isolates_source_failures_and_still_drains_outbox(tmp_path):
@@ -232,3 +248,108 @@ def test_covered_later_window_is_settled_without_a_second_browser_run(tmp_path):
     )
     assert worker._run_download_window(row) is None
     assert calls == []
+
+
+def test_successful_nonempty_download_queues_one_exact_count_status(tmp_path):
+    config = _notification_config(tmp_path)
+    start = datetime(2026, 8, 10, 7, 0, tzinfo=UTC)
+    end = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        state.schedule_source_window(
+            "foreign",
+            start,
+            end,
+            due_cursor=end,
+            truncated=False,
+        )
+
+    def download(request):
+        return SimpleNamespace(
+            status="success",
+            source=request.source,
+            checkpoint_eligible=True,
+            downloaded_entries=tuple({"filename": f"report-{index}.pdf"} for index in range(1, 4)),
+        )
+
+    outcome = PipelineWorker(
+        config,
+        download_runner=download,
+        outbox_runner=lambda max_items: (),
+    ).run_stage("download")
+
+    assert outcome.status == "success"
+    with PipelineState.open(config.runtime.database) as state:
+        notifications = state.list_notifications()
+        assert [item.event for item in notifications] == [DOWNLOAD_COMPLETE_EVENT]
+        assert "本轮新增 **3** 份 PDF" in notifications[0].payload["markdown"]
+
+
+def test_process_statuses_are_one_start_one_milestone_then_one_completion(tmp_path):
+    config = _notification_config(tmp_path)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        window = state.register_source_window(
+            "foreign",
+            datetime(2026, 8, 10, 7, 0, tzinfo=UTC),
+            datetime(2026, 8, 10, 8, 0, tzinfo=UTC),
+        )
+        for index, seed in enumerate("abcdef12", start=1):
+            document = state.upsert_document(
+                "foreign",
+                f"source-file-{index}",
+                filename=f"report-{index}.pdf",
+                source_path=f"/library/report-{index}.pdf",
+                source_window_id=window,
+            )
+            state.record_artifact(
+                document.id,
+                kind="pdf",
+                path=f"/library/report-{index}.pdf",
+                pdf_sha256=seed * 64,
+            )
+            extractor_version = config.pipeline.extractor_version or "ocr-geometry-v2"
+            workflow = f"extract:{extractor_version}"
+            state.ensure_stage(document.id, Stage.TEXT_EXTRACT, workflow)
+            claim = state.claim_due_stage(Stage.TEXT_EXTRACT, workflow, document_ids=(document.id,))
+            assert claim is not None
+            state.complete_stage(claim)
+
+    def process(source, rows):
+        with PipelineState.open(config.runtime.database) as state:
+            state.migrate()
+            for row in rows:
+                for stage, workflow in (
+                    (Stage.SUMMARY, "summary:test"),
+                    (Stage.PUBLISH, "publish:test"),
+                ):
+                    state.ensure_stage(int(row["id"]), stage, workflow)
+                    claim = state.claim_due_stage(stage, workflow, document_ids=(int(row["id"]),))
+                    assert claim is not None
+                    state.complete_stage(claim)
+        return SimpleNamespace(status="success", failures=())
+
+    worker = PipelineWorker(
+        config,
+        process_runner=process,
+        outbox_runner=lambda max_items: (),
+    )
+    assert worker.run_stage("process").processed == 4
+    with PipelineState.open(config.runtime.database) as state:
+        first_events = [item.event for item in state.list_notifications()]
+        assert first_events == [SUMMARY_STARTED_EVENT, SUMMARY_PROGRESS_EVENT]
+        progress = state.list_notifications()[-1]
+        assert "进度 50%" in progress.payload["markdown"]
+        assert "总结 **4/8**｜发布 **4/8**" in progress.payload["markdown"]
+
+    assert worker.run_stage("process").processed == 4
+    assert worker.run_stage("process").processed == 0
+    with PipelineState.open(config.runtime.database) as state:
+        notifications = state.list_notifications()
+        assert [item.event for item in notifications] == [
+            SUMMARY_STARTED_EVENT,
+            SUMMARY_PROGRESS_EVENT,
+            BATCH_COMPLETE_EVENT,
+        ]
+        assert "总结 **8/8**｜发布 **8/8**" in notifications[-1].payload["markdown"]
+        assert notifications[-1].payload["terminal"] is True

@@ -18,7 +18,20 @@ from .config import PipelineConfig, SourceConfig
 from .download import DownloadOutcome, DownloadPipeline, DownloadRequest
 from .lark import LarkCliConfig, LarkNotifier
 from .lock import runtime_lock
-from .notify import NotificationDelivery, NotificationDrainer, export_notification_audit
+from .notify import (
+    BATCH_COMPLETE_EVENT,
+    DOWNLOAD_COMPLETE_EVENT,
+    SUMMARY_PROGRESS_EVENT,
+    SUMMARY_STARTED_EVENT,
+    NotificationDelivery,
+    NotificationDrainer,
+    enqueue_pipeline_status_notification,
+    export_notification_audit,
+    render_batch_complete_notice,
+    render_download_complete_notice,
+    render_summary_progress_notice,
+    render_summary_started_notice,
+)
 from .process import DigestProcessor, ProcessConfig, ProcessOutcome, ProcessRequest
 from .scheduler import PipelineScheduler, ScheduledWindow
 from .state import PipelineState
@@ -184,6 +197,10 @@ class PipelineWorker:
                     continue
                 if outcome.status == "success":
                     downloaded += 1
+                    try:
+                        self._queue_download_complete(row, outcome)
+                    except Exception as exc:
+                        failures.append(f"notify:{outcome.source}:download_complete:{type(exc).__name__}")
                 elif outcome.status != "busy":
                     failures.append(f"download:{outcome.source}:{outcome.status}")
 
@@ -214,6 +231,16 @@ class PipelineWorker:
                 if not rows:
                     continue
                 try:
+                    queued_summary_start = self._queue_summary_starts(rows)
+                except Exception as exc:
+                    failures.append(f"notify:{source.name}:summary_started:{type(exc).__name__}")
+                    queued_summary_start = False
+                # A start message is useful only before the potentially long
+                # model stage.  The durable outbox still keeps processing
+                # independent if Lark is temporarily unavailable.
+                if queued_summary_start and "outbox" in stages and not self._expired(deadline):
+                    drain_outbox()
+                try:
                     outcome = self._process_runner(source.name, tuple(rows))
                 except Exception as exc:
                     failures.append(f"process:{source.name}:{type(exc).__name__}")
@@ -221,6 +248,10 @@ class PipelineWorker:
                     continue
                 processed += len(rows)
                 remaining -= len(rows)
+                try:
+                    self._queue_summary_progress(rows)
+                except Exception as exc:
+                    failures.append(f"notify:{source.name}:summary_progress:{type(exc).__name__}")
                 if outcome.status == "partial":
                     failure_count = len(tuple(getattr(outcome, "failures", ()) or ()))
                     failures.append(f"process:{source.name}:partial:{failure_count}")
@@ -245,6 +276,132 @@ class PipelineWorker:
 
     def _extractor_version(self) -> str:
         return self.config.pipeline.extractor_version or "ocr-geometry-v2"
+
+    def _notifications_configured(self) -> bool:
+        return self.config.lark.notifications_enabled and bool(self.config.lark.target_chat_id)
+
+    @staticmethod
+    def _window_scope(source_window_id: int) -> str:
+        return f"source-window:{int(source_window_id)}"
+
+    @staticmethod
+    def _source_window_ids(rows: tuple[Mapping[str, Any], ...] | list[Mapping[str, Any]]) -> tuple[int, ...]:
+        values: set[int] = set()
+        for row in rows:
+            value = row.get("source_window_id")
+            if value is None:
+                continue
+            try:
+                window_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if window_id > 0:
+                values.add(window_id)
+        return tuple(sorted(values))
+
+    def _queue_download_complete(self, row: Mapping[str, Any], outcome: DownloadOutcome) -> None:
+        """Queue one exact non-empty download count for a scheduled window."""
+
+        if not self._notifications_configured():
+            return
+        entries = tuple(getattr(outcome, "downloaded_entries", ()) or ())
+        if not entries:
+            return
+        try:
+            window_id = int(row["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorkerError("download notification requires a durable source window id") from exc
+        scope = self._window_scope(window_id)
+        with PipelineState.open(self.config.runtime.database) as state:
+            state.migrate()
+            enqueue_pipeline_status_notification(
+                state,
+                event=DOWNLOAD_COMPLETE_EVENT,
+                identity=scope,
+                chat_id=self.config.lark.target_chat_id,
+                markdown=render_download_complete_notice(source=outcome.source, count=len(entries)),
+                scope_key=scope,
+            )
+
+    def _queue_summary_starts(self, rows: list[Mapping[str, Any]]) -> bool:
+        """Queue at most one start status for each durable source window."""
+
+        if not self._notifications_configured():
+            return False
+        created = False
+        with PipelineState.open(self.config.runtime.database) as state:
+            state.migrate()
+            for window_id in self._source_window_ids(rows):
+                progress = state.source_window_progress(window_id)
+                if progress is None or int(progress["total"]) < 1:
+                    continue
+                scope = self._window_scope(window_id)
+                record = enqueue_pipeline_status_notification(
+                    state,
+                    event=SUMMARY_STARTED_EVENT,
+                    identity=scope,
+                    chat_id=self.config.lark.target_chat_id,
+                    markdown=render_summary_started_notice(
+                        source=str(progress["source"]),
+                        total=int(progress["total"]),
+                    ),
+                    scope_key=scope,
+                )
+                created = record.created or created
+        return created
+
+    def _queue_summary_progress(self, rows: list[Mapping[str, Any]]) -> None:
+        """Queue only the highest newly reached milestone or terminal success."""
+
+        if not self._notifications_configured():
+            return
+        with PipelineState.open(self.config.runtime.database) as state:
+            state.migrate()
+            for window_id in self._source_window_ids(rows):
+                progress = state.source_window_progress(window_id)
+                if progress is None:
+                    continue
+                total = int(progress["total"])
+                summarized = int(progress["summarized"])
+                published = int(progress["published"])
+                if total < 1:
+                    continue
+                scope = self._window_scope(window_id)
+                if summarized == total and published == total:
+                    enqueue_pipeline_status_notification(
+                        state,
+                        event=BATCH_COMPLETE_EVENT,
+                        identity=scope,
+                        chat_id=self.config.lark.target_chat_id,
+                        markdown=render_batch_complete_notice(
+                            source=str(progress["source"]),
+                            total=total,
+                            summarized=summarized,
+                            published=published,
+                        ),
+                        scope_key=scope,
+                        terminal=True,
+                    )
+                    continue
+                percentage = ((summarized + published) * 100) // (2 * total)
+                reached = [milestone for milestone in (25, 50, 75) if percentage >= milestone]
+                if not reached:
+                    continue
+                milestone = reached[-1]
+                enqueue_pipeline_status_notification(
+                    state,
+                    event=SUMMARY_PROGRESS_EVENT,
+                    identity=f"{scope}:milestone:{milestone}",
+                    chat_id=self.config.lark.target_chat_id,
+                    markdown=render_summary_progress_notice(
+                        source=str(progress["source"]),
+                        total=total,
+                        summarized=summarized,
+                        published=published,
+                        milestone=milestone,
+                    ),
+                    scope_key=scope,
+                )
 
     def _download_request(self, row: Mapping[str, Any]) -> DownloadRequest:
         source_name = str(row.get("source") or "").strip()

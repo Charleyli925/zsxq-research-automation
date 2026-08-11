@@ -71,8 +71,12 @@ of creating or appending it twice.
 
 `LarkNotifier` uses `lark-cli` as `bot` with a stable idempotency key. The
 notification outbox is independent from publication state: a failed message
-is retried later and never rolls back a successful document. Document links
-are delivered before a terminal batch summary.
+is retried later and never rolls back a successful document. Each non-empty
+source window emits one exact download count and one summary-start status.
+Large batches emit only the highest newly reached 25/50/75 percent milestone,
+with summary and publication counts shown together; small batches may go
+straight to their single completion status. Document links are delivered
+before a terminal batch summary.
 
 ## 6. Durable state
 
