@@ -20,6 +20,10 @@
   <dict>
     <key>HOME</key>
     <string>__HOME__</string>
+    <key>NO_PROXY</key>
+    <string>127.0.0.1,localhost</string>
+    <key>no_proxy</key>
+    <string>127.0.0.1,localhost</string>
     <key>PATH</key>
     <string>__PATH__</string>
     <key>ZSXQ_PIPELINE_RUNTIME_ROOT</key>
