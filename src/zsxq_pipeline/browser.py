@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -49,6 +50,7 @@ class CftLaunchOptions:
     user_data_dir: Path
     start_url: str = ""
     headless: bool = True
+    background: bool = True
     window_size: str = "1440,1200"
     startup_timeout_seconds: float = 25.0
 
@@ -349,15 +351,14 @@ class BrowserSession:
         profile = options.user_data_dir.expanduser()
         profile.mkdir(parents=True, exist_ok=True)
         self._remove_confirmed_dead_singletons(profile)
-        command = [
-            str(executable),
+        chrome_arguments = [
             f"--remote-debugging-port={port}",
             f"--user-data-dir={profile}",
             "--no-first-run",
             "--no-default-browser-check",
         ]
         if options.headless:
-            command.extend(
+            chrome_arguments.extend(
                 [
                     "--headless=new",
                     f"--window-size={options.window_size}",
@@ -366,7 +367,16 @@ class BrowserSession:
                 ]
             )
         if options.start_url:
-            command.append(options.start_url)
+            chrome_arguments.append(options.start_url)
+        command = [str(executable), *chrome_arguments]
+        if not options.headless and options.background and sys.platform == "darwin":
+            app_bundle = next((parent for parent in executable.parents if parent.suffix == ".app"), None)
+            if app_bundle is not None:
+                # ``open -g`` creates a real headed browser window without
+                # activating it.  The user can bring that existing CFT window
+                # forward from the Dock whenever login or inspection is
+                # needed, while scheduled cold starts do not steal focus.
+                command = ["/usr/bin/open", "-g", "-n", str(app_bundle), "--args", *chrome_arguments]
         log_path = Path(tempfile.gettempdir()) / "zsxq-cft-keepalive.log"
         with log_path.open("ab") as log_handle:
             subprocess.Popen(  # noqa: S603 - command is explicit release configuration

@@ -258,6 +258,7 @@ def test_download_source_cft_startup_options_are_typed(tmp_path):
                     f'cft_user_data_dir = "{profile}"',
                     'cft_start_url = "https://wx.zsxq.com/group/example"',
                     "cft_headless = false",
+                    "cft_background = true",
                     'cft_window_size = "1280,800"',
                 ]
             ),
@@ -270,4 +271,5 @@ def test_download_source_cft_startup_options_are_typed(tmp_path):
     assert source.cft_user_data_dir == profile
     assert source.cft_start_url.endswith("/example")
     assert source.cft_headless is False
+    assert source.cft_background is True
     assert source.cft_window_size == "1280,800"

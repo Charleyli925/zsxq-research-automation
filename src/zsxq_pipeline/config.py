@@ -38,6 +38,7 @@ class SourceConfig:
     cft_user_data_dir: Path | None = None
     cft_start_url: str = ""
     cft_headless: bool = True
+    cft_background: bool = True
     cft_window_size: str = "1440,1200"
     # Scheduling is opt-in per source.  An empty tuple keeps an imported source
     # available for durable backlog recovery without creating new windows.
@@ -285,6 +286,7 @@ def _parse_sources(root: Path, raw: Any) -> dict[str, SourceConfig]:
                 "cft_user_data_dir",
                 "cft_start_url",
                 "cft_headless",
+                "cft_background",
                 "cft_window_size",
                 "schedule_times",
                 "max_catchup_seconds",
@@ -306,6 +308,9 @@ def _parse_sources(root: Path, raw: Any) -> dict[str, SourceConfig]:
             ),
             cft_start_url=str(source.get("cft_start_url") or "").strip(),
             cft_headless=_boolean(source, "cft_headless", table_name=f"sources.{source_name}", default=True),
+            cft_background=_boolean(
+                source, "cft_background", table_name=f"sources.{source_name}", default=True
+            ),
             cft_window_size=str(source.get("cft_window_size") or "1440,1200").strip() or "1440,1200",
             schedule_times=_schedule_times(source, table_name=f"sources.{source_name}"),
             max_catchup_seconds=(

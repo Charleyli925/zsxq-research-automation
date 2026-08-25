@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 import time
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -95,6 +96,37 @@ def test_summary_schema_requires_exact_ordered_paths_and_no_extra_fields(tmp_pat
         validate_summary_payload(
             {**payload, "summaries": [_entry(paths[1]), _entry(paths[0])]}, expected_paths=paths
         )
+
+
+def test_summary_preserves_nfd_manifest_key_while_accepting_equivalent_model_echo(tmp_path):
+    exact_path = str(tmp_path / unicodedata.normalize("NFD", "BÉIS.pdf"))
+    model_path = unicodedata.normalize("NFC", exact_path)
+    manifest = {
+        "files": [
+            {
+                "path": exact_path,
+                "filename": Path(exact_path).name,
+                "pdf_sha256": _sha("unicode-pdf"),
+                "text_extract_profile": "extract-fixture-v1",
+            }
+        ]
+    }
+
+    identities = identities_for_manifest(manifest, prompt_version="prompt-v1", model="model-v1", reasoning="medium")
+    result = validate_summary_payload(
+        {
+            "status": "success",
+            "handled_count": 1,
+            "handled_paths": [model_path],
+            "error": None,
+            "summaries": [_entry(model_path)],
+        },
+        expected_paths=(exact_path,),
+    )
+
+    assert list(identities) == [exact_path]
+    assert result.handled_paths == (exact_path,)
+    assert result.summaries[0].path == exact_path
 
 
 def test_summary_store_reuses_only_exact_identity_and_refuses_conflicting_content(tmp_path):

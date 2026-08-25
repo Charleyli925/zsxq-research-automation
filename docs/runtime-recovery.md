@@ -43,6 +43,13 @@ manual action. `blocked_detail` distinguishes endpoint failure, connection
 failure, and page-target exhaustion; do not clear the browser profile or
 delete login/session data to force recovery.
 
+On macOS, an operator-accessible dedicated browser should use
+`cft_headless = false` and `cft_background = true`. A scheduler cold start then
+uses Launch Services without activating CFT, but creates a real window that can
+be selected from the Dock for login or inspection. Changing an already-running
+headless process requires an explicit idle-gated browser restart; the worker
+does not terminate a live profile merely because configuration changed.
+
 Local CDP health must be checked through the package's proxy-free HTTP client
 or an explicitly direct probe. Ambient macOS HTTP proxy settings are not valid
 evidence for `127.0.0.1:9223`; a proxied timeout must never trigger a browser

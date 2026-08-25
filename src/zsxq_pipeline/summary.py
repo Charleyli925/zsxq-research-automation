@@ -64,12 +64,17 @@ def _required_text(value: object, *, field: str) -> str:
 
 
 def _canonical_path(value: object, *, field: str) -> str:
-    text = _required_text(value, field=field)
-    # Do not collapse internal whitespace or rewrite separators.  The provider
-    # receives exactly these strings and its schema-level validator compares
-    # them byte-for-byte after outer whitespace trimming.  NFC only avoids an
-    # accidental Unicode representation distinction in a local manifest.
-    return unicodedata.normalize("NFC", text)
+    # A filesystem path is also an in-memory dictionary key throughout the
+    # processor.  Preserve its exact representation: macOS commonly returns
+    # NFD filenames, and rewriting one key to NFC makes a present PDF look
+    # absent to later stages.
+    return _required_text(value, field=field)
+
+
+def _path_identity(value: object, *, field: str) -> str:
+    """Return a comparison-only Unicode identity without rewriting the path."""
+
+    return unicodedata.normalize("NFC", _canonical_path(value, field=field))
 
 
 def _sha256_text(value: str) -> str:
@@ -197,9 +202,10 @@ def manifest_expected_paths(manifest: Mapping[str, Any]) -> tuple[str, ...]:
         if not isinstance(item, Mapping):
             raise SummaryValidationError(f"manifest.files[{index}] must be an object")
         path = _canonical_path(item.get("path"), field=f"manifest.files[{index}].path")
-        if path in seen:
+        identity = _path_identity(path, field=f"manifest.files[{index}].path")
+        if identity in seen:
             raise SummaryValidationError(f"manifest has duplicate path: {path}")
-        seen.add(path)
+        seen.add(identity)
         paths.append(path)
     return tuple(paths)
 
@@ -293,13 +299,13 @@ def _validate_entry(raw: object, *, expected_path: str) -> SummaryEntry:
     if missing:
         raise SummaryValidationError(f"summary is missing required field(s): {', '.join(missing)}")
     path = _canonical_path(raw.get("path"), field="summary.path")
-    if path != expected_path:
+    if _path_identity(path, field="summary.path") != _path_identity(expected_path, field="expected path"):
         raise SummaryValidationError(f"summary path does not match manifest order: {path}")
     quality_hint = raw.get("quality_hint")
     if not isinstance(quality_hint, str):
         raise SummaryValidationError("summary.quality_hint must be a string")
     return SummaryEntry(
-        path=path,
+        path=_canonical_path(expected_path, field="expected path"),
         filename=_required_text(raw.get("filename"), field="summary.filename"),
         title=_required_text(raw.get("title"), field="summary.title"),
         quality_hint=quality_hint.strip(),
@@ -353,10 +359,11 @@ def validate_summary_payload(payload: Mapping[str, Any], *, expected_paths: Sequ
     if not isinstance(raw_summaries, list):
         raise SummaryValidationError("summaries must be a list")
 
-    normalized_expected = tuple(_canonical_path(path, field="expected path") for path in expected_paths)
+    exact_expected = tuple(_canonical_path(path, field="expected path") for path in expected_paths)
+    normalized_expected = tuple(_path_identity(path, field="expected path") for path in exact_expected)
     if len(set(normalized_expected)) != len(normalized_expected):
         raise SummaryValidationError("expected_paths must not contain duplicates")
-    normalized_handled = tuple(_canonical_path(path, field="handled path") for path in raw_paths)
+    normalized_handled = tuple(_path_identity(path, field="handled path") for path in raw_paths)
 
     if status == "failed":
         if "error" not in keys:
@@ -380,9 +387,9 @@ def validate_summary_payload(payload: Mapping[str, Any], *, expected_paths: Sequ
         )
     entries = tuple(
         _validate_entry(entry, expected_path=expected_path)
-        for entry, expected_path in zip(raw_summaries, normalized_expected, strict=True)
+        for entry, expected_path in zip(raw_summaries, exact_expected, strict=True)
     )
-    return SummaryResult("success", handled_count, normalized_handled, entries)
+    return SummaryResult("success", handled_count, exact_expected, entries)
 
 
 def validate_provider_result(result: Any, *, expected_paths: Sequence[str]) -> SummaryResult:
@@ -444,10 +451,12 @@ class SummaryStore:
         if not isinstance(raw_entry, Mapping):
             raise SummaryCacheCorruptionError("summary cache entry is missing")
         path = _canonical_path(raw_entry.get("path"), field="cache entry path")
-        if expected_path is not None and path != _canonical_path(expected_path, field="expected path"):
+        if expected_path is not None and _path_identity(path, field="cache entry path") != _path_identity(
+            expected_path, field="expected path"
+        ):
             return None
         try:
-            entry = _validate_entry(raw_entry, expected_path=path)
+            entry = _validate_entry(raw_entry, expected_path=expected_path or path)
         except SummaryValidationError as exc:
             raise SummaryCacheCorruptionError("summary cache entry is invalid") from exc
         if entry.markdown != markdown:
