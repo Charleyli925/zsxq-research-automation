@@ -60,6 +60,10 @@ python3 -m venv .venv
 ```
 
 Playwright connects to an existing, authorized Chrome for Testing profile.
+For an operator-accessible macOS session, set `cft_headless = false` and
+`cft_background = true`. The scheduler then launches a real CFT window without
+activating it; clicking Chrome for Testing in the Dock brings that same
+isolated profile forward for login or inspection.
 Install a local browser only if your deployment requires one:
 
 ```bash

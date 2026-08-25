@@ -514,6 +514,7 @@ class PipelineWorker:
             user_data_dir=profile,
             start_url=source.cft_start_url,
             headless=source.cft_headless,
+            background=source.cft_background,
             window_size=source.cft_window_size,
         )
 

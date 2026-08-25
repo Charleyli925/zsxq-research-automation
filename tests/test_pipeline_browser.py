@@ -286,3 +286,45 @@ def test_cft_startup_requires_an_executable_only_when_cdp_is_unavailable(tmp_pat
 
     with pytest.raises(BrowserSessionError, match="blocked_browser_missing"):
         session._ensure_cft_ready()
+
+
+def test_headed_cft_launches_as_a_background_macos_window(tmp_path, monkeypatch):
+    executable = tmp_path / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fixture")
+    executable.chmod(0o755)
+    options = CftLaunchOptions(
+        executable_path=executable,
+        user_data_dir=tmp_path / "profile",
+        start_url="https://wx.zsxq.com/group/fixture",
+        headless=False,
+        background=True,
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(browser_module.sys, "platform", "darwin")
+    monkeypatch.setattr(browser_module.subprocess, "Popen", lambda command, **_kwargs: commands.append(command))
+
+    BrowserSession("http://127.0.0.1:9223", cft_launch_options=options)._launch_cft()
+
+    command = commands[0]
+    assert command[:5] == ["/usr/bin/open", "-g", "-n", str(executable.parents[2]), "--args"]
+    assert "--remote-debugging-port=9223" in command
+    assert f"--user-data-dir={tmp_path / 'profile'}" in command
+    assert "--headless=new" not in command
+    assert command[-1] == options.start_url
+
+
+def test_headless_cft_keeps_direct_background_only_launch(tmp_path, monkeypatch):
+    executable = tmp_path / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fixture")
+    executable.chmod(0o755)
+    options = CftLaunchOptions(executable_path=executable, user_data_dir=tmp_path / "profile", headless=True)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(browser_module.sys, "platform", "darwin")
+    monkeypatch.setattr(browser_module.subprocess, "Popen", lambda command, **_kwargs: commands.append(command))
+
+    BrowserSession("http://127.0.0.1:9223", cft_launch_options=options)._launch_cft()
+
+    assert commands[0][0] == str(executable)
+    assert "--headless=new" in commands[0]

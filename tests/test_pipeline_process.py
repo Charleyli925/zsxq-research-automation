@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -300,6 +301,35 @@ def test_process_uses_extracted_text_direct_codex_and_lark_boundaries(tmp_path):
     assert sidecars.archives == [((str(pdf),), next(iter(publisher.documents)))]
     assert json.loads((runtime / "last_result.json").read_text(encoding="utf-8"))["status"] == "success"
     assert "openclaw" not in (runtime / "run_status.json").read_text(encoding="utf-8").lower()
+
+
+def test_process_completes_an_nfd_pdf_path_without_leaking_summary_claims(tmp_path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    pdf = tmp_path / unicodedata.normalize("NFD", "高盛-BÉIS-260814.pdf")
+    pdf.write_bytes(b"fixture PDF")
+    provider = FakeProvider()
+    processor = DigestProcessor(
+        _config(runtime),
+        extractor=FakeExtractor(),
+        provider=provider,
+        publisher=FakePublisher(),
+        notifier=FakeNotifier(),
+        clock=lambda: NOW,
+    )
+
+    outcome = processor.run(ProcessRequest(batch_file=_batch(tmp_path / "unicode-batch.json", [pdf])))
+
+    assert outcome.status == "success"
+    assert provider.requests[0].expected_paths == (str(pdf),)
+    with PipelineState.open(runtime / "state" / "pipeline.sqlite3") as state:
+        attempts = state._connection.execute(
+            "SELECT state, lease_token, lease_expires_at_epoch FROM stage_attempts WHERE stage=?",
+            (Stage.SUMMARY.value,),
+        ).fetchall()
+    assert [(row["state"], row["lease_token"], row["lease_expires_at_epoch"]) for row in attempts] == [
+        (StageState.SUCCEEDED.value, None, None)
+    ]
 
 
 def test_process_summary_cache_hit_skips_provider_after_a_previous_run(tmp_path):

@@ -15,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -171,6 +172,12 @@ _ROOT_FIELDS = frozenset({"status", "handled_count", "handled_paths", "summaries
 _SUMMARY_FIELDS = frozenset({"path", "filename", "title", "quality_hint", "markdown"})
 
 
+def _path_identity(value: str) -> str:
+    """Compare model echoes without changing the trusted filesystem path."""
+
+    return unicodedata.normalize("NFC", str(value).strip())
+
+
 def summary_schema_path() -> Path:
     """Return the installed fixed schema used for every direct summary call."""
 
@@ -209,9 +216,10 @@ def validate_summary_payload(payload: Any, *, expected_paths: Sequence[str]) -> 
 
     errors: list[str] = []
     expected = tuple(str(path).strip() for path in expected_paths)
+    expected_identities = tuple(_path_identity(path) for path in expected)
     if not expected or any(not path for path in expected):
         errors.append("expected_paths must contain one or more non-empty paths")
-    elif len(set(expected)) != len(expected):
+    elif len(set(expected_identities)) != len(expected_identities):
         errors.append("expected_paths must be unique")
 
     if not isinstance(payload, Mapping):
@@ -237,7 +245,7 @@ def validate_summary_payload(payload: Any, *, expected_paths: Sequence[str]) -> 
     if not isinstance(handled_paths, list) or any(not isinstance(path, str) or not path for path in handled_paths):
         errors.append("handled_paths must be an array of non-empty strings")
         handled_paths = []
-    elif len(set(handled_paths)) != len(handled_paths):
+    elif len({_path_identity(path) for path in handled_paths}) != len(handled_paths):
         errors.append("handled_paths must not contain duplicates")
 
     summaries = value.get("summaries")
@@ -274,9 +282,9 @@ def validate_summary_payload(payload: Any, *, expected_paths: Sequence[str]) -> 
     if status == "success":
         if value.get("error") is not None:
             errors.append("success output requires error to be null")
-        if handled_paths != list(expected):
+        if [_path_identity(path) for path in handled_paths] != list(expected_identities):
             errors.append("success handled_paths must exactly equal the job manifest paths in order")
-        if validated_summary_paths != list(expected):
+        if [_path_identity(path) for path in validated_summary_paths] != list(expected_identities):
             errors.append("success summary paths must exactly equal the job manifest paths in order")
         if handled_count != len(expected):
             errors.append("success handled_count must equal the manifest path count")

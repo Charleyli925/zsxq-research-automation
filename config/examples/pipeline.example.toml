@@ -36,7 +36,8 @@ cdp_endpoint = "http://127.0.0.1:9223"
 cft_executable = "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
 cft_user_data_dir = "/absolute/path/to/zsxq-cft-profile"
 cft_start_url = "https://wx.zsxq.com/group/YOUR_GROUP_ID"
-cft_headless = true
+cft_headless = false
+cft_background = true
 cft_window_size = "1440,1200"
 workflow_version = "download:v1"
 # Preserve the existing foreign-report logical times after cutover.
@@ -51,7 +52,8 @@ cdp_endpoint = "http://127.0.0.1:9223"
 cft_executable = "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
 cft_user_data_dir = "/absolute/path/to/zsxq-cft-profile"
 cft_start_url = "https://wx.zsxq.com/group/YOUR_GROUP_ID"
-cft_headless = true
+cft_headless = false
+cft_background = true
 cft_window_size = "1440,1200"
 workflow_version = "download:v1"
 # Preserve the existing CICC logical times after cutover.

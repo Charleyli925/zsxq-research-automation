@@ -32,3 +32,7 @@ All notable changes will be documented here.
   a fresh transport, forced local CDP HTTP to bypass ambient system proxies,
   closed the API-discovery diagnostic page, persisted exact blocked-browser
   evidence, and added one deduplicated retry alert per source window and reason.
+- Added a headed-background CFT mode on macOS so scheduled cold starts do not
+  take focus while the isolated window remains available from the Dock, and
+  preserved exact NFD filesystem paths across summary identity, cache, and
+  publication stages to prevent Unicode-equivalent names from leaking leases.
