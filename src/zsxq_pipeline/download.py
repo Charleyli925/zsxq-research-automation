@@ -17,9 +17,10 @@ import sys
 import tempfile
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from zoneinfo import ZoneInfo
 
 from ._time import require_aware
 from .browser import BrowserSession, BrowserSessionError, CftLaunchOptions
@@ -29,6 +30,16 @@ from .state import PipelineState
 
 class DownloadError(RuntimeError):
     """A deterministic download transaction could not reach reconciliation."""
+
+
+DOWNLOAD_RATE_LIMIT_REASON = "download_rate_limited_until_next_day"
+ZSXQ_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+def _next_zsxq_day(now: datetime | None = None) -> datetime:
+    instant = (now or datetime.now(UTC)).astimezone(ZSXQ_TIMEZONE)
+    next_date = instant.date() + timedelta(days=1)
+    return datetime.combine(next_date, time.min, tzinfo=ZSXQ_TIMEZONE).astimezone(UTC)
 
 
 def _repo_root() -> Path:
@@ -96,7 +107,12 @@ def _reason_category(reason_code: str) -> ErrorCategory:
         return ErrorCategory.AUTH
     if code == "source_content_protected":
         return ErrorCategory.CONTENT
-    if code in {"playwright_action_timeout", "zsxq_page_unavailable", "zsxq_page_state_unrecognized"}:
+    if code in {
+        DOWNLOAD_RATE_LIMIT_REASON,
+        "playwright_action_timeout",
+        "zsxq_page_unavailable",
+        "zsxq_page_state_unrecognized",
+    }:
         return ErrorCategory.TRANSIENT
     if code.startswith(("api_", "blocked_browser_", "browser_")):
         return ErrorCategory.TRANSIENT
@@ -110,6 +126,7 @@ def _reason_text(code: str) -> str:
         "no_new_docs": "冻结窗口内没有新文档。",
         "no_keyword_match": "冻结窗口内没有匹配关键词的文档。",
         "download_incomplete": "至少一个 immutable plan 候选未完成对账。",
+        DOWNLOAD_RATE_LIMIT_REASON: "知识星球检测到当日下载量异常，已拒绝继续下载；下一个自然日自动恢复。",
         "scan_failed": "扫描阶段没有建立可执行的 immutable plan。",
         "download_completed": "所有可下载候选均已完成归档对账。",
         "plan_only": "已生成 immutable scan plan，未执行下载。",
@@ -490,6 +507,7 @@ class DownloadPipeline:
                     claims: dict[str, Any] = {}
                     blocked: list[Mapping[str, Any]] = []
                     satisfied: list[Mapping[str, Any]] = []
+                    rate_limited = False
                     for candidate in candidates:
                         file_id = str(candidate.get("file_id") or "").strip()
                         document_id = document_ids.get(file_id)
@@ -526,16 +544,26 @@ class DownloadPipeline:
                         )
                         attempted[file_id] = result
                         if str(result.get("status") or "") == "blocked":
-                            category = _reason_category(str(result.get("reason_code") or ""))
+                            reason_code = str(result.get("reason_code") or "")
+                            category = _reason_category(reason_code)
                             state.fail_stage(
                                 claim,
                                 category=category,
-                                error_code=str(result.get("reason_code") or "download_blocked"),
+                                error_code=reason_code or "download_blocked",
                                 error_detail=str(result.get("message") or ""),
-                                retry_at=datetime.now(UTC) + timedelta(minutes=5) if category is ErrorCategory.TRANSIENT else None,
+                                retry_at=(
+                                    _next_zsxq_day()
+                                    if reason_code == DOWNLOAD_RATE_LIMIT_REASON
+                                    else datetime.now(UTC) + timedelta(minutes=5)
+                                    if category is ErrorCategory.TRANSIENT
+                                    else None
+                                ),
                             )
                             blocked.append(result)
                             claims.pop(file_id, None)
+                            if reason_code == DOWNLOAD_RATE_LIMIT_REASON:
+                                rate_limited = True
+                                break
 
                     downloaded_results = [item for item in attempted.values() if str(item.get("status") or "") == "downloaded"]
                     finalizer_summary: Mapping[str, Any] = {}
@@ -629,7 +657,15 @@ class DownloadPipeline:
                         checkpoint_eligible=checkpoint_eligible,
                     )
                     status = "success" if checkpoint_eligible else ("partial" if downloaded_entries or satisfied else "failed")
-                    reason = "download_incomplete" if missing else ("source_content_protected" if terminal_blocked else "download_completed")
+                    reason = (
+                        DOWNLOAD_RATE_LIMIT_REASON
+                        if rate_limited
+                        else "download_incomplete"
+                        if missing
+                        else "source_content_protected"
+                        if terminal_blocked
+                        else "download_completed"
+                    )
                     outcome = self._outcome(
                         run_id=run_id,
                         request=request,

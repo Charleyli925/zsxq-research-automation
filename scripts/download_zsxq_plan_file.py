@@ -11,6 +11,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -31,6 +32,9 @@ DOWNLOAD_CONTROL_TEXTS = ("下载文件", "下载")
 CONTENT_PROTECTION_CONFIRMATION_MS = 5000
 DETAIL_STATE_POLL_INTERVAL_MS = 250
 DEFAULT_NAVIGATION_ATTEMPTS = 3
+DOWNLOAD_API_PATH_SUFFIX = "/download_url"
+DOWNLOAD_RATE_LIMIT_CODE = 13607
+DOWNLOAD_RATE_LIMIT_REASON = "download_rate_limited_until_next_day"
 
 
 def load_json_object(path: Path) -> dict[str, Any]:
@@ -121,6 +125,67 @@ def current_download_control(page: Any) -> Any | None:
         if target is not None:
             return target
     return None
+
+
+def download_api_business_error(response: Any) -> dict[str, Any] | None:
+    """Return a sanitized failed download_url payload, if this is one.
+
+    A rejected ZSXQ download does not emit a browser ``download`` event.  The
+    API still returns HTTP 200 with ``succeeded=false``; ignoring that payload
+    turns a precise business refusal into a misleading Playwright timeout.
+    """
+
+    try:
+        path = urlsplit(str(response.url)).path
+    except (TypeError, ValueError):
+        return None
+    if not path.endswith(DOWNLOAD_API_PATH_SUFFIX):
+        return None
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("succeeded") is not False:
+        return None
+    try:
+        code = int(payload.get("code"))
+    except (TypeError, ValueError):
+        return None
+    message = " ".join(str(payload.get("info") or payload.get("error") or "").split())[:500]
+    return {"code": code, "message": message}
+
+
+def click_and_wait_for_download(page: Any, download_control: Any, timeout_ms: int) -> tuple[Any | None, dict[str, Any] | None]:
+    """Wait for either a browser download or a download API refusal."""
+
+    downloads: list[Any] = []
+    business_errors: list[dict[str, Any]] = []
+
+    def on_download(download: Any) -> None:
+        downloads.append(download)
+
+    def on_response(response: Any) -> None:
+        error = download_api_business_error(response)
+        if error is not None:
+            business_errors.append(error)
+
+    page.on("download", on_download)
+    page.on("response", on_response)
+    try:
+        download_control.click(timeout=timeout_ms)
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            if business_errors:
+                return None, business_errors[0]
+            if downloads:
+                return downloads[0], None
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if remaining_ms:
+                page.wait_for_timeout(min(100, remaining_ms))
+    finally:
+        page.remove_listener("download", on_download)
+        page.remove_listener("response", on_response)
+    raise PlaywrightTimeoutError(f'Timeout {timeout_ms}ms exceeded while waiting for event "download"')
 
 
 def wait_for_file_detail_state(
@@ -308,9 +373,20 @@ def download_candidate_on_page(
 
         if download_control is None:
             raise RuntimeError("downloadable detail state has no download control")
-        with page.expect_download(timeout=timeout_ms) as download_info:
-            download_control.click(timeout=timeout_ms)
-        download = download_info.value
+        download, business_error = click_and_wait_for_download(page, download_control, timeout_ms)
+        if business_error is not None:
+            code = int(business_error["code"])
+            return {
+                "status": "blocked",
+                "reason_code": DOWNLOAD_RATE_LIMIT_REASON if code == DOWNLOAD_RATE_LIMIT_CODE else f"api_error_{code}",
+                "source_api_code": code,
+                "file_id": file_id,
+                "filename": filename,
+                "topic_url": topic_url,
+                "message": str(business_error.get("message") or ""),
+            }
+        if download is None:
+            raise RuntimeError("download event completed without a download")
         failure = download.failure()
         if failure:
             raise RuntimeError(f"browser download failed: {failure}")

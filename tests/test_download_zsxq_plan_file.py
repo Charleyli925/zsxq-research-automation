@@ -87,6 +87,42 @@ class RetryNavigationPage:
         self.wait_calls += 1
 
 
+class FakeDownloadResponse:
+    url = "https://api.zsxq.com/v2/files/file-1/download_url"
+
+    def json(self) -> dict:
+        return {
+            "succeeded": False,
+            "code": 13607,
+            "info": "检测到你的下载量异常，已拒绝下载，下一个自然日自动恢复",
+        }
+
+
+class FakeDownloadEventPage:
+    def __init__(self, clock: FakeClock) -> None:
+        self.clock = clock
+        self.listeners: dict[str, list] = {}
+
+    def on(self, event: str, callback) -> None:
+        self.listeners.setdefault(event, []).append(callback)
+
+    def remove_listener(self, event: str, callback) -> None:
+        self.listeners[event].remove(callback)
+
+    def wait_for_timeout(self, timeout_ms: int) -> None:
+        self.clock.now += timeout_ms / 1000
+
+
+class RateLimitedDownloadControl:
+    def __init__(self, page: FakeDownloadEventPage) -> None:
+        self.page = page
+
+    def click(self, timeout: int) -> None:
+        del timeout
+        for callback in self.page.listeners["response"]:
+            callback(FakeDownloadResponse())
+
+
 class DownloadZsxqPlanFileTests(unittest.TestCase):
     def test_select_candidate_requires_exact_plan_membership(self) -> None:
         plan = {
@@ -217,6 +253,23 @@ class DownloadZsxqPlanFileTests(unittest.TestCase):
         self.assertEqual(navigation_error, "")
         self.assertEqual(page.goto_calls, 2)
         self.assertEqual(page.wait_calls, 1)
+
+    def test_download_api_rate_limit_wins_without_waiting_for_browser_timeout(self) -> None:
+        clock = FakeClock()
+        page = FakeDownloadEventPage(clock)
+        with mock.patch.object(MODULE.time, "monotonic", side_effect=clock.monotonic):
+            download, error = MODULE.click_and_wait_for_download(
+                page,
+                RateLimitedDownloadControl(page),
+                timeout_ms=30000,
+            )
+
+        self.assertIsNone(download)
+        self.assertEqual(error, {
+            "code": 13607,
+            "message": "检测到你的下载量异常，已拒绝下载，下一个自然日自动恢复",
+        })
+        self.assertEqual(clock.now, 0.0)
 
 
 if __name__ == "__main__":
