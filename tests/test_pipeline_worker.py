@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from zsxq_pipeline.config import load_pipeline_config
+from zsxq_pipeline.download import DOWNLOAD_RATE_LIMIT_REASON
 from zsxq_pipeline.lock import runtime_lock
 from zsxq_pipeline.model import Stage
 from zsxq_pipeline.notify import (
@@ -321,6 +322,39 @@ def test_blocked_download_exposes_reason_and_queues_one_retry_alert(tmp_path):
         notifications = state.list_notifications()
         assert [item.event for item in notifications] == [DOWNLOAD_BLOCKED_EVENT]
         assert "`blocked_browser_cdp_unresponsive`" in notifications[0].payload["markdown"]
+
+
+def test_account_wide_download_rate_limit_stops_the_remaining_tick_quota(tmp_path):
+    config = _config(tmp_path)
+    start = datetime(2026, 8, 10, 7, 0, tzinfo=UTC)
+    end = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        state.schedule_source_window("foreign", start, end, due_cursor=end, truncated=False)
+        state.schedule_source_window("domestic", start, end, due_cursor=end, truncated=False)
+
+    calls: list[str] = []
+
+    def download(request):
+        calls.append(request.source)
+        return SimpleNamespace(
+            status="failed",
+            source=request.source,
+            reason_code=DOWNLOAD_RATE_LIMIT_REASON,
+            checkpoint_eligible=False,
+            downloaded_entries=(),
+        )
+
+    outcome = PipelineWorker(
+        config,
+        download_runner=download,
+        outbox_runner=lambda max_items: (),
+    ).run_stage("download")
+
+    assert calls == ["foreign"]
+    assert outcome.failures == (
+        f"download:foreign:failed:{DOWNLOAD_RATE_LIMIT_REASON}",
+    )
 
 
 def test_process_statuses_are_one_start_one_milestone_then_one_completion(tmp_path):

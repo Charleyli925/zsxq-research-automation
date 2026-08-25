@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from zsxq_pipeline.browser import BrowserSessionError
-from zsxq_pipeline.download import DownloadPipeline, DownloadRequest
+from zsxq_pipeline.download import DOWNLOAD_RATE_LIMIT_REASON, DownloadPipeline, DownloadRequest
 from zsxq_pipeline.model import Stage, StageState
 from zsxq_pipeline.state import PipelineState
 
@@ -178,6 +178,51 @@ def test_content_protection_is_terminal_but_allows_the_window_to_checkpoint(tmp_
         attempt = state.get_stage_attempt(1, Stage.DOWNLOAD, request.workflow_version)
         assert attempt is not None
         assert attempt["state"] == StageState.QUARANTINED.value
+
+
+def test_download_rate_limit_stops_remaining_candidates_and_defers_until_next_day(tmp_path):
+    plan = _plan()
+    plan["download_candidates"].append(
+        {
+            "file_id": "file-2",
+            "filename": "second.pdf",
+            "topic_url": "https://wx.zsxq.com/group/fixture/topic/2",
+        }
+    )
+    plan["download_candidate_count"] = 2
+    downloader = FakeDownloader(tmp_path / "staging")
+    calls: list[str] = []
+
+    def rate_limited(candidate, **_kwargs):
+        calls.append(candidate["file_id"])
+        return {
+            "status": "blocked",
+            "reason_code": DOWNLOAD_RATE_LIMIT_REASON,
+            "source_api_code": 13607,
+            "file_id": candidate["file_id"],
+            "filename": candidate["filename"],
+            "message": "下一个自然日自动恢复",
+        }
+
+    downloader.download_candidate_on_page = rate_limited
+    request = _request(tmp_path)
+    outcome = DownloadPipeline(
+        browser_session_factory=FakeSession,
+        scanner=FakeScanner(plan),
+        downloader=downloader,
+    ).run(request)
+
+    assert calls == ["file-1"]
+    assert outcome.status == "failed"
+    assert outcome.reason_code == DOWNLOAD_RATE_LIMIT_REASON
+    assert outcome.checkpoint_eligible is False
+    with PipelineState.open(request.database) as state:
+        first = state.get_stage_attempt(1, Stage.DOWNLOAD, request.workflow_version)
+        second = state.get_stage_attempt(2, Stage.DOWNLOAD, request.workflow_version)
+        assert first is not None and first["state"] == StageState.RETRY_WAIT.value
+        assert first["error_code"] == DOWNLOAD_RATE_LIMIT_REASON
+        assert first["available_at_iso"].endswith("16:00:00Z")
+        assert second is not None and second["state"] == StageState.QUEUED.value
 
 
 def test_browser_failure_persists_exact_diagnostics_before_scanning(tmp_path):

@@ -15,7 +15,7 @@ from typing import Any
 from ._time import from_iso
 from .browser import CftLaunchOptions
 from .config import PipelineConfig, SourceConfig
-from .download import DownloadOutcome, DownloadPipeline, DownloadRequest
+from .download import DOWNLOAD_RATE_LIMIT_REASON, DownloadOutcome, DownloadPipeline, DownloadRequest
 from .lark import LarkCliConfig, LarkNotifier
 from .lock import runtime_lock
 from .notify import (
@@ -212,6 +212,11 @@ class PipelineWorker:
                             self._queue_download_blocked(row, outcome)
                         except Exception as exc:
                             failures.append(f"notify:{outcome.source}:download_blocked:{type(exc).__name__}")
+                    if reason_code == DOWNLOAD_RATE_LIMIT_REASON:
+                        # ZSXQ applies this refusal account-wide until the next
+                        # natural day. Do not burn the remaining per-tick quota
+                        # on another source/window that cannot succeed either.
+                        break
 
         # A processor can legitimately run beyond the soft tick deadline while
         # finishing a model request.  Drain durable work from the prior tick
