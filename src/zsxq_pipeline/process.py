@@ -38,6 +38,7 @@ from .notify import (
     NotificationDelivery,
     NotificationDrainer,
     enqueue_document_notification,
+    document_entry_total,
     enqueue_terminal_notification,
     export_notification_audit,
     render_document_notice,
@@ -1282,7 +1283,11 @@ class DigestProcessor:
                 state,
                 publication,
                 chat_id=self.config.target_chat_id,
-                markdown=render_document_notice(publication, title=group.title, count=len(group.entries)),
+                markdown=render_document_notice(
+                    publication, title=group.title, count=len(group.entries),
+                    filenames=[entry.filename for entry in group.entries],
+                    total=document_entry_total(state, publication),
+                ),
                 scope_key=run_id,
             )
 

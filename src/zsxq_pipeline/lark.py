@@ -446,12 +446,30 @@ class LarkNotifier(_LarkClient):
 
         return self._preflight("im notify", ("im", "+messages-send", "--help"))
 
-    def notify_once(self, chat_id: str, markdown: str, *, idempotency_key: str) -> NotificationReceipt:
+    def notify_once(self, chat_id: str, markdown: str, *, idempotency_key: str, compact_document: bool = False) -> NotificationReceipt:
         """Send Markdown as bot; retry callers reuse the same key, never a fallback."""
 
         chat = _require_nonempty(chat_id, "target chat_id")
         content = _require_nonempty(markdown, "notification markdown", preserve=True)
         key = _require_nonempty(idempotency_key, "notification idempotency_key")
+        content_args = ("--markdown", content)
+        if compact_document:
+            # A URL button does not embed the old document's first-page preview.
+            match = re.search(r"\n*\[打开文档\]\((https://[^\s)]+)\)\s*$", content)
+            if match is None:
+                raise ValueError("document notice requires an open-document link")
+            body = content[:match.start()].removeprefix("## ").strip()
+            card = {
+                "config": {"wide_screen_mode": True},
+                "elements": [
+                    {"tag": "div", "text": {"tag": "plain_text", "content": body}},
+                    {"tag": "action", "actions": [
+                        {"tag": "button", "text": {"tag": "plain_text", "content": "打开文档"},
+                         "type": "primary", "url": match.group(1)},
+                    ]},
+                ],
+            }
+            content_args = ("--msg-type", "interactive", "--content", _compact_json(card))
         payload = self._execute_json(
             "im notify",
             (
@@ -463,8 +481,7 @@ class LarkNotifier(_LarkClient):
                 key,
                 "--as",
                 self.config.bot_identity,
-                "--markdown",
-                content,
+                *content_args,
                 "--json",
             ),
         )

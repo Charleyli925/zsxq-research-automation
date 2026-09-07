@@ -169,12 +169,14 @@ class FakeNotifier:
     def __init__(self, *, error: Exception | None = None) -> None:
         self.error = error
         self.calls: list[tuple[str, str, str]] = []
+        self.compact_modes: list[bool] = []
 
     def capability_preflight(self):
         return {"ok": True}
 
-    def notify_once(self, chat_id: str, markdown: str, *, idempotency_key: str):
+    def notify_once(self, chat_id: str, markdown: str, *, idempotency_key: str, compact_document: bool = False):
         self.calls.append((chat_id, markdown, idempotency_key))
+        self.compact_modes.append(compact_document)
         if self.error is not None:
             raise self.error
         return object()
@@ -297,6 +299,9 @@ def test_process_uses_extracted_text_direct_codex_and_lark_boundaries(tmp_path):
     assert len(publisher.created) == 1
     assert publisher.titles and publisher.permissions == [(next(iter(publisher.documents)), "oc_test")]
     assert len(notifier.calls) == 1
+    assert notifier.compact_modes == [True]
+    assert "本次新增" in notifier.calls[0][1]
+    assert "文档累计" in notifier.calls[0][1]
     assert sidecars.summary_paths == [str(pdf)]
     assert sidecars.archives == [((str(pdf),), next(iter(publisher.documents)))]
     assert json.loads((runtime / "last_result.json").read_text(encoding="utf-8"))["status"] == "success"

@@ -203,3 +203,24 @@ def test_default_subprocess_executor_uses_an_argv_array_and_never_a_shell(monkey
     assert result.returncode == 0
     assert calls[0][0] == ["lark-cli", "docs", "+fetch", "--help"]
     assert calls[0][1]["shell"] is False
+
+
+def test_document_notice_uses_plain_text_card_and_url_button_without_preview(tmp_path):
+    executor = _FakeExecutor()
+    notifier = LarkNotifier(_config(tmp_path), executor=executor)
+    body = "## 知识星球研报更新\n\n已追加到原文档｜本次新增 6 篇｜文档累计 16 篇\n\n1. [literal] <at id=all>\n\n[打开文档](https://feishu.cn/docx/doxcn12345678)"
+    for _ in range(2):
+        notifier.notify_once("oc_chat_123", body, idempotency_key="same-key", compact_document=True)
+    for call in executor.calls:
+        argv = call["argv"]
+        assert "--markdown" not in argv
+        assert argv[argv.index("--msg-type") + 1] == "interactive"
+        assert argv[argv.index("--idempotency-key") + 1] == "same-key"
+        card = json.loads(argv[argv.index("--content") + 1])
+        text = card["elements"][0]["text"]
+        assert text["tag"] == "plain_text"
+        assert "累计 16 篇" in text["content"]
+        assert "https://" not in text["content"]
+        assert "<at id=all>" in text["content"]
+        button = card["elements"][1]["actions"][0]
+        assert button["url"] == "https://feishu.cn/docx/doxcn12345678"
