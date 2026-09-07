@@ -31,7 +31,7 @@ class FakeNotifier:
         self.error = error
         self.calls: list[tuple[str, str, str]] = []
 
-    def notify_once(self, chat_id: str, markdown: str, *, idempotency_key: str):
+    def notify_once(self, chat_id: str, markdown: str, *, idempotency_key: str, compact_document: bool = False):
         self.calls.append((chat_id, markdown, idempotency_key))
         if self.error is not None:
             raise self.error
@@ -307,3 +307,46 @@ def test_batch_completion_waits_for_its_document_link(tmp_path):
         assert len(deliveries) == 1 and deliveries[0].deferred is True
         assert notifier.calls == []
         assert state.get_notification(complete.idempotency_key).status == "retry_wait"  # type: ignore[union-attr]
+
+
+def test_document_notice_counts_appends_and_lists_only_current_files(tmp_path):
+    from zsxq_pipeline.notify import document_entry_total, render_document_notice
+
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        url = "https://feishu.cn/docx/doxcn12345678"
+        records = []
+        for index, count in enumerate((10, 6, 2), 1):
+            digest = str(index) * 64
+            state.record_remote_write(
+                digest, "daily", f"part-{index}", remote_reference=url,
+                target_document=url,
+                details={"created_document": index == 1, "entry_count": count}, now=NOW,
+            )
+            records.append(state.complete_publication(
+                digest, "daily", f"part-{index}", target_document=url, now=NOW,
+            ))
+        assert document_entry_total(state, records[0]) == 10
+        assert document_entry_total(state, records[1]) == 16
+        assert document_entry_total(state, records[2]) == 18
+        notice = render_document_notice(
+            records[1], title="old batch title", count=6,
+            filenames=[f"新增研报{i}.pdf" for i in range(6)],
+            total=document_entry_total(state, records[1]),
+        )
+        assert "已追加到原文档｜本次新增 6 篇｜文档累计 16 篇" in notice
+        assert "6. 新增研报5" in notice
+        assert "old batch title" not in notice
+        assert ".pdf" not in notice
+        created = render_document_notice(records[0], title="first", count=10, total=10)
+        assert "新建文档｜本次新增 10 篇｜文档累计 10 篇" in created
+
+
+def test_unknown_document_history_does_not_claim_a_total(tmp_path):
+    from zsxq_pipeline.notify import document_entry_total, render_document_notice
+
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        publication = _publication(state)
+        assert document_entry_total(state, publication) is None
+        assert "累计" not in render_document_notice(publication, title="report", count=1)

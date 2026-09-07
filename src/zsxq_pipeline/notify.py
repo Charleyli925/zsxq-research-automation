@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,7 +45,7 @@ class NotificationError(RuntimeError):
 class LarkNotificationClient(Protocol):
     """The small bot-only surface consumed by the durable drainer."""
 
-    def notify_once(self, chat_id: str, markdown: str, *, idempotency_key: str) -> Any: ...
+    def notify_once(self, chat_id: str, markdown: str, *, idempotency_key: str, compact_document: bool = False) -> Any: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,14 +163,45 @@ def enqueue_terminal_notification(
     )
 
 
-def render_document_notice(publication: PublicationRecord, *, title: str, count: int) -> str:
-    """Render the concise, user-facing document notice from durable data."""
+def document_entry_total(state: PipelineState, publication: PublicationRecord) -> int | None:
+    """Count all successful writes through this publication, including appends.
 
+    Unknown/user-managed document history cannot support an exact total.
+    """
+    records = [record for record in state.list_publications(
+        target=publication.target, states=("success",),
+    ) if record.remote_reference == publication.remote_reference and record.id <= publication.id]
+    if not any(record.details.get("created_document") is True for record in records):
+        return None
+    counts = [record.details.get("entry_count") for record in records]
+    if any(type(count) is not int or count < 1 for count in counts):
+        return None
+    return sum(counts)
+
+
+def render_document_notice(
+    publication: PublicationRecord, *, title: str, count: int,
+    filenames: Sequence[str] = (), total: int | None = None,
+) -> str:
+    """Describe this increment rather than repeat the document's first report."""
     reference = str(publication.remote_reference or "").strip()
     if not reference:
         raise NotificationError("successful publication has no remote reference")
-    noun = "篇" if int(count) == 1 else "篇研报"
-    return f"## 知识星球研报总结\n\n已发布《{str(title).strip() or '研报总结'}》：{int(count)} {noun}\n\n[打开文档]({reference})"
+    created = publication.details.get("created_document") is True
+    action = "新建文档" if created else "已追加到原文档"
+    lines = ["## 知识星球研报更新", "", f"{action}｜本次新增 {int(count)} 篇"]
+    if total is not None:
+        lines[-1] += f"｜文档累计 {total} 篇"
+    lines.extend(("", "本次新增研报："))
+    for index, filename in enumerate(filenames, 1):
+        name = " ".join(str(filename).split())
+        if name.lower().endswith(".pdf"):
+            name = name[:-4]
+        lines.append(f"{index}. {name}")
+    if not filenames:
+        lines.append(" ".join(str(title).split()) or "研报总结")
+    lines.extend(("", f"[打开文档]({reference})"))
+    return "\n".join(lines)
 
 
 def _source_label(source: str) -> str:
@@ -378,6 +409,7 @@ class NotificationDrainer:
                     _payload_text(claim.payload, "chat_id"),
                     _payload_text(claim.payload, "markdown"),
                     idempotency_key=claim.idempotency_key,
+                    **({"compact_document": True} if claim.event == DOCUMENT_EVENT else {}),
                 )
             except Exception as exc:
                 error = str(exc).strip() or type(exc).__name__
