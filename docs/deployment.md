@@ -77,6 +77,32 @@ zsxq-pipeline outbox drain --config /absolute/path/to/pipeline.toml
 document or run a summary. `tick` returns `busy` without mutating business
 state if another tick/manual stage owns the advisory lock.
 
+## Research full-text index
+
+After each successful Obsidian archive, the archive helper updates that
+report's SQLite `report_search` row. The scheduled `tick` also runs a bounded
+reconciliation once per local day. It checks only the configured
+`ResearchVault/10_Reports` directory, follows that explicitly configured
+report-directory symlink, and repairs new, changed, and removed notes in
+batches of 250. Incomplete batches resume on the next tick; successful daily
+completion is recorded in `runtime.root/state/kb-reconcile.json`. A failed
+reconciliation appears as `kb_reconcile` in the tick outcome and is retried.
+The marker records the indexed count and latest non-future report date.
+
+For a one-time rebuild after migration or a major metadata rule change, take a
+SQLite backup and run the following while holding the pipeline runtime lock:
+
+```bash
+python3 scripts/kb_search.py "example" --rebuild \
+  --db-path /absolute/runtime/state/research_library.sqlite \
+  --vault-root /absolute/runtime/projections/ResearchVault \
+  --config-root /absolute/runtime/projections/ResearchLibrary/config
+```
+
+The query uses the existing SQLite index. It does not scan the home directory.
+The `--rebuild` option refreshes the whole FTS table and its file signatures;
+normal publication and daily maintenance update only affected rows.
+
 Before a tick enters potentially long PDF/model processing, it drains durable
 notifications left by the prior tick. It drains again after processing when
 the soft deadline still has time remaining. Therefore an over-budget process

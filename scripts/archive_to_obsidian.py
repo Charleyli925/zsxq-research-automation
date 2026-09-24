@@ -23,6 +23,7 @@ try:
         render_frontmatter,
         split_frontmatter,
         upsert_metadata,
+        upsert_search_note,
     )
 except ModuleNotFoundError:  # pragma: no cover
     from scripts.kb_common import (
@@ -33,6 +34,7 @@ except ModuleNotFoundError:  # pragma: no cover
         render_frontmatter,
         split_frontmatter,
         upsert_metadata,
+        upsert_search_note,
     )
 
 try:
@@ -195,7 +197,6 @@ def archive_batch(
             item["feishu_doc_url"] = feishu_doc_url or str(item.get("feishu_doc_url", "") or "")
             item["metadata_confidence"] = metadata.get("metadata_confidence", 0)
             item["metadata_status"] = metadata.get("metadata_status", "")
-            archived_count += 1
             db_path = library_database or db_path_for_library(library_root)
             upsert_report(
                 db_path,
@@ -213,6 +214,14 @@ def archive_batch(
                     "error_message": "",
                 },
             )
+            upsert_search_note(
+                db_path,
+                load_note(note_path, vault_root),
+                library_root / "config",
+                vault_root,
+                metadata=metadata,
+            )
+            archived_count += 1
             try:
                 record_event(
                     db_path,

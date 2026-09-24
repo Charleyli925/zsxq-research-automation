@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping
@@ -175,6 +177,15 @@ class PipelineWorker:
             if "schedule" in stages:
                 scheduled = self._scheduler.enqueue_due_windows(state, now=self.clock())
 
+        # Give daily index repair a bounded slot before a long download or
+        # summary run can exhaust the soft tick budget. Per-report archive
+        # updates remain the normal fast path.
+        if "schedule" in stages and deadline - self.monotonic() >= 30:
+            try:
+                self._maybe_reconcile_search(deadline)
+            except Exception as exc:
+                failures.append(f"kb_reconcile:{type(exc).__name__}")
+
         if "download" in stages:
             with PipelineState.open(self.config.runtime.database) as state:
                 state.migrate()
@@ -287,6 +298,48 @@ class PipelineWorker:
             budget_exhausted=budget_exhausted,
             failures=tuple(failures),
         )
+
+    def _maybe_reconcile_search(self, deadline: float) -> None:
+        library = self.config.pipeline.research_library_root
+        database = self.config.pipeline.research_library_database
+        vault = self.config.pipeline.obsidian_vault_root
+        if library is None or database is None or vault is None:
+            return
+        marker = self.config.runtime.root / "state" / "kb-reconcile.json"
+        prior: dict[str, Any] = {}
+        if marker.is_file():
+            prior = json.loads(marker.read_text(encoding="utf-8"))
+        today = self.clock().date().isoformat()
+        if prior.get("last_completed_date") == today:
+            return
+        script = Path(__file__).resolve().parents[2] / "scripts" / "kb_reconcile_search.py"
+        if not script.is_file():
+            raise WorkerError("knowledge-base reconciliation script is unavailable")
+        remaining = max(1, min(30, int(deadline - self.monotonic()) - 10))
+        completed = subprocess.run(
+            [
+                sys.executable, str(script), "--db-path", str(database),
+                "--vault-root", str(vault), "--config-root", str(library / "config"),
+                "--max-updates", "250",
+            ],
+            capture_output=True, text=True, check=False, shell=False,
+            timeout=remaining,
+        )
+        if completed.returncode:
+            raise WorkerError(f"knowledge-base reconciliation failed with exit {completed.returncode}")
+        result = json.loads(completed.stdout)
+        payload = {
+            "last_run_at": self.clock().isoformat(timespec="seconds"),
+            "last_completed_date": today if result.get("complete") else prior.get("last_completed_date", ""),
+            "seen": result.get("seen", 0),
+            "indexed": result.get("indexed", 0),
+            "latest_report_date": result.get("latest_report_date", ""),
+            "updated": result.get("updated", 0),
+            "pending": result.get("pending", 0),
+            "deleted": result.get("deleted", 0),
+            "errors": result.get("errors", 0),
+        }
+        _atomic_json(marker, payload)
 
     def _extractor_version(self) -> str:
         return self.config.pipeline.extractor_version or "ocr-geometry-v2"
