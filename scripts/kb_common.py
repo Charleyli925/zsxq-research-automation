@@ -186,7 +186,20 @@ def display_title_for_note(title: str, body: str) -> str:
 
 
 def obsidian_target(note_path: Path, vault_root: Path) -> str:
-    relative = note_path.resolve(strict=False).relative_to(vault_root.resolve(strict=False))
+    resolved_note = note_path.resolve(strict=False)
+    resolved_vault = vault_root.resolve(strict=False)
+    try:
+        relative = resolved_note.relative_to(resolved_vault)
+    except ValueError:
+        # The human-facing vault may link only its report/company directories
+        # into the runtime projection. Keep the Obsidian link's lexical path,
+        # while verifying the note is inside that specific link target.
+        relative = note_path.absolute().relative_to(vault_root.absolute())
+        if not relative.parts or relative.parts[0] not in {REPORT_DIR_NAME, COMPANY_DIR_NAME}:
+            raise
+        linked_root = vault_root / relative.parts[0]
+        if not linked_root.is_symlink() or not resolved_note.is_relative_to(linked_root.resolve(strict=False)):
+            raise ValueError(f"note escapes linked vault directory: {note_path}")
     if relative.suffix == ".md":
         relative = relative.with_suffix("")
     return relative.as_posix()
@@ -1234,11 +1247,12 @@ def upsert_metadata(db_path: Path, note: NoteRecord, metadata: dict[str, Any], s
             )
 
 
-def ensure_search_table(conn: sqlite3.Connection) -> None:
-    conn.execute("DROP TABLE IF EXISTS report_search")
+def ensure_search_table(conn: sqlite3.Connection, *, reset: bool = False) -> None:
+    if reset:
+        conn.execute("DROP TABLE IF EXISTS report_search")
     conn.execute(
         """
-        CREATE VIRTUAL TABLE report_search USING fts5(
+        CREATE VIRTUAL TABLE IF NOT EXISTS report_search USING fts5(
           report_id UNINDEXED,
           title,
           broker,
@@ -1256,6 +1270,87 @@ def ensure_search_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS report_search_state (
+          report_id TEXT NOT NULL,
+          note_path TEXT PRIMARY KEY,
+          note_mtime_ns INTEGER NOT NULL,
+          note_size INTEGER NOT NULL,
+          summary_path TEXT NOT NULL,
+          summary_mtime_ns INTEGER NOT NULL,
+          summary_size INTEGER NOT NULL
+        )
+        """
+    )
+    if reset:
+        conn.execute("DELETE FROM report_search_state")
+
+
+def search_row_for_note(note: NoteRecord, metadata: dict[str, Any]) -> tuple[Any, ...]:
+    citation = citation_for_note(note)
+    return (
+        stable_report_id(note),
+        clean_search_text(note.display_title),
+        str(metadata.get("broker") or ""),
+        str(metadata.get("report_date") or ""),
+        " ".join(extract_list_value(metadata.get("companies"))),
+        " ".join(extract_list_value(metadata.get("themes"))),
+        " ".join(extract_list_value(metadata.get("subthemes"))),
+        clean_search_text(metadata.get("core_conclusions") or ""),
+        clean_search_text(metadata.get("core_questions_answers") or ""),
+        clean_search_text(metadata.get("summary_text") or ""),
+        citation["note_path"],
+        citation["pdf_path"],
+        str(note.frontmatter.get("feishu_doc_url") or ""),
+    )
+
+
+def search_file_state(note: NoteRecord) -> tuple[Any, ...]:
+    note_stat = note.path.stat()
+    summary_path = citation_for_note(note)["summary_path"]
+    try:
+        summary_stat = Path(summary_path).stat() if summary_path else None
+    except OSError:
+        summary_stat = None
+    return (
+        stable_report_id(note), str(note.path), note_stat.st_mtime_ns, note_stat.st_size,
+        summary_path, summary_stat.st_mtime_ns if summary_stat else 0,
+        summary_stat.st_size if summary_stat else 0,
+    )
+
+
+def upsert_search_note(
+    db_path: Path,
+    note: NoteRecord,
+    config_root: Path = DEFAULT_CONFIG_ROOT,
+    vault_root: Path | None = None,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    metadata = metadata or extract_report_metadata(note, load_kb_configs(config_root), vault_root)
+    row = search_row_for_note(note, metadata)
+    state = search_file_state(note)
+    with closing(sqlite3.connect(str(db_path), timeout=30)) as conn:
+        with conn:
+            ensure_search_table(conn)
+            conn.execute("DELETE FROM report_search WHERE note_path = ?", (row[10],))
+            conn.execute(
+                """INSERT INTO report_search(
+                  report_id, title, broker, report_date, companies, themes, subthemes,
+                  core_conclusions, core_questions_answers, summary_text,
+                  note_path, pdf_path, feishu_doc_url
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                row,
+            )
+            conn.execute(
+                """INSERT INTO report_search_state VALUES(?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(note_path) DO UPDATE SET
+                  report_id=excluded.report_id, note_mtime_ns=excluded.note_mtime_ns,
+                  note_size=excluded.note_size, summary_path=excluded.summary_path,
+                  summary_mtime_ns=excluded.summary_mtime_ns, summary_size=excluded.summary_size""",
+                state,
+            )
 
 
 def rebuild_search_index(
@@ -1273,28 +1368,11 @@ def rebuild_search_index(
         metadata = extract_report_metadata(note, configs, vault_root)
         if upsert_notes:
             upsert_metadata(db_path, note, metadata, "kb_search_rebuild")
-        citation = citation_for_note(note)
-        rows.append(
-            (
-                stable_report_id(note),
-                clean_search_text(note.display_title),
-                str(metadata.get("broker") or ""),
-                str(metadata.get("report_date") or ""),
-                " ".join(extract_list_value(metadata.get("companies"))),
-                " ".join(extract_list_value(metadata.get("themes"))),
-                " ".join(extract_list_value(metadata.get("subthemes"))),
-                clean_search_text(metadata.get("core_conclusions") or ""),
-                clean_search_text(metadata.get("core_questions_answers") or ""),
-                clean_search_text(metadata.get("summary_text") or ""),
-                citation["note_path"],
-                citation["pdf_path"],
-                str(note.frontmatter.get("feishu_doc_url") or ""),
-            )
-        )
+        rows.append((search_row_for_note(note, metadata), search_file_state(note)))
     with closing(sqlite3.connect(str(db_path))) as conn:
         with conn:
-            ensure_search_table(conn)
-            for row in rows:
+            ensure_search_table(conn, reset=True)
+            for row, state in rows:
                 conn.execute(
                     """
                     INSERT INTO report_search(
@@ -1306,6 +1384,7 @@ def rebuild_search_index(
                     """,
                     row,
                 )
+                conn.execute("INSERT INTO report_search_state VALUES(?, ?, ?, ?, ?, ?, ?)", state)
     return {"indexed": len(rows)}
 
 

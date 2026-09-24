@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -73,6 +74,13 @@ class ArchiveToObsidianTests(unittest.TestCase):
             self.assertIn("# Alpha", note_text)
             self.assertTrue(library_database.is_file())
             self.assertFalse((library_root / "state" / "processed_files.sqlite").exists())
+            with sqlite3.connect(library_database) as conn:
+                row = conn.execute(
+                    "SELECT report_id, title, summary_text FROM report_search"
+                ).fetchone()
+            self.assertEqual(row[0], "zsxq_aaaaaaaaaaaaaaaa")
+            self.assertIn("alpha", row[1])
+            self.assertIn("Key points", row[2])
 
 
 if __name__ == "__main__":

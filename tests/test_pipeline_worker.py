@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import json
 from types import SimpleNamespace
+from unittest import mock
 
 from zsxq_pipeline.config import load_pipeline_config
 from zsxq_pipeline.download import DOWNLOAD_RATE_LIMIT_REASON
@@ -72,6 +74,34 @@ def _notification_config(tmp_path):
         config,
         lark=replace(config.lark, notifications_enabled=True, target_chat_id="oc_test"),
     )
+
+
+def test_daily_search_reconciliation_runs_once_per_day_and_records_progress(tmp_path):
+    config = _config(tmp_path)
+    library = config.runtime.root / "projections" / "ResearchLibrary"
+    vault = config.runtime.root / "projections" / "ResearchVault"
+    database = config.runtime.root / "state" / "research_library.sqlite"
+    config = replace(
+        config,
+        pipeline=replace(
+            config.pipeline,
+            research_library_root=library,
+            research_library_database=database,
+            obsidian_vault_root=vault,
+        ),
+    )
+    now = [datetime(2026, 9, 24, 3, 0, tzinfo=UTC)]
+    worker = PipelineWorker(config, clock=lambda: now[0])
+    response = SimpleNamespace(returncode=0, stdout=json.dumps({"complete": True, "seen": 2, "updated": 1, "pending": 0, "deleted": 0, "errors": 0}))
+    with mock.patch("zsxq_pipeline.worker.subprocess.run", return_value=response) as run:
+        worker._maybe_reconcile_search(worker.monotonic() + 60)
+        worker._maybe_reconcile_search(worker.monotonic() + 60)
+        assert run.call_count == 1
+        marker = config.runtime.root / "state" / "kb-reconcile.json"
+        assert json.loads(marker.read_text(encoding="utf-8"))["last_completed_date"] == "2026-09-24"
+        now[0] += timedelta(days=1)
+        worker._maybe_reconcile_search(worker.monotonic() + 60)
+        assert run.call_count == 2
 
 
 def test_tick_isolates_source_failures_and_still_drains_outbox(tmp_path):
