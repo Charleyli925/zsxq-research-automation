@@ -199,6 +199,21 @@ def test_transient_io_retries_without_edit_but_quarantined_content_does_not(tmp_
         )
 
 
+def test_invalid_directory_is_quarantined_without_io_retry(tmp_path):
+    db, directory = tmp_path / "catalog.sqlite", tmp_path / "directory.md"
+    directory.mkdir()
+    assert (
+        upsert_report(
+            db, {"report_id": "directory", "summary_md_path": str(directory)}
+        )["evidence_index_status"]
+        == "error"
+    )
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT error_kind,next_retry_at FROM report_evidence_state"
+        ).fetchone() == ("quarantined", "")
+
+
 def test_attestation_must_match_bytes_and_migration_preserves_known_version(tmp_path):
     db, md = tmp_path / "catalog.sqlite", tmp_path / "source.md"
     md.write_text("original evidence")

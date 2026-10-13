@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -150,9 +151,11 @@ def _source(row: dict) -> tuple[str, str, str, str, str]:
             path = Path(raw)
             if path.suffix.lower() not in (".md", ".markdown"):
                 raise ValueError("source_invalid")
-            if path.stat().st_size > MAX_SOURCE_BYTES:
-                raise ValueError("source_too_large")
             before = path.stat()
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("source_not_regular_file")
+            if before.st_size > MAX_SOURCE_BYTES:
+                raise ValueError("source_too_large")
             data = path.read_bytes()
             after = path.stat()
             if (
