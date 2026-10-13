@@ -179,3 +179,12 @@ def test_worker_records_catalog_failures_without_vault_before_raising(tmp_path):
     assert marker["catalog"]["catalog_errors"] == 1
     assert marker["catalog"]["oldest_pending_at"] == "2026-10-01"
     assert marker["last_completed_date"] == ""
+
+
+def test_sk_hynix_label_is_not_a_key_but_lowercase_key_is_excluded(tmp_path):
+    db = tmp_path / "catalog.sqlite"
+    md = tmp_path / "issuer.md"
+    md.write_text("# SK-Hynix-000660-KS-Project-2026E-OP-of-W251tr-Raise-TP-to-W3100k\n\nFindings.")
+    assert upsert_report(db, {"report_id": "issuer", "summary_md_path": str(md)})["evidence_index_status"] == "ready"
+    md.write_text("sk-" + "a" * 48)
+    assert refresh_report(db, "issuer")["status"] == "error"

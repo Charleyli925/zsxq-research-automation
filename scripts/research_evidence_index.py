@@ -17,7 +17,7 @@ MAX_SOURCE_BYTES = 5_000_000
 SCHEMA_VERSION = 1
 SENSITIVE = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----|"
-    r"\b(?:sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|AKIA[A-Z0-9]{16})\b|"
+    r"\b(?:(?-i:sk-)[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|AKIA[A-Z0-9]{16})\b|"
     r"^\s*(?:api[_-]?key|access[_-]?token|client[_-]?secret|password|private[_-]?key)\s*[:=]\s*[^\s#]{8,}",
     re.IGNORECASE | re.MULTILINE,
 )
