@@ -34,8 +34,8 @@ def _file_signature(path: str) -> tuple[int, int]:
     return stat.st_mtime_ns, stat.st_size
 
 
-def reconcile(db_path: Path, vault_root: Path, config_root: Path, *, max_updates: int = 250) -> dict[str, int | bool | str]:
-    if max_updates < 1:
+def reconcile(db_path: Path, vault_root: Path, config_root: Path, *, max_updates: int | None = None) -> dict[str, int | bool | str]:
+    if max_updates is not None and max_updates < 1:
         raise ValueError("max_updates must be positive")
     report_root = vault_root / "10_Reports"
     if not report_root.is_dir():
@@ -75,7 +75,7 @@ def reconcile(db_path: Path, vault_root: Path, config_root: Path, *, max_updates
             ):
                 continue
             pending += 1
-            if updated >= max_updates:
+            if max_updates is not None and updated >= max_updates:
                 continue
             note = load_note(path, vault_root)
             if not note.link_target.startswith("10_Reports/"):
@@ -114,7 +114,7 @@ def main() -> int:
     parser.add_argument("--db-path", default=str(DEFAULT_DB_PATH))
     parser.add_argument("--vault-root", default=str(DEFAULT_VAULT_ROOT))
     parser.add_argument("--config-root", default=str(DEFAULT_CONFIG_ROOT))
-    parser.add_argument("--max-updates", type=int, default=250)
+    parser.add_argument("--max-updates", type=int, help="Optional operator-selected batch size; default processes all pending updates")
     args = parser.parse_args()
     database = Path(args.db_path).expanduser().resolve(strict=False)
     vault = Path(args.vault_root).expanduser().resolve(strict=False) if args.vault_root else None

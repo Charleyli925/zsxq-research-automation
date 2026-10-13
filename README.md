@@ -58,15 +58,21 @@ writer attestation can bind a new summary version to the current catalog report.
 This is a catalog binding, not semantic verification against the original PDF.
 
 The scheduled `kb_reconcile_search.py` CLI repairs both notes and catalog sources,
-with separate update budgets. Catalog reconciliation also runs when the vault
+processing all pending updates by default. An operator can explicitly request a
+batch with `--max-updates`; scheduled reconciliation does not impose a batch or
+subprocess time limit. Catalog reconciliation also runs when the vault
 is absent. It records source status (`ready`, `pdf_only`, `files_missing`, `error`, `source_changed`),
 remaining updates, oldest waiting timestamp and last successful indexing time.
 Errors are retained in `kb-reconcile.json` before a nonzero exit is reported.
 `pdf_only` means no searchable Markdown, not full PDF indexing. Daily completion
 only skips reconciliation for that day; normal catalog updates remain immediate.
-Transient I/O failures retry without touching the file, starting after 60 seconds
-with exponential backoff capped at one hour, when the next writer reconciliation
-or incremental refresh runs. Unsafe/invalid content is quarantined and is not
+Transient I/O failures retry once on the next writer reconciliation or incremental
+refresh, without touching the file or waiting for an additional retry timer.
+Markdown size is unrestricted; old size-only quarantines are revisited.
+Note metadata matching also uses the complete body and retains every matched
+company/theme/subtheme, key-number paragraph and relevant bullet without fixed
+list or character caps.
+Unsafe/invalid content is quarantined and is not
 retried merely because time elapsed. Schema v2 migrates existing writer states;
 states without a comparable identity binding remain unknown to readers until
 the writer validates the accepted version.
@@ -77,7 +83,7 @@ schema initialization/reconciliation. FTS is candidate discovery, not evidence:
 returned paragraphs must be read and authorized from their current source.
 
 Before activation: review/merge the Draft PR, choose a release explicitly, check
-the runtime is idle, deploy that SHA, then let bounded reconciliation drain.
+the runtime is idle, deploy that SHA, then let reconciliation complete.
 Monitor source statuses and waiting time; a recent report date alone is not a
 coverage check. Validation on database copies does not change production indexes.
 

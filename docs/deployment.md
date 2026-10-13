@@ -80,11 +80,13 @@ state if another tick/manual stage owns the advisory lock.
 ## Research full-text index
 
 After each successful Obsidian archive, the archive helper updates that
-report's SQLite `report_search` row. The scheduled `tick` also runs a bounded
-reconciliation once per local day. It checks only the configured
+report's SQLite `report_search` row. The scheduled `tick` also completes
+reconciliation once per local day. It checks the configured
 `ResearchVault/10_Reports` directory, follows that explicitly configured
-report-directory symlink, and repairs new, changed, and removed notes in
-batches of 250. Incomplete batches resume on the next tick; successful daily
+report-directory symlink, and repairs all new, changed, and removed notes and
+catalog sources. There is no scheduled batch size or subprocess timeout;
+`--max-updates` is an optional operator-selected batch. This pass can extend beyond
+the soft tick deadline while holding the existing runtime flock. Successful daily
 completion is recorded in `runtime.root/state/kb-reconcile.json`. A failed
 reconciliation appears as `kb_reconcile` in the tick outcome and is retried.
 The marker records the indexed count and latest non-future report date.

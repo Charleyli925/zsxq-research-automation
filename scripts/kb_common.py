@@ -447,10 +447,14 @@ def extract_report_date(frontmatter: dict[str, Any], text: str, note_path: Path 
     return ""
 
 
-def text_for_matching(note: NoteRecord, max_body_chars: int = 20000) -> tuple[str, str, str]:
+def text_for_matching(note: NoteRecord, max_body_chars: int | None = None) -> tuple[str, str, str]:
     title_text = f"{note.title}\n{note.display_title}"
     summary_text = extract_note_summary_text(note)
-    body_text = summary_text[:max_body_chars] if summary_text else note.body[:max_body_chars]
+    body_text = summary_text or note.body
+    if max_body_chars is not None:
+        if max_body_chars < 1:
+            raise ValueError("max_body_chars must be positive")
+        body_text = body_text[:max_body_chars]
     return title_text, body_text, f"{title_text}\n{body_text}"
 
 
@@ -802,7 +806,7 @@ def extract_entities(note: NoteRecord, configs: dict[str, Any], vault_root: Path
             matched_names.add(company)
     matched.sort(key=lambda item: (-item[1], item[0]))
     return {
-        "companies": [name for name, _ in matched[:12]],
+        "companies": [name for name, _ in matched],
         "tickers": list(dict.fromkeys(tickers)),
         "regions": list(dict.fromkeys(regions)),
         "industries": list(dict.fromkeys(industries)),
@@ -831,30 +835,36 @@ def extract_themes(note: NoteRecord, configs: dict[str, Any]) -> dict[str, list[
     theme_scores.sort(key=lambda item: (-item[1], item[0]))
     subtheme_scores.sort(key=lambda item: (-item[1], item[0]))
     return {
-        "themes": [name for name, _ in theme_scores[:8]],
-        "subthemes": list(dict.fromkeys([name for name, _ in subtheme_scores[:12]])),
+        "themes": [name for name, _ in theme_scores],
+        "subthemes": list(dict.fromkeys([name for name, _ in subtheme_scores])),
         "regions": list(dict.fromkeys(regions)),
         "industries": list(dict.fromkeys(industries)),
     }
 
 
-def extract_key_numbers(text: str, limit: int = 12) -> list[str]:
+def extract_key_numbers(text: str, limit: int | None = None) -> list[str]:
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be positive")
     number_re = re.compile(
         r"(?:(?:\d+(?:\.\d+)?\s?(?:%|亿美元|亿元|万亿|GWh|GW|MW|美元|人民币|倍|bps|bp|页|个|家|万吨|美元/桶))|(?:\$\s?\d+(?:\.\d+)?\s?[BMK]?))"
     )
     results: list[str] = []
-    for match in number_re.finditer(text[:20000]):
-        start = max(0, match.start() - 24)
-        end = min(len(text), match.end() + 24)
+    for match in number_re.finditer(text):
+        before = text.rfind("\n\n", 0, match.start())
+        after = text.find("\n\n", match.end())
+        start = before + 2 if before >= 0 else 0
+        end = after if after >= 0 else len(text)
         snippet = clean_search_text(text[start:end])
         if snippet and snippet not in results:
             results.append(snippet)
-        if len(results) >= limit:
+        if limit is not None and len(results) >= limit:
             break
     return results
 
 
-def extract_bullet_like(text: str, keywords: list[str], limit: int = 8) -> list[str]:
+def extract_bullet_like(text: str, keywords: list[str], limit: int | None = None) -> list[str]:
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be positive")
     results: list[str] = []
     for line in text.splitlines():
         stripped = line.strip("-* \t")
@@ -863,8 +873,8 @@ def extract_bullet_like(text: str, keywords: list[str], limit: int = 8) -> list[
         if any(keyword in stripped for keyword in keywords):
             cleaned = clean_search_text(stripped)
             if cleaned and cleaned not in results:
-                results.append(cleaned[:220])
-        if len(results) >= limit:
+                results.append(cleaned)
+        if limit is not None and len(results) >= limit:
             break
     return results
 

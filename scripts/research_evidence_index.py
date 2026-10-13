@@ -11,10 +11,9 @@ import json
 import re
 import sqlite3
 import stat
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
-MAX_SOURCE_BYTES = 5_000_000
 SCHEMA_VERSION = 2
 IDENTITY_FIELDS = (
     "report_id",
@@ -85,10 +84,13 @@ def ensure_evidence_schema(conn: sqlite3.Connection) -> None:
             )
 
 
-def _needs_refresh(conn, old, row, signature, now):
+def _needs_refresh(conn, old, row, signature):
     if not old or old["signature"] != signature:
         return True
     if old["status"] == "error":
+        # Revisit sources excluded only by the removed historical size policy.
+        if "ValueError:source_too_large" in old["reason"]:
+            return True
         # Pre-migration I/O errors also receive one automatic retry.
         retryable = old["error_kind"] == "retryable_io" or (
             not old["error_kind"]
@@ -96,7 +98,8 @@ def _needs_refresh(conn, old, row, signature, now):
             and "ValueError:" not in old["reason"]
             and "Unicode" not in old["reason"]
         )
-        return retryable and (not old["next_retry_at"] or old["next_retry_at"] <= now)
+        # One attempt per writer pass; no additional timer delays recovery.
+        return retryable
     if old["status"] == "ready":
         if not old["identity_sha256"]:
             return True
@@ -154,8 +157,6 @@ def _source(row: dict) -> tuple[str, str, str, str, str]:
             before = path.stat()
             if not stat.S_ISREG(before.st_mode):
                 raise ValueError("source_not_regular_file")
-            if before.st_size > MAX_SOURCE_BYTES:
-                raise ValueError("source_too_large")
             data = path.read_bytes()
             after = path.stat()
             if (
@@ -170,7 +171,7 @@ def _source(row: dict) -> tuple[str, str, str, str, str]:
                 after.st_mtime_ns,
                 after.st_ctime_ns,
                 after.st_size,
-            ) or len(data) > MAX_SOURCE_BYTES:
+            ):
                 raise OSError("source_changed_during_read")
             text = data.decode("utf-8")
             unescaped = re.sub(r"\\([\\`*_{}\[\]()#+\-.!])", r"\1", text)
@@ -182,7 +183,7 @@ def _source(row: dict) -> tuple[str, str, str, str, str]:
                 ("io:" if isinstance(exc, OSError) else "quarantine:")
                 + type(exc).__name__
                 + ":"
-                + str(exc)[:100]
+                + str(exc)
             )
             # Do not silently replace a declared failed primary with another source.
             break
@@ -219,7 +220,7 @@ def refresh_catalog_source(
     if (
         not force
         and not expected_source_sha256
-        and not _needs_refresh(conn, old, row, signature, checked_at)
+        and not _needs_refresh(conn, old, row, signature)
     ):
         return {"changed": False, "status": old["status"], "reason": old["reason"]}
     kind, path, text, digest, reason = _source(row)
@@ -296,14 +297,8 @@ def refresh_catalog_source(
         if error_kind == "retryable_io"
         else 0
     )
-    next_retry_at = (
-        (
-            checked_time
-            + timedelta(seconds=min(3600, 60 * 2 ** min(retry_count - 1, 6)))
-        ).isoformat(timespec="seconds")
-        if retry_count
-        else ""
-    )
+    # Keep the schema column for existing readers; retries use writer passes.
+    next_retry_at = ""
     # Keep the accepted binding through errors. A forced reconcile is not approval.
     if status != "ready" and old and old["content_sha256"]:
         kind, path, digest, binding = (
@@ -402,9 +397,9 @@ def refresh_report(db_path: Path, report_id: str) -> dict:
 
 
 def reconcile_catalog(
-    db_path: Path, *, max_updates: int = 250, now: datetime | None = None
+    db_path: Path, *, max_updates: int | None = None, now: datetime | None = None
 ) -> dict:
-    if max_updates < 1:
+    if max_updates is not None and max_updates < 1:
         raise ValueError("max_updates must be positive")
     updated = pending = 0
     oldest_waiting = []
@@ -424,10 +419,10 @@ def reconcile_catalog(
         for row in rows:
             old = states.get(row["report_id"])
             sig = _signature(row)
-            if not _needs_refresh(conn, old, row, sig, now):
+            if not _needs_refresh(conn, old, row, sig):
                 continue
             pending += 1
-            if updated >= max_updates:
+            if max_updates is not None and updated >= max_updates:
                 oldest_waiting.append(
                     (old or {}).get("first_pending_at") or row.get("updated_at") or now
                 )

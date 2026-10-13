@@ -18,6 +18,7 @@ from scripts.research_evidence_index import (
     refresh_catalog_source,
 )
 from scripts.research_library_index import upsert_report
+from scripts.research_library_index import ensure_schema
 
 
 def test_summary_indexes_before_publication_and_requires_attested_replacement(tmp_path):
@@ -175,15 +176,12 @@ def test_transient_io_retries_without_edit_but_quarantined_content_does_not(tmp_
         )
     signature = md.stat()
     with sqlite3.connect(db) as conn:
-        retry_at = datetime.fromisoformat(
-            conn.execute("SELECT next_retry_at FROM report_evidence_state").fetchone()[
-                0
-            ]
+        # A retry timer persisted by an older version must not delay recovery.
+        conn.execute(
+            "UPDATE report_evidence_state SET next_retry_at='2099-01-01T00:00:00+00:00'"
         )
-    assert (
-        reconcile_catalog(db, now=retry_at - timedelta(seconds=1))["catalog_updated"]
-        == 0
-    )
+    retry_at = datetime.now(timezone.utc)
+    # No edit or additional timer is needed for the next writer pass to recover.
     assert reconcile_catalog(db, now=retry_at)["source_status_counts"] == {"ready": 1}
     assert md.stat() == signature
     md.write_text("password: synthetic-example-secret")
@@ -197,6 +195,54 @@ def test_transient_io_retries_without_edit_but_quarantined_content_does_not(tmp_
             reconcile_catalog(db, now=retry_at + timedelta(days=1))["catalog_updated"]
             == 0
         )
+
+
+def test_large_source_is_indexed_in_full_and_old_size_quarantine_recovers(tmp_path):
+    db, md = tmp_path / "catalog.sqlite", tmp_path / "large.md"
+    text = "# Findings\n\n" + "x" * 5_000_001 + "\n\ncomplete tail evidence"
+    md.write_text(text)
+    assert (
+        upsert_report(db, {"report_id": "large", "summary_md_path": str(md)})[
+            "evidence_index_status"
+        ]
+        == "ready"
+    )
+    with sqlite3.connect(db) as conn:
+        assert (
+            conn.execute("SELECT summary_text FROM report_search").fetchone()[0] == text
+        )
+        conn.execute("DELETE FROM report_search")
+        conn.execute(
+            "UPDATE report_evidence_state SET status='error',reason='quarantine:ValueError:source_too_large',error_kind='quarantined'"
+        )
+    assert reconcile_catalog(db)["source_status_counts"] == {"ready": 1}
+    with sqlite3.connect(db) as conn:
+        assert (
+            conn.execute(
+                "SELECT report_id FROM report_search WHERE report_search MATCH 'evidence'"
+            ).fetchone()[0]
+            == "large"
+        )
+
+
+def test_default_catalog_reconciliation_processes_more_than_250_sources(tmp_path):
+    db = tmp_path / "catalog.sqlite"
+    ensure_schema(db)
+    records = []
+    for number in range(270):
+        path = tmp_path / f"report-{number}.md"
+        path.write_text(f"Finding from report {number}.")
+        records.append((f"report-{number}", str(path), "2026-10-13"))
+    with sqlite3.connect(db) as conn:
+        conn.executemany(
+            "INSERT INTO reports(report_id,summary_md_path,updated_at) VALUES(?,?,?)",
+            records,
+        )
+    result = reconcile_catalog(db)
+    assert result["catalog_updated"] == 270
+    assert result["catalog_pending"] == 0
+    assert result["source_status_counts"] == {"ready": 270}
+    assert result["catalog_complete"]
 
 
 def test_invalid_directory_is_quarantined_without_io_retry(tmp_path):
@@ -234,7 +280,7 @@ def test_attestation_must_match_bytes_and_migration_preserves_known_version(tmp_
         assert conn.execute("SELECT count(*) FROM report_search").fetchone()[0] == 0
 
 
-def test_ticker_changes_are_identity_changes_and_retry_backoff_is_bounded(tmp_path):
+def test_ticker_changes_stay_quarantined_and_io_retries_once_per_pass(tmp_path):
     db, md = tmp_path / "catalog.sqlite", tmp_path / "source.md"
     md.write_text("original evidence")
     upsert_report(db, {"report_id": "one", "summary_md_path": str(md)})
@@ -245,21 +291,17 @@ def test_ticker_changes_are_identity_changes_and_retry_backoff_is_bounded(tmp_pa
     with patch.object(Path, "read_bytes", side_effect=OSError("temporarily offline")):
         upsert_report(db, {"report_id": "retry", "summary_md_path": str(md)})
         for attempt in range(8):
-            with sqlite3.connect(db) as conn:
-                retry_at = datetime.fromisoformat(
-                    conn.execute(
-                        "SELECT next_retry_at FROM report_evidence_state WHERE report_id='retry'"
-                    ).fetchone()[0]
-                )
-            reconcile_catalog(db, now=retry_at)
+            reconcile_catalog(db)
             with sqlite3.connect(db) as conn:
                 count, next_at = conn.execute(
                     "SELECT retry_count,next_retry_at FROM report_evidence_state WHERE report_id='retry'"
                 ).fetchone()
             assert count == attempt + 2
-            assert (
-                0 < (datetime.fromisoformat(next_at) - retry_at).total_seconds() <= 3600
-            )
+            assert next_at == ""
+    assert reconcile_catalog(db)["source_status_counts"] == {
+        "ready": 1,
+        "source_changed": 1,
+    }
 
 
 def test_catalog_move_and_missing_pdf_are_distinct_from_bad_source(tmp_path):
@@ -331,7 +373,7 @@ def test_worker_records_catalog_failures_without_vault_before_raising(tmp_path):
     result = subprocess.CompletedProcess([], 1, stdout=json.dumps(payload), stderr="")
     with patch("zsxq_pipeline.worker.subprocess.run", return_value=result) as run:
         with pytest.raises(WorkerError, match="recorded source errors"):
-            worker._maybe_reconcile_search(60)
+            worker._maybe_reconcile_search()
     command = run.call_args.args[0]
     assert command[command.index("--vault-root") + 1] == ""
     marker = json.loads((tmp_path / "state/kb-reconcile.json").read_text())
