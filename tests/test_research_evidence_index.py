@@ -4,18 +4,23 @@ import sqlite3
 import subprocess
 import sys
 import json
-from datetime import datetime, timezone
+import hashlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-from scripts.research_evidence_index import reconcile_catalog, refresh_report
+from scripts.research_evidence_index import (
+    reconcile_catalog,
+    refresh_report,
+    refresh_catalog_source,
+)
 from scripts.research_library_index import upsert_report
 
 
-def test_summary_indexes_before_note_or_publication_and_repairs_replacement(tmp_path):
+def test_summary_indexes_before_publication_and_requires_attested_replacement(tmp_path):
     db = tmp_path / "catalog.sqlite"
     summary = tmp_path / "20261001-高盛-腾讯.summary.md"
     summary.write_text("# 腾讯\n\n## 广告\n短期内广告尚未加速。", encoding="utf-8")
@@ -41,7 +46,22 @@ def test_summary_indexes_before_note_or_publication_and_repairs_replacement(tmp_
     summary.write_text("# 腾讯\n\n在需求改善条件下才会上调。", encoding="utf-8")
     repaired = reconcile_catalog(db)
     assert repaired["catalog_updated"] == 1
+    assert repaired["source_status_counts"]["source_changed"] == 1
     assert reconcile_catalog(db)["catalog_updated"] == 0
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM report_search").fetchone()[0] == 0
+    assert (
+        upsert_report(
+            db,
+            {
+                "report_id": "one",
+                "expected_source_sha256": hashlib.sha256(
+                    summary.read_bytes()
+                ).hexdigest(),
+            },
+        )["evidence_index_status"]
+        == "ready"
+    )
     with sqlite3.connect(db) as conn:
         assert (
             "需求改善"
@@ -101,6 +121,130 @@ def test_budget_resumes_catalog_without_vault_and_preserves_legacy_notes(tmp_pat
         check=True,
     )
     assert '"note_directory_available": false' in completed.stdout
+
+
+def test_unattested_identity_change_and_force_cannot_bless_replaced_content(tmp_path):
+    db, md = tmp_path / "catalog.sqlite", tmp_path / "source.md"
+    md.write_text("# Apple\n\nApple AI outlook.")
+    upsert_report(
+        db,
+        {
+            "report_id": "one",
+            "title": "Apple",
+            "broker": "Broker A",
+            "companies_json": '["Apple"]',
+            "summary_md_path": str(md),
+        },
+    )
+    original_hash = hashlib.sha256(md.read_bytes()).hexdigest()
+    md.write_text("# Microsoft\n\nAzure AI outlook.")
+    assert refresh_report(db, "one")["status"] == "source_changed"
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = dict(conn.execute("SELECT * FROM reports").fetchone())
+        assert (
+            refresh_catalog_source(conn, row, force=True)["status"] == "source_changed"
+        )
+        assert (
+            conn.execute("SELECT content_sha256 FROM report_evidence_state").fetchone()[
+                0
+            ]
+            == original_hash
+        )
+        assert conn.execute("SELECT count(*) FROM report_search").fetchone()[0] == 0
+    # Restoring accepted bytes restores the existing binding automatically.
+    md.write_text("# Apple\n\nApple AI outlook.")
+    assert reconcile_catalog(db)["source_status_counts"] == {"ready": 1}
+    assert (
+        upsert_report(db, {"report_id": "one", "title": "Wrong Company"})[
+            "evidence_index_status"
+        ]
+        == "source_changed"
+    )
+
+
+def test_transient_io_retries_without_edit_but_quarantined_content_does_not(tmp_path):
+    db, md = tmp_path / "catalog.sqlite", tmp_path / "source.md"
+    md.write_text("# Apple\n\nRevenue improves conditionally.")
+    with patch.object(Path, "read_bytes", side_effect=OSError("temporary offline")):
+        assert (
+            upsert_report(db, {"report_id": "one", "summary_md_path": str(md)})[
+                "evidence_index_status"
+            ]
+            == "error"
+        )
+    signature = md.stat()
+    with sqlite3.connect(db) as conn:
+        retry_at = datetime.fromisoformat(
+            conn.execute("SELECT next_retry_at FROM report_evidence_state").fetchone()[
+                0
+            ]
+        )
+    assert (
+        reconcile_catalog(db, now=retry_at - timedelta(seconds=1))["catalog_updated"]
+        == 0
+    )
+    assert reconcile_catalog(db, now=retry_at)["source_status_counts"] == {"ready": 1}
+    assert md.stat() == signature
+    md.write_text("password: synthetic-example-secret")
+    assert refresh_report(db, "one")["status"] == "error"
+    with patch.object(
+        Path,
+        "read_bytes",
+        side_effect=AssertionError("must not retry quarantined bytes"),
+    ):
+        assert (
+            reconcile_catalog(db, now=retry_at + timedelta(days=1))["catalog_updated"]
+            == 0
+        )
+
+
+def test_attestation_must_match_bytes_and_migration_preserves_known_version(tmp_path):
+    db, md = tmp_path / "catalog.sqlite", tmp_path / "source.md"
+    md.write_text("original evidence")
+    upsert_report(db, {"report_id": "one", "summary_md_path": str(md)})
+    with sqlite3.connect(db) as conn:
+        for column in ("identity_sha256", "error_kind", "retry_count", "next_retry_at"):
+            conn.execute(f"ALTER TABLE report_evidence_state DROP COLUMN {column}")
+        conn.execute("UPDATE report_evidence_state SET schema_version=1")
+    assert reconcile_catalog(db)["source_status_counts"] == {"ready": 1}
+    md.write_text("other evidence")
+    assert (
+        upsert_report(db, {"report_id": "one", "expected_source_sha256": "0" * 64})[
+            "evidence_index_status"
+        ]
+        == "source_changed"
+    )
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM report_search").fetchone()[0] == 0
+
+
+def test_ticker_changes_are_identity_changes_and_retry_backoff_is_bounded(tmp_path):
+    db, md = tmp_path / "catalog.sqlite", tmp_path / "source.md"
+    md.write_text("original evidence")
+    upsert_report(db, {"report_id": "one", "summary_md_path": str(md)})
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE reports SET tickers_json='[\"MSFT\"]'")
+    assert reconcile_catalog(db)["source_status_counts"] == {"source_changed": 1}
+    # A separate previously unread source cannot be stuck after transient I/O.
+    with patch.object(Path, "read_bytes", side_effect=OSError("temporarily offline")):
+        upsert_report(db, {"report_id": "retry", "summary_md_path": str(md)})
+        for attempt in range(8):
+            with sqlite3.connect(db) as conn:
+                retry_at = datetime.fromisoformat(
+                    conn.execute(
+                        "SELECT next_retry_at FROM report_evidence_state WHERE report_id='retry'"
+                    ).fetchone()[0]
+                )
+            reconcile_catalog(db, now=retry_at)
+            with sqlite3.connect(db) as conn:
+                count, next_at = conn.execute(
+                    "SELECT retry_count,next_retry_at FROM report_evidence_state WHERE report_id='retry'"
+                ).fetchone()
+            assert count == attempt + 2
+            assert (
+                0 < (datetime.fromisoformat(next_at) - retry_at).total_seconds() <= 3600
+            )
 
 
 def test_catalog_move_and_missing_pdf_are_distinct_from_bad_source(tmp_path):
@@ -184,7 +328,14 @@ def test_worker_records_catalog_failures_without_vault_before_raising(tmp_path):
 def test_sk_hynix_label_is_not_a_key_but_lowercase_key_is_excluded(tmp_path):
     db = tmp_path / "catalog.sqlite"
     md = tmp_path / "issuer.md"
-    md.write_text("# SK-Hynix-000660-KS-Project-2026E-OP-of-W251tr-Raise-TP-to-W3100k\n\nFindings.")
-    assert upsert_report(db, {"report_id": "issuer", "summary_md_path": str(md)})["evidence_index_status"] == "ready"
+    md.write_text(
+        "# SK-Hynix-000660-KS-Project-2026E-OP-of-W251tr-Raise-TP-to-W3100k\n\nFindings."
+    )
+    assert (
+        upsert_report(db, {"report_id": "issuer", "summary_md_path": str(md)})[
+            "evidence_index_status"
+        ]
+        == "ready"
+    )
     md.write_text("sk-" + "a" * 48)
     assert refresh_report(db, "issuer")["status"] == "error"

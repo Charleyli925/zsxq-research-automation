@@ -8,6 +8,7 @@ rewritten or its publication state to be revoked.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -118,9 +119,13 @@ class ArtifactSidecars:
 
         if self.library_root is None:
             return persisted.paths.markdown_path
+        if str(item.get("pdf_sha256", "")).strip().lower() != persisted.identity.pdf_sha256:
+            raise SidecarError("summary identity does not match this report's PDF hash")
         destination = _summary_destination(self.library_root, item)
-        _atomic_write(destination, persisted.entry.markdown.rstrip() + "\n")
-        self._upsert_library(item, destination, title=persisted.entry.title)
+        markdown = persisted.entry.markdown.rstrip() + "\n"
+        _atomic_write(destination, markdown)
+        self._upsert_library(item, destination, title=persisted.entry.title,
+                             source_sha256=hashlib.sha256(markdown.encode("utf-8")).hexdigest())
         return destination
 
     def archive_published_group(
@@ -139,7 +144,11 @@ class ArtifactSidecars:
             source = batch_items.get(str(entry.path))
             if source is None:
                 raise SidecarError(f"missing batch metadata for published path: {entry.path}")
-            files.append(dict(source))
+            # Use the committed summary title, consistent with persist_summary's
+            # catalog binding, rather than relabeling it with an import filename.
+            projected = dict(source)
+            projected["title"] = getattr(entry, "title", "") or projected.get("title", "")
+            files.append(projected)
         manifest_path = self.work_root / "sidecars" / f"obsidian-{uuid.uuid4().hex}.json"
         _atomic_write(manifest_path, json.dumps({"files": files}, ensure_ascii=False, indent=2) + "\n")
         # Keep ResearchLibrary's human-readable index in sync even on
@@ -216,7 +225,7 @@ class ArtifactSidecars:
             operation="upsert ResearchLibrary publication",
         )
 
-    def _upsert_library(self, item: Mapping[str, Any], summary_path: Path, *, title: str) -> None:
+    def _upsert_library(self, item: Mapping[str, Any], summary_path: Path, *, title: str, source_sha256: str = "") -> None:
         if self.library_root is None:
             return
         script = self.repository_root / "scripts" / "research_library_index.py"
@@ -244,6 +253,8 @@ class ArtifactSidecars:
                 str(item.get("path", "")),
                 "--summary-md-path",
                 str(summary_path),
+                "--expected-source-sha256",
+                source_sha256,
                 "--index-status",
                 "summary_created",
             ],

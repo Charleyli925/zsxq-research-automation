@@ -49,14 +49,27 @@ an Obsidian note or Lark publication exists. The writer owns its FTS row through
 report ID, remain independently owned. Markdown SHA-256 and file signatures
 track replacements, moves and deletions. Missing broker/date can be inferred
 from the report filename; import dates are never substituted for report dates.
+The accepted Markdown hash, path and catalog identity form a binding. Unattested
+content or identity replacements are quarantined as `source_changed`, keeping
+the accepted hash; even forced reconciliation cannot approve new bytes. The
+summary adapter checks the committed PDF identity and sends the SHA-256 of the
+Markdown it just generated (`--expected-source-sha256`). Only this explicit
+writer attestation can bind a new summary version to the current catalog report.
+This is a catalog binding, not semantic verification against the original PDF.
 
 The scheduled `kb_reconcile_search.py` CLI repairs both notes and catalog sources,
 with separate update budgets. Catalog reconciliation also runs when the vault
-is absent. It records source status (`ready`, `pdf_only`, `files_missing`, `error`),
+is absent. It records source status (`ready`, `pdf_only`, `files_missing`, `error`, `source_changed`),
 remaining updates, oldest waiting timestamp and last successful indexing time.
 Errors are retained in `kb-reconcile.json` before a nonzero exit is reported.
 `pdf_only` means no searchable Markdown, not full PDF indexing. Daily completion
 only skips reconciliation for that day; normal catalog updates remain immediate.
+Transient I/O failures retry without touching the file, starting after 60 seconds
+with exponential backoff capped at one hour, when the next writer reconciliation
+or incremental refresh runs. Unsafe/invalid content is quarantined and is not
+retried merely because time elapsed. Schema v2 migrates existing writer states;
+states without a comparable identity binding remain unknown to readers until
+the writer validates the accepted version.
 
 The Mac-files MCP consumer is maintained separately. It must open the database
 with `mode=ro` and `query_only=ON`, never import these writer helpers or invoke
