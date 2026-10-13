@@ -18,7 +18,7 @@ source scan
   -> archive + manifest reconciliation
   -> text extraction / OCR
   -> direct Codex summary + durable local Markdown / quarantine
-  -> ResearchLibrary readable-summary projection (best effort)
+  -> ResearchLibrary readable-summary projection + catalog-driven FTS update
   -> Lark document publication + notification outbox
   -> verified document -> Obsidian reading projection (best effort)
 ```
@@ -39,6 +39,34 @@ mtime. See [deployment.md](docs/deployment.md) and the
 Merging code does not install it. Production activation needs a separate
 explicit release decision and idle check; the repository no longer ships a
 second scheduler or legacy task wrapper.
+
+## Research evidence discovery
+
+`research_library_index.py upsert` now refreshes the existing `report_search`
+FTS when a catalog record changes. A persisted summary can be discovered before
+an Obsidian note or Lark publication exists. The writer owns its FTS row through
+`report_evidence_state`; legacy note rows, including distinct notes with the same
+report ID, remain independently owned. Markdown SHA-256 and file signatures
+track replacements, moves and deletions. Missing broker/date can be inferred
+from the report filename; import dates are never substituted for report dates.
+
+The scheduled `kb_reconcile_search.py` CLI repairs both notes and catalog sources,
+with separate update budgets. Catalog reconciliation also runs when the vault
+is absent. It records source status (`ready`, `pdf_only`, `files_missing`, `error`),
+remaining updates, oldest waiting timestamp and last successful indexing time.
+Errors are retained in `kb-reconcile.json` before a nonzero exit is reported.
+`pdf_only` means no searchable Markdown, not full PDF indexing. Daily completion
+only skips reconciliation for that day; normal catalog updates remain immediate.
+
+The Mac-files MCP consumer is maintained separately. It must open the database
+with `mode=ro` and `query_only=ON`, never import these writer helpers or invoke
+schema initialization/reconciliation. FTS is candidate discovery, not evidence:
+returned paragraphs must be read and authorized from their current source.
+
+Before activation: review/merge the Draft PR, choose a release explicitly, check
+the runtime is idle, deploy that SHA, then let bounded reconciliation drain.
+Monitor source statuses and waiting time; a recent report date alone is not a
+coverage check. Validation on database copies does not change production indexes.
 
 ## Repository layout
 

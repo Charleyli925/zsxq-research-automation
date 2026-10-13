@@ -233,8 +233,17 @@ def upsert_report(db_path: Path, payload: dict[str, Any]) -> dict[str, str]:
                 """,
                 values,
             )
+            # Summary persistence updates content discovery in this transaction,
+            # independently of Obsidian projection or remote publication.
+            try:
+                from research_evidence_index import refresh_catalog_source
+            except ModuleNotFoundError:
+                from scripts.research_evidence_index import refresh_catalog_source
+            current = conn.execute("SELECT * FROM reports WHERE report_id=?", (report_id,)).fetchone()
+            evidence = refresh_catalog_source(conn, dict(current))
 
-    return {"report_id": report_id, **merged}
+    return {"report_id": report_id, **merged, "evidence_index_status": evidence["status"],
+            "evidence_index_reason": evidence["reason"]}
 
 
 def stage_for_status(status: str) -> str:

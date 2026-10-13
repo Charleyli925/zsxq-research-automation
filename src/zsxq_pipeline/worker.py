@@ -303,7 +303,7 @@ class PipelineWorker:
         library = self.config.pipeline.research_library_root
         database = self.config.pipeline.research_library_database
         vault = self.config.pipeline.obsidian_vault_root
-        if library is None or database is None or vault is None:
+        if library is None or database is None:
             return
         marker = self.config.runtime.root / "state" / "kb-reconcile.json"
         prior: dict[str, Any] = {}
@@ -319,13 +319,13 @@ class PipelineWorker:
         completed = subprocess.run(
             [
                 sys.executable, str(script), "--db-path", str(database),
-                "--vault-root", str(vault), "--config-root", str(library / "config"),
+                "--vault-root", str(vault) if vault else "", "--config-root", str(library / "config"),
                 "--max-updates", "250",
             ],
             capture_output=True, text=True, check=False, shell=False,
             timeout=remaining,
         )
-        if completed.returncode:
+        if completed.returncode and not completed.stdout.strip():
             raise WorkerError(f"knowledge-base reconciliation failed with exit {completed.returncode}")
         result = json.loads(completed.stdout)
         payload = {
@@ -338,8 +338,13 @@ class PipelineWorker:
             "pending": result.get("pending", 0),
             "deleted": result.get("deleted", 0),
             "errors": result.get("errors", 0),
+            "catalog": {key: value for key, value in result.items()
+                        if key.startswith("catalog_") or key in {
+                            "source_status_counts", "last_successful_index_at", "oldest_pending_at", "last_checked_at"}},
         }
         _atomic_json(marker, payload)
+        if completed.returncode:
+            raise WorkerError(f"knowledge-base reconciliation recorded source errors: {completed.returncode}")
 
     def _extractor_version(self) -> str:
         return self.config.pipeline.extractor_version or "ocr-geometry-v2"
