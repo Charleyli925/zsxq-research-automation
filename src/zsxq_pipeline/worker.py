@@ -177,12 +177,11 @@ class PipelineWorker:
             if "schedule" in stages:
                 scheduled = self._scheduler.enqueue_due_windows(state, now=self.clock())
 
-        # Give daily index repair a bounded slot before a long download or
-        # summary run can exhaust the soft tick budget. Per-report archive
-        # updates remain the normal fast path.
-        if "schedule" in stages and deadline - self.monotonic() >= 30:
+        # Complete daily index repair before download/summary work. Per-report
+        # archive updates remain the normal fast path.
+        if "schedule" in stages:
             try:
-                self._maybe_reconcile_search(deadline)
+                self._maybe_reconcile_search()
             except Exception as exc:
                 failures.append(f"kb_reconcile:{type(exc).__name__}")
 
@@ -299,11 +298,11 @@ class PipelineWorker:
             failures=tuple(failures),
         )
 
-    def _maybe_reconcile_search(self, deadline: float) -> None:
+    def _maybe_reconcile_search(self) -> None:
         library = self.config.pipeline.research_library_root
         database = self.config.pipeline.research_library_database
         vault = self.config.pipeline.obsidian_vault_root
-        if library is None or database is None or vault is None:
+        if library is None or database is None:
             return
         marker = self.config.runtime.root / "state" / "kb-reconcile.json"
         prior: dict[str, Any] = {}
@@ -315,17 +314,14 @@ class PipelineWorker:
         script = Path(__file__).resolve().parents[2] / "scripts" / "kb_reconcile_search.py"
         if not script.is_file():
             raise WorkerError("knowledge-base reconciliation script is unavailable")
-        remaining = max(1, min(30, int(deadline - self.monotonic()) - 10))
         completed = subprocess.run(
             [
                 sys.executable, str(script), "--db-path", str(database),
-                "--vault-root", str(vault), "--config-root", str(library / "config"),
-                "--max-updates", "250",
+                "--vault-root", str(vault) if vault else "", "--config-root", str(library / "config"),
             ],
             capture_output=True, text=True, check=False, shell=False,
-            timeout=remaining,
         )
-        if completed.returncode:
+        if completed.returncode and not completed.stdout.strip():
             raise WorkerError(f"knowledge-base reconciliation failed with exit {completed.returncode}")
         result = json.loads(completed.stdout)
         payload = {
@@ -338,8 +334,13 @@ class PipelineWorker:
             "pending": result.get("pending", 0),
             "deleted": result.get("deleted", 0),
             "errors": result.get("errors", 0),
+            "catalog": {key: value for key, value in result.items()
+                        if key.startswith("catalog_") or key in {
+                            "source_status_counts", "last_successful_index_at", "oldest_pending_at", "last_checked_at"}},
         }
         _atomic_json(marker, payload)
+        if completed.returncode:
+            raise WorkerError(f"knowledge-base reconciliation recorded source errors: {completed.returncode}")
 
     def _extractor_version(self) -> str:
         return self.config.pipeline.extractor_version or "ocr-geometry-v2"

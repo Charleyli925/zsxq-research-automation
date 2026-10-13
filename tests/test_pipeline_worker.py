@@ -94,13 +94,15 @@ def test_daily_search_reconciliation_runs_once_per_day_and_records_progress(tmp_
     worker = PipelineWorker(config, clock=lambda: now[0])
     response = SimpleNamespace(returncode=0, stdout=json.dumps({"complete": True, "seen": 2, "updated": 1, "pending": 0, "deleted": 0, "errors": 0}))
     with mock.patch("zsxq_pipeline.worker.subprocess.run", return_value=response) as run:
-        worker._maybe_reconcile_search(worker.monotonic() + 60)
-        worker._maybe_reconcile_search(worker.monotonic() + 60)
+        worker._maybe_reconcile_search()
+        worker._maybe_reconcile_search()
         assert run.call_count == 1
+        assert "--max-updates" not in run.call_args.args[0]
+        assert "timeout" not in run.call_args.kwargs
         marker = config.runtime.root / "state" / "kb-reconcile.json"
         assert json.loads(marker.read_text(encoding="utf-8"))["last_completed_date"] == "2026-09-24"
         now[0] += timedelta(days=1)
-        worker._maybe_reconcile_search(worker.monotonic() + 60)
+        worker._maybe_reconcile_search()
         assert run.call_count == 2
 
 

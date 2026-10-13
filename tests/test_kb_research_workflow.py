@@ -16,6 +16,35 @@ import kb_health_report  # noqa: E402
 
 
 class KBResearchWorkflowTests(unittest.TestCase):
+    def test_metadata_matches_full_body_and_preserves_all_tags_and_evidence(self) -> None:
+        names = [f"Issuer{number}" for number in range(15)]
+        themes = [f"theme{number}" for number in range(10)]
+        text = "Background " + "x" * 20_001 + "\n\n"
+        text += "\n\n".join(f"{name} {name} findings." for name in names)
+        text += "\n\n" + "\n\n".join(f"{theme} {theme}." for theme in themes)
+        note = kb.NoteRecord(
+            path=Path("report.md"), link_target="10_Reports/report", frontmatter={},
+            body=text, title="Research findings", display_title="Research findings",
+        )
+        config = {
+            "entities": {"companies": [{"name": name, "aliases": [name]} for name in names]},
+            "themes": {"themes": [
+                {"name": theme, "keywords": [theme], "subthemes": [
+                    {"name": f"{theme}-sub1", "keywords": [theme]},
+                    {"name": f"{theme}-sub2", "keywords": [theme]},
+                ]} for theme in themes
+            ]},
+        }
+        self.assertEqual(kb.text_for_matching(note)[1], text)
+        self.assertEqual(set(kb.extract_entities(note, config)["companies"]), set(names))
+        extracted = kb.extract_themes(note, config)
+        self.assertEqual(set(extracted["themes"]), set(themes))
+        self.assertEqual(len(extracted["subthemes"]), 20)
+        numbers = "\n\n".join(f"Scenario {number}: revenue {number + 1}亿元 with conditions." for number in range(15))
+        self.assertEqual(len(kb.extract_key_numbers("x" * 20_001 + "\n\n" + numbers)), 15)
+        lines = [f"风险 {number}: " + "x" * 300 for number in range(12)]
+        self.assertEqual(kb.extract_bullet_like("\n".join(lines), ["风险"]), lines)
+
     def make_workspace(self) -> tuple[Path, Path, Path, Path]:
         tmp = Path(tempfile.mkdtemp())
         vault = tmp / "ResearchVault"

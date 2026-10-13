@@ -233,8 +233,17 @@ def upsert_report(db_path: Path, payload: dict[str, Any]) -> dict[str, str]:
                 """,
                 values,
             )
+            # Summary persistence updates content discovery in this transaction,
+            # independently of Obsidian projection or remote publication.
+            try:
+                from research_evidence_index import refresh_catalog_source
+            except ModuleNotFoundError:
+                from scripts.research_evidence_index import refresh_catalog_source
+            current = conn.execute("SELECT * FROM reports WHERE report_id=?", (report_id,)).fetchone()
+            evidence = refresh_catalog_source(conn, dict(current), expected_source_sha256=str(payload.get("expected_source_sha256") or ""))
 
-    return {"report_id": report_id, **merged}
+    return {"report_id": report_id, **merged, "evidence_index_status": evidence["status"],
+            "evidence_index_reason": evidence["reason"]}
 
 
 def stage_for_status(status: str) -> str:
@@ -545,6 +554,7 @@ def parse_args() -> argparse.Namespace:
     upsert_parser.add_argument("--raw-md-path", default="")
     upsert_parser.add_argument("--clean-md-path", default="")
     upsert_parser.add_argument("--summary-md-path", default="")
+    upsert_parser.add_argument("--expected-source-sha256", default="", help="Writer attestation for the Markdown just generated for this report; never supplied by MCP readers.")
     upsert_parser.add_argument("--obsidian-note-path", default="")
     upsert_parser.add_argument("--feishu-doc-url", default="")
     upsert_parser.add_argument("--index-status", default="")
@@ -615,6 +625,7 @@ def main() -> int:
             "raw_md_path": args.raw_md_path,
             "clean_md_path": args.clean_md_path,
             "summary_md_path": args.summary_md_path,
+            "expected_source_sha256": args.expected_source_sha256,
             "obsidian_note_path": args.obsidian_note_path,
             "feishu_doc_url": args.feishu_doc_url,
             "index_status": args.index_status,
