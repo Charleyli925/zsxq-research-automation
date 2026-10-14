@@ -10,6 +10,7 @@ from contextlib import closing
 from pathlib import Path
 
 from research_evidence_index import reconcile_catalog
+from research_library_index import ensure_schema
 
 from kb_common import (
     DEFAULT_CONFIG_ROOT,
@@ -40,6 +41,7 @@ def reconcile(db_path: Path, vault_root: Path, config_root: Path, *, max_updates
     report_root = vault_root / "10_Reports"
     if not report_root.is_dir():
         raise FileNotFoundError(f"report directory unavailable: {report_root}")
+    ensure_schema(db_path)
     with closing(sqlite3.connect(str(db_path), timeout=30)) as conn:
         with conn:
             ensure_search_table(conn)

@@ -1215,12 +1215,45 @@ def metadata_db_payload(note: NoteRecord, metadata: dict[str, Any]) -> dict[str,
     }
 
 
-def upsert_metadata(db_path: Path, note: NoteRecord, metadata: dict[str, Any], source: str) -> None:
+def upsert_metadata(
+    db_path: Path,
+    note: NoteRecord,
+    metadata: dict[str, Any],
+    source: str,
+    *,
+    attest_unchanged_summary: bool = False,
+) -> None:
     ensure_kb_schema(db_path)
     payload = metadata_db_payload(note, metadata)
     with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.row_factory = sqlite3.Row
         with conn:
-            existing = conn.execute("SELECT report_id FROM reports WHERE report_id = ?", (payload["report_id"],)).fetchone()
+            if attest_unchanged_summary:
+                conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT * FROM reports WHERE report_id = ?", (payload["report_id"],)).fetchone()
+            evidence = None
+            expected_hash = ""
+            if attest_unchanged_summary and existing is not None:
+                try:
+                    from research_evidence_index import ensure_evidence_schema, identity_sha256, refresh_catalog_source
+                except ModuleNotFoundError:
+                    from scripts.research_evidence_index import ensure_evidence_schema, identity_sha256, refresh_catalog_source
+                ensure_evidence_schema(conn)
+                evidence = conn.execute(
+                    "SELECT * FROM report_evidence_state WHERE report_id=?",
+                    (payload["report_id"],),
+                ).fetchone()
+                # The trusted archive may enrich labels on an already accepted
+                # summary, but must not bless a changed source or report identity.
+                if (
+                    evidence is not None
+                    and evidence["status"] == "ready"
+                    and evidence["source_kind"] == "summary"
+                    and evidence["source_path"] == existing["summary_md_path"]
+                    and evidence["identity_sha256"] == identity_sha256(dict(existing))
+                    and all(payload[key] == existing[key] for key in ("title", "pdf_path", "summary_md_path"))
+                ):
+                    expected_hash = evidence["content_sha256"]
             if existing is None:
                 conn.execute(
                     """
@@ -1240,6 +1273,12 @@ def upsert_metadata(db_path: Path, note: NoteRecord, metadata: dict[str, Any], s
             assignments = ", ".join(f"{key}=?" for key in payload if key != "report_id")
             values = [payload[key] for key in payload if key != "report_id"]
             conn.execute(f"UPDATE reports SET {assignments} WHERE report_id = ?", [*values, payload["report_id"]])
+            if evidence is not None:
+                current = conn.execute(
+                    "SELECT * FROM reports WHERE report_id=?", (payload["report_id"],)
+                ).fetchone()
+                # Byte validation and binding refresh share the metadata transaction.
+                refresh_catalog_source(conn, dict(current), expected_source_sha256=expected_hash)
             conn.execute(
                 """
                 INSERT INTO report_metadata_events(event_id, report_id, event_type, confidence, metadata_json, source, created_at)
