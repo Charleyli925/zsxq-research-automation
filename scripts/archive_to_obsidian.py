@@ -164,7 +164,13 @@ def enrich_note_metadata(
     if changed_fields:
         note_path.write_text(render_frontmatter(merged, body), encoding="utf-8")
         note = load_note(note_path, vault_root)
-    upsert_metadata(library_database or db_path_for_library(library_root), note, metadata, "archive_to_obsidian")
+    upsert_metadata(
+        library_database or db_path_for_library(library_root),
+        note,
+        metadata,
+        "archive_to_obsidian",
+        attest_unchanged_summary=True,
+    )
     return metadata
 
 

@@ -401,6 +401,11 @@ def reconcile_catalog(
 ) -> dict:
     if max_updates is not None and max_updates < 1:
         raise ValueError("max_updates must be positive")
+    try:
+        from research_library_index import ensure_schema
+    except ModuleNotFoundError:
+        from scripts.research_library_index import ensure_schema
+    ensure_schema(db_path)
     updated = pending = 0
     oldest_waiting = []
     checked_time = now or datetime.now(timezone.utc)
