@@ -41,6 +41,14 @@ Model names in a config are not proof of access: run a live request using the
 exact executable, credentials and ignored-user-config mode before cutover.
 Some ChatGPT sign-in environments may reject an otherwise documented model.
 
+When the local Codex desktop uses OpenCodex, set `[codex].routing_config_path`
+to that local Codex TOML. Both summary and digest adapters copy only its
+`openai_base_url` and `model_catalog_json` into explicit command-line overrides.
+They retain `--ignore-user-config` so hooks, MCP servers and unrelated settings
+are not inherited. No credentials are copied. A missing or invalid configured
+route fails instead of silently going to the default upstream. The same local
+OpenCodex service must be running when scheduled jobs execute.
+
 Research uses a scratch workspace with network access disabled. Trusted state,
 input PDFs and publication files are outside that writable workspace. Returned
 JSON cannot specify executable commands, file paths, destinations or XML.
@@ -96,7 +104,9 @@ same runtime lock and never overwrites a document.
 1. Review and merge the PR, then perform the repository's explicit idle-runtime
    release procedure. The feature defaults to `enabled = false`.
 2. Verify Poppler (`pdftoppm`, `pdftotext`), user Lark access and an actual
-   `gpt-6.1-sol/high` Codex call in the production launch environment.
+   `gpt-6.1-sol/high` Codex call in the production launch environment. If desktop
+   model access uses a local route, configure `routing_config_path` and verify
+   both structured output and image input through that exact route.
 3. Under the runtime lock, update both `[model].name` and `[codex].model` to
    `gpt-6.1-sol`, keeping `[codex].reasoning = "high"`. Never deploy an unsupported
    model into a functioning summary queue solely because a config parses.

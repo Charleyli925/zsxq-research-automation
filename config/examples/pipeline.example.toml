@@ -68,6 +68,9 @@ prompt_version = "summary-v1"
 reasoning = "high"
 timeout_seconds = 600
 work_root = "work/codex"
+# Optional: reuse a local Codex/OpenCodex endpoint and model catalog, while
+# continuing to ignore unrelated user settings, MCP servers and hooks.
+# routing_config_path = "/absolute/path/to/codex/config.toml"
 
 [daily_digest]
 # Enable only after the exact model/credential path passes a live probe,

@@ -70,6 +70,7 @@ class CodexConfig:
     prompt_path: Path | None
     system_prompt_path: Path | None
     output_schema_path: Path | None
+    routing_config_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -510,6 +511,7 @@ def _parse_model_and_codex(root: Path, model_raw: Any, codex_raw: Any) -> tuple[
             "prompt_path",
             "system_prompt_path",
             "output_schema_path",
+            "routing_config_path",
         },
     )
     if model_table:
@@ -540,6 +542,7 @@ def _parse_model_and_codex(root: Path, model_raw: Any, codex_raw: Any) -> tuple[
         prompt_path=_optional_within_root(root, codex_table.get("prompt_path"), field="codex.prompt_path"),
         system_prompt_path=_optional_within_root(root, codex_table.get("system_prompt_path"), field="codex.system_prompt_path"),
         output_schema_path=_optional_within_root(root, codex_table.get("output_schema_path"), field="codex.output_schema_path"),
+        routing_config_path=_optional_absolute_path(codex_table.get("routing_config_path"), field="codex.routing_config_path"),
     )
 
 

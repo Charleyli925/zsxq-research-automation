@@ -26,6 +26,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .config import PipelineConfig
+from .providers.local_routing import local_routing_arguments
 
 
 class DailyDigestError(RuntimeError):
@@ -207,6 +208,7 @@ class CodexDigestModel:
                    "--model", settings.model, "-c", f"model_reasoning_effort={json.dumps(settings.reasoning)}",
                    "-c", "sandbox_workspace_write.network_access=false", "--json",
                    "--output-schema", str(schema_path), "--output-last-message", str(result_path)]
+        command.extend(local_routing_arguments(self.config.codex.routing_config_path))
         for image in images:
             command.extend(("--image", str(image)))
         command.append("-")

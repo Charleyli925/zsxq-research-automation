@@ -22,6 +22,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Protocol
 
+from .local_routing import local_routing_arguments
+
 
 class CodexProviderError(RuntimeError):
     """Base error for the direct Codex provider."""
@@ -54,6 +56,7 @@ class CodexProviderConfig:
     timeout_seconds: float = 900.0
     terminate_grace_seconds: float = 10.0
     retain_workdir: bool = False
+    routing_config_path: Path | None = None
 
     def __post_init__(self) -> None:
         if not str(self.command).strip():
@@ -480,6 +483,7 @@ class CodexSummaryProvider:
             str(schema),
             "--output-last-message",
             str(output),
+            *local_routing_arguments(self.config.routing_config_path),
             "-",
         )
 
