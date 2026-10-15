@@ -20,8 +20,8 @@ outbox_quota = 50
 max_catchup_seconds = 259200
 
 [model]
-name = "logical-summary-model"
-provider = "logical-provider"
+name = "gpt-6.1-sol"
+provider = "codex"
 prompt_version = "summary-v1"
 
 [sources.foreign_reports]
@@ -63,11 +63,27 @@ schedule_times = ["08:20", "12:20", "16:20", "20:50"]
 # Absolute paths are allowed only for installed CLI executables; the release
 # entrypoint itself always resolves from runtime/current, never a dev checkout.
 command = "codex"
-model = "logical-summary-model"
+model = "gpt-6.1-sol"
 prompt_version = "summary-v1"
 reasoning = "high"
 timeout_seconds = 600
 work_root = "work/codex"
+# Optional: reuse a local Codex/OpenCodex endpoint and model catalog, while
+# continuing to ignore unrelated user settings, MCP servers and hooks.
+# routing_config_path = "/absolute/path/to/codex/config.toml"
+
+[daily_digest]
+# Enable only after the exact model/credential path passes a live probe,
+# state is seeded, and the previous chat automation has been disabled.
+enabled = false
+at = "21:00"
+model = "gpt-6.1-sol"
+reasoning = "high"
+timeout_seconds = 3600
+# Optional approved presentation rules and first-edition migration state;
+# copy these private files into the runtime before setting their paths.
+# rules_path = "daily-digest/editorial-rules.json"
+# seed_state = "daily-digest/chat-seed.json"
 
 [lark]
 command = "lark-cli"

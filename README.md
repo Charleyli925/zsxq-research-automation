@@ -5,6 +5,11 @@ an immutable download plan, archiving verified PDFs, extracting text,
 summarizing reports, publishing notifications, and maintaining a local
 research knowledge base.
 
+The optional [daily research digest](docs/daily-research-digest.md) adds a
+cross-report macro/industry selection with original PDF charts to the same
+worker. It defaults to disabled and requires an explicit model/access probe
+and publication cutover before use.
+
 The repository is the canonical source for code, prompts, tests, and
 configuration examples. Credentials, browser profiles, downloaded reports,
 runtime state, and machine-specific configuration stay outside Git.

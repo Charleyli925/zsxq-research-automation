@@ -220,6 +220,7 @@ class ProcessConfig:
     doc_group_threshold: int = 15
     max_files_per_document: int = 20
     preflight_path: Path | None = None
+    codex_routing_config_path: Path | None = None
 
     def __post_init__(self) -> None:
         root = _absolute(self.runtime_root)
@@ -302,6 +303,7 @@ class ProcessConfig:
             codex_reasoning=config.codex.reasoning,
             codex_timeout_seconds=config.codex.timeout_seconds,
             codex_work_root=config.codex.work_root,
+            codex_routing_config_path=config.codex.routing_config_path,
             prompt_path=prompt,
             system_prompt_path=system,
             text_cache_root=_inside(root, "text_cache", field_name="text_cache_root"),
@@ -437,6 +439,7 @@ class DigestProcessor:
                 reasoning=config.codex_reasoning,
                 work_root=config.codex_work_root,
                 timeout_seconds=config.codex_timeout_seconds,
+                routing_config_path=config.codex_routing_config_path,
             )
         )
         lark_config = LarkCliConfig(

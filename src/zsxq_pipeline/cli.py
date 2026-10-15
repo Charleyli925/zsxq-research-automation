@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from .config import ConfigError, load_pipeline_config, resolve_database
+from .daily_digest import DailyDigest, DailyDigestError
+from .lock import runtime_lock
 from .legacy_import import (
     LegacyImportError,
     apply_import_plan,
@@ -72,8 +74,22 @@ def _parser() -> argparse.ArgumentParser:
 
     run_stage = top.add_parser("run-stage", help="Run one existing unified worker stage under the shared runtime lock.")
     run_stage.add_argument("--config", required=True, help="Validated pipeline TOML configuration.")
-    run_stage.add_argument("--stage", required=True, choices=("download", "process", "outbox", "all"))
+    run_stage.add_argument("--stage", required=True, choices=("download", "process", "outbox", "daily-digest", "all"))
     run_stage.add_argument("--budget-seconds", type=int, help="Override the configured one-shot wall-clock budget.")
+
+    daily = top.add_parser("daily-digest", help="Inspect or reconcile the cross-report daily publication.")
+    daily_sub = daily.add_subparsers(dest="daily_command", required=True)
+    daily_status = daily_sub.add_parser("status", help="Read digest state without running a model or publishing.")
+    daily_status.add_argument("--config", required=True)
+    reconcile = daily_sub.add_parser("reconcile", help="Resolve exactly one inspected ambiguous remote write.")
+    reconcile.add_argument("--config", required=True)
+    reconcile.add_argument("--day", required=True)
+    reconcile.add_argument("--operation-index", type=int, required=True)
+    evidence = reconcile.add_mutually_exclusive_group(required=True)
+    evidence.add_argument("--receipt", help="JSON receipt of the already-applied write; content is fetched and verified.")
+    evidence.add_argument("--confirmed-not-applied", action="store_true", help="Operator has checked remote state and confirmed no write occurred.")
+    reconcile.add_argument("--reason", required=True, help="Record the remote inspection evidence.")
+    reconcile.add_argument("--apply", action="store_true", help="Persist the inspected reconciliation; otherwise preview only.")
 
     outbox = top.add_parser("outbox", help="Operate the durable notification outbox.")
     outbox_sub = outbox.add_subparsers(dest="outbox_command", required=True)
@@ -295,6 +311,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             outcome = PipelineWorker(load_pipeline_config(args.config)).tick(budget_seconds=args.budget_seconds)
             _emit(outcome.to_dict())
             return 0 if outcome.status in {"success", "busy"} else 1
+        if args.command == "daily-digest":
+            config = load_pipeline_config(args.config)
+            digest = DailyDigest(config)
+            if args.daily_command == "status":
+                _emit(digest.status())
+                return 0
+            with runtime_lock(config.runtime.root) as acquired:
+                if not acquired:
+                    _emit({"status": "busy"})
+                    return 0
+                receipt = json.loads(Path(args.receipt).read_text(encoding="utf-8")) if args.receipt else None
+                _emit(digest.reconcile(day=args.day, index=args.operation_index, receipt=receipt,
+                                      confirmed_not_applied=args.confirmed_not_applied,
+                                      reason=args.reason, apply=args.apply))
+            return 0
         if args.command == "run-stage":
             outcome = PipelineWorker(load_pipeline_config(args.config)).run_stage(
                 args.stage, budget_seconds=args.budget_seconds
@@ -355,6 +386,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         SchemaVersionError,
         StateError,
         WorkerError,
+        DailyDigestError,
         ValueError,
     ) as exc:
         print(f"zsxq-pipeline: {exc}", file=sys.stderr)

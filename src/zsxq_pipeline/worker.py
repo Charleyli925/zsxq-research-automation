@@ -18,6 +18,7 @@ from ._time import from_iso
 from .browser import CftLaunchOptions
 from .config import PipelineConfig, SourceConfig
 from .download import DOWNLOAD_RATE_LIMIT_REASON, DownloadOutcome, DownloadPipeline, DownloadRequest
+from .daily_digest import DailyDigest
 from .lark import LarkCliConfig, LarkNotifier
 from .lock import runtime_lock
 from .notify import (
@@ -56,6 +57,7 @@ class TickOutcome:
     notifications: tuple[NotificationDelivery, ...] = ()
     budget_exhausted: bool = False
     failures: tuple[str, ...] = ()
+    daily_digest: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -75,6 +77,7 @@ class TickOutcome:
             ],
             "budget_exhausted": self.budget_exhausted,
             "failures": list(self.failures),
+            "daily_digest": dict(self.daily_digest) if self.daily_digest is not None else None,
         }
 
 
@@ -115,6 +118,7 @@ class PipelineWorker:
         download_runner: DownloadRunner | None = None,
         process_runner: ProcessRunner | None = None,
         outbox_runner: OutboxRunner | None = None,
+        daily_digest_runner: Callable[[datetime], Mapping[str, Any]] | None = None,
     ) -> None:
         self.config = config
         self.clock = clock or (lambda: datetime.now().astimezone())
@@ -123,11 +127,12 @@ class PipelineWorker:
         self._download_runner = download_runner or DownloadPipeline().run
         self._process_runner = process_runner or self._run_process
         self._outbox_runner = outbox_runner or self._drain_outbox
+        self._daily_digest_runner = daily_digest_runner or DailyDigest(config).step
 
     def tick(self, *, budget_seconds: int | None = None) -> TickOutcome:
         """Discover due slots and keep durable notifications ahead of long work."""
 
-        return self._run(stages=("schedule", "download", "process", "outbox"), budget_seconds=budget_seconds)
+        return self._run(stages=("schedule", "daily-digest", "download", "process", "outbox"), budget_seconds=budget_seconds)
 
     def run_stage(self, stage: str, *, budget_seconds: int | None = None) -> TickOutcome:
         """Run one worker stage under the same lock/configuration as ``tick``."""
@@ -137,10 +142,11 @@ class PipelineWorker:
             "download": ("download",),
             "process": ("process",),
             "outbox": ("outbox",),
-            "all": ("download", "process", "outbox"),
+            "daily-digest": ("daily-digest",),
+            "all": ("daily-digest", "download", "process", "outbox"),
         }
         if normalized not in accepted:
-            raise WorkerError("run-stage must be download, process, outbox, or all")
+            raise WorkerError("run-stage must be download, process, outbox, daily-digest, or all")
         return self._run(stages=accepted[normalized], budget_seconds=budget_seconds)
 
     def _run(self, *, stages: tuple[str, ...], budget_seconds: int | None) -> TickOutcome:
@@ -162,6 +168,7 @@ class PipelineWorker:
         processed = 0
         notifications_by_key: dict[str, NotificationDelivery] = {}
         budget_exhausted = False
+        digest_outcome = None
 
         def drain_outbox() -> None:
             try:
@@ -184,6 +191,23 @@ class PipelineWorker:
                 self._maybe_reconcile_search()
             except Exception as exc:
                 failures.append(f"kb_reconcile:{type(exc).__name__}")
+
+        # Advance the cross-report job before long downloads/summary calls can
+        # consume every tick. A checkpoint may finish after the soft deadline;
+        # the next one waits for the next tick. No extra scheduler is installed.
+        if "daily-digest" in stages and self.config.daily_digest.enabled:
+            while not self._expired(deadline):
+                try:
+                    digest_outcome = self._daily_digest_runner(self.clock())
+                except Exception as exc:
+                    failures.append(f"daily-digest:{type(exc).__name__}")
+                    break
+                if digest_outcome.get("status") == "needs_reconciliation":
+                    failures.append("daily-digest:needs_reconciliation")
+                    break
+                if digest_outcome.get("status") not in {"research", "verify", "publish"}:
+                    break
+            budget_exhausted = self._expired(deadline)
 
         if "download" in stages:
             with PipelineState.open(self.config.runtime.database) as state:
@@ -296,6 +320,7 @@ class PipelineWorker:
             notifications=tuple(notifications_by_key.values()),
             budget_exhausted=budget_exhausted,
             failures=tuple(failures),
+            daily_digest=digest_outcome,
         )
 
     def _maybe_reconcile_search(self) -> None:

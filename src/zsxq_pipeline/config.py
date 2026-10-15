@@ -70,6 +70,7 @@ class CodexConfig:
     prompt_path: Path | None
     system_prompt_path: Path | None
     output_schema_path: Path | None
+    routing_config_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +127,19 @@ class LegacyConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DailyDigestConfig:
+    """Opt-in cross-report editorial job; independent of per-report summaries."""
+
+    enabled: bool = False
+    at: str = "21:00"
+    model: str = "gpt-6.1-sol"
+    reasoning: str = "high"
+    timeout_seconds: int = 3600
+    rules_path: Path | None = None
+    seed_state: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class PipelineConfig:
     schema_version: int
     runtime: RuntimeConfig
@@ -137,6 +151,7 @@ class PipelineConfig:
     codex: CodexConfig
     lark: LarkConfig
     pipeline: PipelineSettingsConfig
+    daily_digest: DailyDigestConfig = DailyDigestConfig()
 
     @property
     def schedule_timezone(self) -> str:
@@ -496,6 +511,7 @@ def _parse_model_and_codex(root: Path, model_raw: Any, codex_raw: Any) -> tuple[
             "prompt_path",
             "system_prompt_path",
             "output_schema_path",
+            "routing_config_path",
         },
     )
     if model_table:
@@ -526,6 +542,27 @@ def _parse_model_and_codex(root: Path, model_raw: Any, codex_raw: Any) -> tuple[
         prompt_path=_optional_within_root(root, codex_table.get("prompt_path"), field="codex.prompt_path"),
         system_prompt_path=_optional_within_root(root, codex_table.get("system_prompt_path"), field="codex.system_prompt_path"),
         output_schema_path=_optional_within_root(root, codex_table.get("output_schema_path"), field="codex.output_schema_path"),
+        routing_config_path=_optional_absolute_path(codex_table.get("routing_config_path"), field="codex.routing_config_path"),
+    )
+
+
+def _parse_daily_digest(root: Path, raw: Any) -> DailyDigestConfig:
+    table = _as_mapping(raw if raw is not None else {}, field="daily_digest")
+    _require_known(table, field="daily_digest", allowed={
+        "enabled", "at", "model", "reasoning", "timeout_seconds", "rules_path", "seed_state",
+    })
+    at = str(table.get("at", "21:00"))
+    _schedule_times({"schedule_times": [at]}, table_name="daily_digest")
+    model = str(table.get("model", "gpt-6.1-sol")).strip()
+    reasoning = str(table.get("reasoning", "high")).strip()
+    if not model or reasoning not in {"low", "medium", "high", "xhigh", "max", "ultra"}:
+        raise ConfigError("daily_digest requires a model and supported reasoning effort")
+    return DailyDigestConfig(
+        enabled=_boolean(table, "enabled", table_name="daily_digest", default=False),
+        at=at, model=model, reasoning=reasoning,
+        timeout_seconds=_positive_int(table, "timeout_seconds", table_name="daily_digest", default=3600),
+        rules_path=_optional_within_root(root, table.get("rules_path"), field="daily_digest.rules_path"),
+        seed_state=_optional_within_root(root, table.get("seed_state"), field="daily_digest.seed_state"),
     )
 
 
@@ -557,6 +594,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
             "pipeline",
             "publish_targets",
             "legacy",
+            "daily_digest",
         },
     )
     schema_version = raw.get("schema_version", 1)
@@ -593,6 +631,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         codex=codex,
         lark=_parse_lark(raw.get("lark")),
         pipeline=_parse_pipeline_settings(root, raw.get("pipeline")),
+        daily_digest=_parse_daily_digest(root, raw.get("daily_digest")),
     )
 
 
