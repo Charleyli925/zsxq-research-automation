@@ -212,13 +212,23 @@ class PipelineWorker:
         if "download" in stages:
             with PipelineState.open(self.config.runtime.database) as state:
                 state.migrate()
+                # The runtime lock proves any running row belongs to a
+                # prior interrupted worker. Resume its original frozen range,
+                # along with auth waits and partially reconciled downloads.
                 pending_windows = state.list_source_windows(
-                    statuses=("scheduled",), limit=self.config.schedule.download_quota
+                    statuses=("scheduled", "blocked_auth", "partial", "running")
                 )
+            auth_blocked_sources: set[str] = set()
+            attempted_windows = 0
             for row in pending_windows:
+                if str(row.get("source") or "") in auth_blocked_sources:
+                    continue
+                if attempted_windows >= self.config.schedule.download_quota:
+                    break
                 if self._expired(deadline):
                     budget_exhausted = True
                     break
+                attempted_windows += 1
                 try:
                     outcome = self._run_download_window(row)
                 except Exception as exc:
@@ -246,6 +256,10 @@ class PipelineWorker:
                             self._queue_download_blocked(row, outcome)
                         except Exception as exc:
                             failures.append(f"notify:{outcome.source}:download_blocked:{type(exc).__name__}")
+                    if reason_code == "need_reauth":
+                        # Another frozen range for the same source shares
+                        # this login. Other sources and local work may proceed.
+                        auth_blocked_sources.add(outcome.source)
                     if reason_code == DOWNLOAD_RATE_LIMIT_REASON:
                         # ZSXQ applies this refusal account-wide until the next
                         # natural day. Do not burn the remaining per-tick quota
@@ -547,19 +561,19 @@ class PipelineWorker:
         )
 
     def _run_download_window(self, row: Mapping[str, Any]) -> DownloadOutcome | None:
-        """Run only the uncovered suffix of a scheduled catch-up window.
+        """Preserve owed candidates; otherwise run only an uncovered suffix.
 
-        A transient browser outage can leave an older scheduled window while a
-        later tick durably records another coalesced window.  Once the older
-        one succeeds, the later row may already be fully covered.  Never scan
-        that range again merely because the schedule rows overlap.
+        Overlapping checkpoints can deduplicate windows only after their
+        registered download debts are settled. A suffix is a different window
+        identity and must not hide an original window's missing candidates.
         """
 
         request = self._download_request(row)
         with PipelineState.open(self.config.runtime.database) as state:
             state.migrate()
             checkpoint = state.latest_source_checkpoint(request.source)
-            if checkpoint is not None and checkpoint >= request.window_end:
+            has_debts = bool(state.list_window_download_debts(int(row["id"]), request.workflow_version))
+            if not has_debts and checkpoint is not None and checkpoint >= request.window_end:
                 state.register_source_window(
                     request.source,
                     request.window_start,
@@ -568,7 +582,7 @@ class PipelineWorker:
                     checkpoint_eligible=True,
                 )
                 return None
-        if checkpoint is not None and checkpoint > request.window_start:
+        if not has_debts and checkpoint is not None and checkpoint > request.window_start:
             request = replace(request, window_start=checkpoint)
         outcome = self._download_runner(request)
         if bool(getattr(outcome, "checkpoint_eligible", False)):

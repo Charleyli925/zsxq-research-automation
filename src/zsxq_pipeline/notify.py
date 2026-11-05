@@ -18,6 +18,7 @@ from typing import Any, Protocol
 
 from .lark import LarkCommandError
 from .model import NotificationClaim, NotificationRecord, PublicationRecord
+from .retry import retry_delay
 from .state import PipelineState
 
 
@@ -358,6 +359,8 @@ def _has_pending_document(state: PipelineState, claim: NotificationClaim) -> boo
 def is_auth_error(exc: Exception) -> bool:
     """Recognize explicit auth failures for publication and notification."""
 
+    if is_login_error(exc):
+        return True
     # A failed request to an OAuth/token endpoint can still be a transport
     # failure. Prefer the CLI's structured category to words in its URL.
     if isinstance(exc, LarkCommandError):
@@ -384,8 +387,60 @@ def is_auth_error(exc: Exception) -> bool:
         "token has expired", "token is expired", "refresh token expired",
         "token refresh failed", "failed to refresh", "refresh_token_reused",
         "user identity is missing", "permission denied", "permission_denied",
-        "insufficient permission", "access denied", "missing scope", "missing required scope",
+        "insufficient permission", "access denied", "missing scope", "missing_scope", "missing required scope",
         "insufficient_scope", "keychain access denied", "keychain get failed", "keychain not initialized",
+    ))
+
+
+def is_login_error(error: Exception | str) -> bool:
+    """Identify credentials a user can repair, excluding permission failures.
+
+    A valid login does not grant missing scopes or resource permissions. Only
+    explicit credential/login failures receive an automatic cooldown retry.
+    """
+    rendered = str(error)
+    diagnostic = error.diagnostic if isinstance(error, LarkCommandError) else ""
+    if not diagnostic:
+        prefix, separator, remainder = rendered.partition("{")
+        if separator and prefix.lstrip().startswith("lark-cli ") and " failed with status " in prefix:
+            # Stage recovery persists str(exc), not the exception object. Keep
+            # the CLI's structured category authoritative after that boundary.
+            diagnostic = "{" + remainder
+    payload = None
+    start = diagnostic.find("{")
+    if start >= 0:
+        try:
+            payload, _end = json.JSONDecoder().raw_decode(diagnostic[start:])
+        except (TypeError, ValueError):
+            pass
+    details = payload.get("error") if isinstance(payload, Mapping) else None
+    kind = str(details.get("type", "")).lower() if isinstance(details, Mapping) else ""
+    if kind in {
+        "network", "transport", "timeout", "permission", "permission_denied", "insufficient_scope",
+    }:
+        return False
+    text = rendered.lower()
+    if re.search(r"\b(?:http(?:/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*403\b", text):
+        return False
+    if any(marker in text for marker in (
+        "forbidden", "permission denied", "permission_denied", "insufficient permission",
+        "access denied", "missing scope", "missing_scope", "missing required scope", "insufficient_scope",
+    )):
+        return False
+    if kind in {"auth", "authentication", "authentication_error", "login"}:
+        return True
+    if re.search(r"\b(?:http(?:/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*401\b", text):
+        return True
+    return any(marker in text for marker in (
+        "unauthorized", "authentication failed", "authentication error", "authentication_error",
+        "authentication required", "authorization required", "requires authentication", "auth required", "credentials missing",
+        "login required", "not logged in", "please log in", "please login", "please sign in",
+        "session expired", "session has expired", "reauthentication required",
+        "user identity is missing", "invalid_api_key", "invalid api key",
+        "invalid access token", "invalid_access_token", "invalid refresh token", "invalid token",
+        "expired access token", "expired refresh token", "access_token_expired", "refresh_token_expired",
+        "token expired", "token has expired", "token is expired", "refresh token expired",
+        "token refresh failed", "failed to refresh", "refresh_token_reused",
     ))
 
 
@@ -444,7 +499,15 @@ class NotificationDrainer:
                 )
             except Exception as exc:
                 error = str(exc).strip() or type(exc).__name__
-                if is_auth_error(exc):
+                if is_login_error(exc):
+                    record = self.state.fail_notification(
+                        claim,
+                        retry_at=now + retry_delay(claim.attempt_count),
+                        error_code="notification_login_required",
+                        error_detail=error,
+                        now=now,
+                    )
+                elif is_auth_error(exc):
                     record = self.state.fail_notification(
                         claim,
                         error_code="notification_auth",
@@ -486,6 +549,7 @@ __all__ = [
     "export_notification_audit",
     "notification_idempotency_key",
     "is_auth_error",
+    "is_login_error",
     "render_batch_complete_notice",
     "render_download_blocked_notice",
     "render_download_complete_notice",

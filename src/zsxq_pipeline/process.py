@@ -16,7 +16,7 @@ import sys
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -42,6 +42,7 @@ from .notify import (
     enqueue_terminal_notification,
     export_notification_audit,
     is_auth_error,
+    is_login_error,
     render_document_notice,
 )
 from .providers.codex import (
@@ -57,12 +58,14 @@ from .providers.codex import (
 )
 from .publish import (
     PublicationError,
+    PublicationReconciliationRequired,
     SummaryForPublish,
     build_publication_groups,
     publish_group,
     resolve_same_day_capacity_target,
 )
 from .state import PipelineState
+from .retry import retry_delay
 from .sidecars import ArtifactSidecars, SidecarError
 from .summary import (
     PersistedSummary,
@@ -88,12 +91,9 @@ class ProcessBusyError(ProcessError):
     """Another digest process still holds the runtime lock."""
 
 
-# A direct model, extraction, or document-write failure may retry once after a
-# bounded cooldown.  Further automatic attempts would repeatedly consume the
-# same external capacity without new evidence, so they become an operator-
-# visible release block instead of an unbounded cron loop.
-_TRANSIENT_RETRY_DELAY = timedelta(minutes=5)
-_MAX_TRANSIENT_STAGE_ATTEMPTS = 2
+# Temporary failures retain durable retry times. A powered-off computer or an
+# expired login can recover days later, so lifetime claims are audit counters,
+# not a reason to turn network trouble into a permanent release block.
 
 
 class SummaryProvider(Protocol):
@@ -398,6 +398,8 @@ def _same_path(left: str | Path, right: str | Path) -> bool:
 def _failure_category(error: Exception) -> ErrorCategory:
     if isinstance(error, CodexTimeoutError):
         return ErrorCategory.TRANSIENT
+    if isinstance(error, PublicationReconciliationRequired):
+        return ErrorCategory.INVARIANT
     if isinstance(error, SummaryOutputValidationError):
         return ErrorCategory.INVARIANT
     if isinstance(error, (SummaryCacheCorruptionError,)):
@@ -730,32 +732,15 @@ class DigestProcessor:
     ) -> StageState:
         """Persist a bounded retry policy for side-effecting pipeline stages."""
 
-        if category is not ErrorCategory.TRANSIENT:
-            return state.fail_stage(
-                claim,
-                category=category,
-                error_code=error_code,
-                error_detail=error_detail,
-                now=self.clock(),
-            )
-        if claim.attempt_count >= _MAX_TRANSIENT_STAGE_ATTEMPTS:
-            exhausted_detail = (
-                f"{error_detail.strip() or error_code}; transient retry budget "
-                f"({_MAX_TRANSIENT_STAGE_ATTEMPTS} attempts) exhausted"
-            )
-            return state.fail_stage(
-                claim,
-                category=ErrorCategory.RELEASE_CONTRACT,
-                error_code=f"{error_code}_retry_exhausted",
-                error_detail=exhausted_detail,
-                now=self.clock(),
-            )
+        retryable = category is ErrorCategory.TRANSIENT or (
+            category is ErrorCategory.AUTH and is_login_error(error_detail)
+        )
         return state.fail_stage(
             claim,
-            category=ErrorCategory.TRANSIENT,
+            category=category,
             error_code=error_code,
             error_detail=error_detail,
-            retry_at=self.clock() + _TRANSIENT_RETRY_DELAY,
+            retry_at=self.clock() + retry_delay(claim.attempt_count) if retryable else None,
             now=self.clock(),
         )
 
@@ -1085,6 +1070,19 @@ class DigestProcessor:
                     system_prompt=self._system_prompt,
                     expected_paths=job.expected_paths,
                 )
+            )
+            # Commit this completed report before waiting for sibling jobs.
+            # A power loss during another model call must not discard an
+            # already-valid summary. SQLite remains owned by the main thread.
+            item, identity, _claim = job_context[job.job_id]
+            output_json, output_markdown = self._summary_output_paths(identity)
+            persist_summary_batch(
+                manifest,
+                result,
+                identities={str(item["path"]): identity},
+                store=self.summary_store,
+                output_json=output_json,
+                output_markdown=output_markdown,
             )
             usage = getattr(result, "usage", {})
             if isinstance(usage, Mapping) and usage:

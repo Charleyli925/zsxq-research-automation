@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from zsxq_pipeline.config import load_pipeline_config
-from zsxq_pipeline.download import DOWNLOAD_RATE_LIMIT_REASON
+from zsxq_pipeline.download import DOWNLOAD_RATE_LIMIT_REASON, DownloadPipeline
 from zsxq_pipeline.lock import runtime_lock
-from zsxq_pipeline.model import Stage
+from zsxq_pipeline.model import ErrorCategory, Stage
 from zsxq_pipeline.notify import (
     BATCH_COMPLETE_EVENT,
     DOWNLOAD_BLOCKED_EVENT,
@@ -457,3 +460,168 @@ def test_process_statuses_are_one_start_one_milestone_then_one_completion(tmp_pa
         ]
         assert "总结 **8/8**｜发布 **8/8**" in notifications[-1].payload["markdown"]
         assert notifications[-1].payload["terminal"] is True
+
+
+@pytest.mark.parametrize("pending_status", ["blocked_auth", "partial", "running"])
+def test_download_stage_resumes_original_pending_window_without_a_new_schedule(tmp_path, pending_status):
+    config = _config(tmp_path)
+    start = datetime(2026, 8, 10, 7, 0, tzinfo=UTC)
+    end = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        original_id = state.register_source_window("foreign", start, end, status=pending_status)
+        generic_id = state.register_source_window(
+            "domestic", start - timedelta(days=1), end - timedelta(days=1), status="blocked",
+        )
+    calls = []
+
+    def download(request):
+        calls.append((request.source, request.window_start, request.window_end))
+        return SimpleNamespace(status="success", source=request.source, checkpoint_eligible=True)
+
+    outcome = PipelineWorker(config, download_runner=download, outbox_runner=lambda max_items: ()).run_stage("download")
+
+    assert outcome.status == "success"
+    assert calls == [("foreign", start, end)]
+    with PipelineState.open(config.runtime.database) as state:
+        windows = {row["id"]: row for row in state.list_source_windows()}
+        assert windows[original_id]["status"] == "succeeded"
+        assert windows[original_id]["checkpoint_eligible"] == 1
+        assert windows[generic_id]["status"] == "blocked"
+        assert windows[generic_id]["checkpoint_eligible"] == 0
+        assert state.table_count("source_windows") == 2
+
+
+def test_auth_failure_skips_sibling_windows_but_keeps_other_source_and_local_work(tmp_path):
+    config = _notification_config(tmp_path)
+    start = datetime(2026, 8, 10, 7, 0, tzinfo=UTC)
+    end = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        # More siblings than the quota must not hide another source behind
+        # windows skipped after the first login failure.
+        for index in range(config.schedule.download_quota + 1):
+            state.register_source_window("foreign", start, end + timedelta(minutes=index), status="blocked_auth")
+        state.register_source_window("domestic", start, end + timedelta(minutes=10), status="scheduled")
+        pdf = tmp_path / "already-downloaded.pdf"
+        pdf.write_bytes(b"synthetic-existing-pdf")
+        document = state.upsert_document("foreign", "existing", filename=pdf.name, source_path=pdf)
+        state.record_artifact(document.id, kind="pdf", path=pdf, pdf_sha256="a" * 64)
+    calls = []
+    processes = []
+    drains = []
+
+    def download(request):
+        calls.append(request.source)
+        blocked = request.source == "foreign"
+        with PipelineState.open(config.runtime.database) as state:
+            state.register_source_window(
+                request.source, request.window_start, request.window_end,
+                status="blocked_auth" if blocked else "succeeded", checkpoint_eligible=not blocked,
+            )
+        return SimpleNamespace(
+            status="blocked" if blocked else "success", source=request.source,
+            reason_code="need_reauth" if blocked else "download_completed", checkpoint_eligible=not blocked,
+            downloaded_entries=(),
+        )
+
+    def process(source, rows):
+        processes.append(source)
+        return SimpleNamespace(status="success")
+
+    def outbox(max_items):
+        drains.append(max_items)
+        return ()
+
+    worker = PipelineWorker(config, download_runner=download, process_runner=process, outbox_runner=outbox)
+    first = worker.run_stage("all")
+    second = worker.run_stage("download")
+
+    assert first.status == "partial"
+    assert first.downloaded == 1
+    assert first.processed == 1
+    assert processes == ["foreign"]
+    assert drains
+    assert calls == ["foreign", "domestic", "foreign"]
+    assert second.failures == ("download:foreign:blocked:need_reauth",)
+    with PipelineState.open(config.runtime.database) as state:
+        alerts = [item for item in state.list_notifications() if item.event == DOWNLOAD_BLOCKED_EVENT]
+        assert len(alerts) == 1
+        assert state.latest_source_checkpoint("foreign") is None
+        assert state.latest_source_checkpoint("domestic") == end + timedelta(minutes=10)
+
+
+@pytest.mark.parametrize("checkpoint_minutes", [30, 90])
+def test_download_debt_keeps_original_window_despite_an_overlapping_checkpoint(tmp_path, checkpoint_minutes):
+    config = _config(tmp_path)
+    start = datetime(2026, 8, 10, 7, 0, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    checkpoint = start + timedelta(minutes=checkpoint_minutes)
+    workflow = config.sources["foreign"].workflow_version
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        original_id = state.register_source_window("foreign", start, end, status="blocked_auth")
+        document = state.upsert_document("foreign", "owed-file", filename="owed.pdf", source_window_id=original_id)
+        state.ensure_stage(document.id, Stage.DOWNLOAD, workflow)
+        claim = state.claim_due_stage(Stage.DOWNLOAD, workflow, document_ids=(document.id,))
+        state.fail_stage(
+            claim, category=ErrorCategory.AUTH, error_code="need_reauth",
+            retry_at=end + timedelta(minutes=5),
+        )
+        state.register_source_window(
+            "foreign", start - timedelta(hours=1), checkpoint, status="succeeded", checkpoint_eligible=True,
+        )
+        row = next(item for item in state.list_source_windows() if item["id"] == original_id)
+    calls = []
+    empty_scanner = SimpleNamespace(
+        load_json=lambda path: {}, load_persistent_config=lambda path: {},
+        scan_window=lambda page, **kwargs: {
+            "download_candidates": [], "window_new_docs_count": 0, "download_candidate_count": 0,
+        },
+    )
+    pipeline = DownloadPipeline(
+        browser_session_factory=lambda *args, **kwargs: nullcontext(SimpleNamespace(page=object())),
+        scanner=empty_scanner,
+    )
+
+    def download(request):
+        calls.append((request.window_start, request.window_end))
+        return pipeline.run(request)
+
+    worker = PipelineWorker(config, download_runner=download, outbox_runner=lambda max_items: ())
+    outcome = worker._run_download_window(row)
+
+    assert calls == [(start, end)]
+    assert outcome is not None and outcome.checkpoint_eligible is False
+    assert {item["source_file_id"] for item in outcome.missing_entries} == {"owed-file"}
+    with PipelineState.open(config.runtime.database) as state:
+        original = next(item for item in state.list_source_windows() if item["id"] == original_id)
+        assert original["checkpoint_eligible"] == 0
+        assert original["status"] == "blocked_auth"
+        assert state.latest_source_checkpoint("foreign") == checkpoint
+        assert len(state.list_window_download_debts(original_id, workflow)) == 1
+
+
+def test_download_without_debt_keeps_the_uncovered_suffix_optimization(tmp_path):
+    config = _config(tmp_path)
+    start = datetime(2026, 8, 10, 7, 0, tzinfo=UTC)
+    middle = start + timedelta(minutes=30)
+    end = start + timedelta(hours=1)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        original_id = state.register_source_window("foreign", start, end, status="partial")
+        state.register_source_window("foreign", start, middle, status="succeeded", checkpoint_eligible=True)
+        row = next(item for item in state.list_source_windows() if item["id"] == original_id)
+    calls = []
+
+    def download(request):
+        calls.append((request.window_start, request.window_end))
+        return SimpleNamespace(status="success", source="foreign", checkpoint_eligible=True)
+
+    worker = PipelineWorker(config, download_runner=download, outbox_runner=lambda max_items: ())
+    assert worker._run_download_window(row).checkpoint_eligible is True
+    assert calls == [(middle, end)]
+    with PipelineState.open(config.runtime.database) as state:
+        original = next(item for item in state.list_source_windows() if item["id"] == original_id)
+        assert original["status"] == "succeeded"
+        assert original["checkpoint_eligible"] == 1

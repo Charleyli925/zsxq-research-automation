@@ -65,6 +65,47 @@ def test_missed_slots_coalesce_from_last_successful_checkpoint(tmp_path):
         assert scheduler.enqueue_due_windows(state, now=now) == ()
 
 
+
+@pytest.mark.parametrize("has_schedule_cursor", [False, True])
+def test_week_offline_resumes_the_full_checkpoint_gap_after_restart(tmp_path, has_schedule_cursor):
+    config = _config(tmp_path, max_catchup_seconds=3 * 86400)
+    checkpoint = datetime(2026, 8, 3, 8, 0, tzinfo=UTC)  # 16:00 Asia/Shanghai
+    now = datetime(2026, 8, 10, 9, 5, tzinfo=UTC)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        if has_schedule_cursor:
+            state.schedule_source_window(
+                "foreign", checkpoint - timedelta(hours=4), checkpoint,
+                due_cursor=checkpoint, truncated=False,
+            )
+        state.register_source_window(
+            "foreign", checkpoint - timedelta(hours=4), checkpoint,
+            status="succeeded", checkpoint_eligible=True,
+        )
+
+    # Reopen state as the login-time worker does after a machine restart.
+    with PipelineState.open(config.runtime.database) as state:
+        windows = PipelineScheduler(config).enqueue_due_windows(state, now=now)
+        assert len(windows) == 1
+        window = windows[0]
+        assert window.window_start == checkpoint
+        assert window.window_end == now
+        assert len(window.due_slots) == 21
+        assert window.truncated is False
+        assert state.latest_source_checkpoint("foreign") == checkpoint
+        assert state.get_schedule_cursor("foreign") == window.due_slots[-1]
+
+    # The persisted window survives a second restart without duplicating work.
+    with PipelineState.open(config.runtime.database) as state:
+        assert PipelineScheduler(config).enqueue_due_windows(state, now=now) == ()
+        assert len(state.list_source_windows()) == 2
+        state.register_source_window(
+            "foreign", window.window_start, window.window_end,
+            status="succeeded", checkpoint_eligible=True,
+        )
+        assert state.latest_source_checkpoint("foreign") == now
+
+
 def test_bootstrap_catchup_reports_explicit_truncation(tmp_path):
     config = _config(tmp_path, max_catchup_seconds=3600)
     now = datetime(2026, 8, 10, 8, 10, tzinfo=UTC)  # 16:10 Asia/Shanghai

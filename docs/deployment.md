@@ -106,9 +106,12 @@ authorization. Before requeueing terminal failures:
 
 A WebSocket upgrade diagnostic alone does not establish the final failure:
 inspect the CLI exit code and the final response. `model_not_found` is a
-configuration or model-access failure and stops for repair; network EOF or a
-502 response remains retryable, including an EOF from an OAuth token endpoint.
-The word `token` in a URL or a usage field is not evidence of an expired login.
+configuration or model-access failure and stops for repair. Explicit login
+expiry and temporary network/429 failures retain cooldown retries as described
+in [runtime-recovery.md](runtime-recovery.md). An OAuth token endpoint EOF is a
+network failure; the word `token` in a URL or usage field is not evidence of an
+expired login. A document-body write with an uncertain remote outcome requires
+reconciliation before another write.
 
 ## Research full-text index
 

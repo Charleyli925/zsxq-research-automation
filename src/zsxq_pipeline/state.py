@@ -571,6 +571,42 @@ class PipelineState:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_window_download_debts(
+        self, source_window_id: int, workflow_version: str,
+    ) -> list[dict[str, Any]]:
+        """Keep previously planned downloads owed when a later scan omits them.
+
+        Only success or explicitly quarantined source protection settles a
+        candidate. A missing matching workflow is still debt; another source,
+        window, or workflow cannot acknowledge it.
+        """
+        self._require_migrated()
+        workflow = str(workflow_version).strip()
+        if int(source_window_id) < 1 or not workflow:
+            raise ValueError("a source window id and download workflow are required")
+        rows = self._connection.execute(
+            """
+            SELECT documents.id AS document_id, documents.source_file_id,
+                   documents.filename, attempt.state, attempt.error_code
+            FROM source_windows AS window
+            JOIN documents ON documents.source_window_id=window.id
+              AND documents.source=window.source
+            LEFT JOIN stage_attempts AS attempt
+              ON attempt.document_id=documents.id AND attempt.stage='download'
+             AND attempt.workflow_version=?
+            WHERE window.id=? AND (
+              attempt.id IS NULL OR NOT (
+                attempt.state='succeeded' OR (
+                  attempt.state='quarantined' AND attempt.error_code='source_content_protected'
+                )
+              )
+            )
+            ORDER BY documents.id
+            """,
+            (workflow, int(source_window_id)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def source_window_progress(self, source_window_id: int) -> dict[str, Any] | None:
         """Return exact PDF, summary, and publication counts for one source window.
 
@@ -1172,13 +1208,15 @@ class PipelineState:
         """Persist a category-driven failure outcome and release the worker lease."""
 
         normalized_category = as_error_category(category)
-        if normalized_category is ErrorCategory.TRANSIENT:
+        if normalized_category is ErrorCategory.TRANSIENT or (
+            normalized_category is ErrorCategory.AUTH and retry_at is not None
+        ):
             next_time = retry_at if retry_at is not None else now or utc_now()
             _, available_iso, available_epoch = _timestamp(next_time)
             next_state = StageState.RETRY_WAIT
         else:
             if retry_at is not None:
-                raise ValueError("only transient failures may have retry_at")
+                raise ValueError("only transient or auth failures may have retry_at")
             available_iso = None
             available_epoch = None
             next_state = {
@@ -1503,6 +1541,47 @@ class PipelineState:
             ).fetchone()
         assert row is not None
         return _row_publication(row)
+
+    def set_publication_write_in_flight(
+        self,
+        publication_id: int,
+        *,
+        in_flight: bool,
+        now: datetime | None = None,
+    ) -> PublicationRecord:
+        """Guard one intent's remote body write without rewinding receipts.
+
+        Only an intent without a remote reference may change this marker. A
+        second writer cannot claim an already in-flight intent, and verified
+        remote-written or successful publications can never be reset here.
+        """
+
+        self._require_migrated()
+        if int(publication_id) < 1 or not isinstance(in_flight, bool):
+            raise ValueError("a publication id and boolean in_flight are required")
+        _, now_iso, now_epoch = _timestamp(now)
+        with self._write_transaction():
+            row = self._connection.execute(
+                "SELECT * FROM publications WHERE id=?", (int(publication_id),)
+            ).fetchone()
+            if row is None:
+                raise InvariantViolation("publication write marker requires an existing intent")
+            record = _row_publication(row)
+            if record.state is not PublicationState.INTENT or record.remote_reference:
+                raise InvariantViolation("publication write marker cannot change a durable remote receipt")
+            details = dict(record.details)
+            if in_flight and details.get("write_in_flight"):
+                raise InvariantViolation("publication body write is already in flight")
+            details["write_in_flight"] = in_flight
+            self._connection.execute(
+                "UPDATE publications SET details_json=?, updated_at_iso=?, updated_at_epoch=? WHERE id=?",
+                (_json(details), now_iso, now_epoch, record.id),
+            )
+            updated = self._connection.execute(
+                "SELECT * FROM publications WHERE id=?", (record.id,)
+            ).fetchone()
+        assert updated is not None
+        return _row_publication(updated)
 
     def record_remote_write(
         self,
