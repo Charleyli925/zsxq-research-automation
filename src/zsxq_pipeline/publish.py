@@ -12,18 +12,26 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import re
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Protocol, Sequence
+from urllib.parse import urlsplit
 
+from .lark import LarkCommandError
 from .model import PublicationState
+from .notify import is_login_error
 from .state import PipelineState
 
 
 class PublicationError(RuntimeError):
     """A remote publication was not safely verified."""
+
+
+class PublicationReconciliationRequired(PublicationError):
+    """A body write may have happened and must be inspected before retry."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +274,16 @@ def _publication_details(group: PublicationGroup, *, target_document: str, creat
         "entry_count": len(group.entries),
         "target_document": target_document,
         "created_document": created_document,
+        "entries": [
+            {
+                "summary_sha256": entry.summary_sha256,
+                "source": entry.source,
+                "path": entry.path,
+                "filename": entry.filename,
+                "source_date": entry.source_date,
+            }
+            for entry in group.entries
+        ],
     }
 
 
@@ -365,6 +383,96 @@ def _verify_remote(
         publisher.grant_chat_view(reference, chat_id)
 
 
+
+
+def _member_keys(entries: Any) -> set[tuple[str, str, str]]:
+    """Keep a report's identity independent of its publication partition."""
+
+    keys: set[tuple[str, str, str]] = set()
+    if not isinstance(entries, (list, tuple)):
+        return keys
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        source = _canonical_text(entry.get("source", ""))
+        path = _canonical_text(entry.get("path", ""))
+        digest = _canonical_text(entry.get("summary_sha256", ""))
+        if path:
+            keys.add(("path", source, path))
+        if digest:
+            keys.add(("summary", source, digest))
+    return keys
+
+
+def _guard_prior_body_writes(state: PipelineState, group: PublicationGroup) -> None:
+    """A changed batch must not repeat a previously attempted report write."""
+
+    expected = _member_keys(_publication_details(
+        group, target_document=group.target_document, created_document=not bool(group.target_document),
+    )["entries"])
+    for record in state.list_publications(
+        target=group.target,
+        states=(PublicationState.INTENT, PublicationState.REMOTE_WRITTEN, PublicationState.SUCCESS),
+    ):
+        details = record.details
+        uncertain = record.state is PublicationState.INTENT and details.get("write_in_flight")
+        if record.state is PublicationState.INTENT and not uncertain:
+            continue
+        members = _member_keys(details.get("entries"))
+        # Older in-flight rows without member metadata cannot establish that a
+        # new group is unrelated. Require inspection rather than guessing.
+        if uncertain and not members:
+            raise PublicationReconciliationRequired(
+                f"publication {record.id} has an unfinished body write without report members; "
+                "inspect remote state before retry"
+            )
+        if expected.intersection(members):
+            reason = "an unfinished body write" if uncertain else "a recorded body write"
+            raise PublicationReconciliationRequired(
+                f"publication {record.id} has {reason} affecting this target's report members; "
+                "inspect remote state before retry"
+            )
+
+
+def _body_write_definitely_not_applied(error: Exception) -> bool:
+    """Accept only a definite rejection or failure before document API use."""
+
+    if not isinstance(error, LarkCommandError):
+        return False
+    payload = None
+    start = error.diagnostic.find("{")
+    if start >= 0:
+        try:
+            payload, _end = json.JSONDecoder().raw_decode(error.diagnostic[start:])
+        except (TypeError, ValueError):
+            pass
+    detail = payload.get("error") if isinstance(payload, Mapping) else None
+    kind = str(detail.get("type", "")).lower() if isinstance(detail, Mapping) else ""
+    text = str(detail.get("message", error.diagnostic)).lower() if isinstance(detail, Mapping) else error.diagnostic.lower()
+    # Publication and stage/outbox recovery must agree on login refusals. The
+    # shared helper keeps a structured network category authoritative even if
+    # its diagnostic happens to mention credentials.
+    if is_login_error(error):
+        return True
+    if kind not in {"network", "transport", "timeout"}:
+        if kind in {"authorization", "permission", "permission_denied", "insufficient_scope"}:
+            return True
+        if re.search(r"\b(?:http(?:/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:401|403)\b", text):
+            return True
+    if kind not in {"", "network", "transport"} or "eof" not in text:
+        return False
+    # A failed token exchange precedes the document API request. An EOF from
+    # the document endpoint itself leaves the remote write outcome unknown.
+    for raw in re.findall(r'https?://[^\s"\\]+', text):
+        url = urlsplit(raw)
+        if (
+            url.hostname and url.hostname.endswith((".feishu.cn", ".larksuite.com"))
+            and "/oauth/" in url.path and url.path.rstrip("/").endswith("/token")
+        ):
+            return True
+    return False
+
+
 def publish_group(
     state: PipelineState,
     publisher: LarkPublicationClient,
@@ -374,9 +482,9 @@ def publish_group(
 ) -> PublishedDocument:
     """Publish or resume one deterministic group.
 
-    A ``remote_written`` row is intentionally verified and granted again on a
-    retry.  It is never created or appended again, even if a process crashed
-    just after Lark accepted the original write.
+    A ``remote_written`` row is verified without rewriting its body. An intent
+    marked in-flight has no durable receipt yet; recovery must reconcile that
+    uncertain write rather than automatically create or append again.
     """
 
     existing = _get_publication(state, group)
@@ -415,22 +523,44 @@ def publish_group(
         if not reference:
             raise PublicationError("remote_written publication has no remote reference")
     else:
-        remote = (
-            publisher.append_document(group.target_document, group.markdown)
-            if group.target_document
-            else publisher.create_document(group.markdown)
-        )
-        reference = _remote_reference(remote)
+        _guard_prior_body_writes(state, group)
+        details = getattr(existing, "details", {})
+        if isinstance(details, Mapping) and details.get("write_in_flight"):
+            raise PublicationReconciliationRequired(
+                f"publication {existing.id} has an unfinished body write; inspect remote state before retry"
+            )
+        state.set_publication_write_in_flight(existing.id, in_flight=True)
+        try:
+            remote = (
+                publisher.append_document(group.target_document, group.markdown)
+                if group.target_document
+                else publisher.create_document(group.markdown)
+            )
+            reference = _remote_reference(remote)
+        except Exception as exc:
+            if _body_write_definitely_not_applied(exc):
+                state.set_publication_write_in_flight(existing.id, in_flight=False)
+                raise
+            raise PublicationReconciliationRequired(
+                f"publication {existing.id} body write has no durable receipt; inspect remote state before retry"
+            ) from exc
         if not reference:
-            raise PublicationError("Lark write returned no document reference")
+            raise PublicationReconciliationRequired(
+                f"publication {existing.id} write returned no document reference; inspect remote state before retry"
+            )
         # This is deliberately before title/fetch/permission verification.
         effective_group = replace(group, target_document=group.target_document or reference)
-        _record_remote_write(
-            state,
-            group,
-            reference=reference,
-            target_document=effective_group.target_document,
-        )
+        try:
+            _record_remote_write(
+                state,
+                group,
+                reference=reference,
+                target_document=effective_group.target_document,
+            )
+        except Exception as exc:
+            raise PublicationReconciliationRequired(
+                f"publication {existing.id} remote receipt could not be persisted; inspect remote state before retry"
+            ) from exc
         created = not bool(group.target_document)
         created_document = created
 

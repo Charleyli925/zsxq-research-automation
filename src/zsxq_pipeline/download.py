@@ -311,6 +311,20 @@ class DownloadPipeline:
         return documents
 
     @staticmethod
+    def _window_debts(
+        state: PipelineState, source_window_id: int, workflow_version: str,
+    ) -> list[Mapping[str, Any]]:
+        return [
+            {
+                "source_file_id": item["source_file_id"],
+                "filename": item["filename"],
+                "reason_code": "need_reauth" if item["error_code"] == "need_reauth" else "planned_candidate_unsettled",
+                "stage_state": item["state"],
+            }
+            for item in state.list_window_download_debts(source_window_id, workflow_version)
+        ]
+
+    @staticmethod
     def _terminal_blocked(result: Mapping[str, Any]) -> bool:
         return str(result.get("reason_code") or "") == "source_content_protected"
 
@@ -433,7 +447,7 @@ class DownloadPipeline:
                                 request.source,
                                 request.window_start,
                                 request.window_end,
-                                status="blocked",
+                                status="blocked_auth" if blocked_reason == "need_reauth" else "blocked",
                                 checkpoint_eligible=False,
                             )
                     outcome = self._outcome(
@@ -480,23 +494,32 @@ class DownloadPipeline:
                         plan=plan,
                     )
                     if not candidates:
+                        # A fresh empty scan does not settle candidates that
+                        # were frozen/registered before login loss or a crash.
+                        debts = self._window_debts(state, source_window_id, request.workflow_version)
+                        auth_required = any(item["reason_code"] == "need_reauth" for item in debts)
+                        checkpoint_eligible = not debts
                         state.register_source_window(
                             request.source,
                             request.window_start,
                             request.window_end,
-                            status="succeeded",
-                            checkpoint_eligible=True,
+                            status="succeeded" if checkpoint_eligible else "blocked_auth" if auth_required else "partial",
+                            checkpoint_eligible=checkpoint_eligible,
                         )
-                        reason = "no_new_docs" if int(plan.get("window_new_docs_count") or 0) == 0 else "no_keyword_match"
+                        reason = (
+                            "need_reauth" if auth_required else "download_incomplete" if debts
+                            else "no_new_docs" if int(plan.get("window_new_docs_count") or 0) == 0 else "no_keyword_match"
+                        )
                         outcome = self._outcome(
                             run_id=run_id,
                             request=request,
                             plan_path=plan_path,
                             manifest_path=None,
                             plan=plan,
-                            status="success",
+                            status="success" if checkpoint_eligible else "blocked" if auth_required else "failed",
                             reason_code=reason,
-                            checkpoint_eligible=True,
+                            missing=debts,
+                            checkpoint_eligible=checkpoint_eligible,
                             state_updated=True,
                         )
                         if request.result_path:
@@ -508,6 +531,7 @@ class DownloadPipeline:
                     blocked: list[Mapping[str, Any]] = []
                     satisfied: list[Mapping[str, Any]] = []
                     rate_limited = False
+                    auth_required = False
                     for candidate in candidates:
                         file_id = str(candidate.get("file_id") or "").strip()
                         document_id = document_ids.get(file_id)
@@ -524,12 +548,28 @@ class DownloadPipeline:
                             if prior and prior.get("state") == StageState.SUCCEEDED.value:
                                 satisfied.append({"source_file_id": file_id, "filename": candidate.get("filename"), "disposition": "already_completed"})
                                 continue
-                            attempted[file_id] = {
+                            # A deferred or terminal stage is still part of
+                            # this frozen plan. Never advance the checkpoint
+                            # merely because its lease cannot be claimed now.
+                            reason_code = "download_stage_busy"
+                            if prior and prior.get("error_code") == "need_reauth":
+                                reason_code = "need_reauth"
+                                auth_required = True
+                            elif (
+                                prior and prior.get("state") == StageState.QUARANTINED.value
+                                and prior.get("error_code") == "source_content_protected"
+                            ):
+                                reason_code = "source_content_protected"
+                            deferred = {
                                 "status": "blocked",
-                                "reason_code": "download_stage_busy",
+                                "reason_code": reason_code,
                                 "file_id": file_id,
                                 "filename": candidate.get("filename"),
                             }
+                            attempted[file_id] = deferred
+                            blocked.append(deferred)
+                            if auth_required:
+                                break
                             continue
                         claims[file_id] = claim
                         result = self.downloader.download_candidate_on_page(
@@ -555,12 +595,15 @@ class DownloadPipeline:
                                     _next_zsxq_day()
                                     if reason_code == DOWNLOAD_RATE_LIMIT_REASON
                                     else datetime.now(UTC) + timedelta(minutes=5)
-                                    if category is ErrorCategory.TRANSIENT
+                                    if category in {ErrorCategory.TRANSIENT, ErrorCategory.AUTH}
                                     else None
                                 ),
                             )
                             blocked.append(result)
                             claims.pop(file_id, None)
+                            if category is ErrorCategory.AUTH:
+                                auth_required = True
+                                break
                             if reason_code == DOWNLOAD_RATE_LIMIT_REASON:
                                 rate_limited = True
                                 break
@@ -648,17 +691,31 @@ class DownloadPipeline:
                     terminal_blocked = [entry for entry in blocked if self._terminal_blocked(entry)]
                     nonterminal_blocked = [entry for entry in blocked if not self._terminal_blocked(entry)]
                     missing.extend(nonterminal_blocked)
+                    # Include every unsettled member of this durable window,
+                    # even if source visibility or keywords changed since its
+                    # original plan and today's scan omitted that member.
+                    missing_ids = {str(item.get("source_file_id") or item.get("file_id") or "") for item in missing}
+                    for debt in self._window_debts(state, source_window_id, request.workflow_version):
+                        if str(debt["source_file_id"]) not in missing_ids:
+                            missing.append(debt)
+                        if debt["reason_code"] == "need_reauth":
+                            auth_required = True
                     checkpoint_eligible = not missing
                     state.register_source_window(
                         request.source,
                         request.window_start,
                         request.window_end,
-                        status="succeeded" if checkpoint_eligible else "partial",
+                        status="succeeded" if checkpoint_eligible else "blocked_auth" if auth_required else "partial",
                         checkpoint_eligible=checkpoint_eligible,
                     )
-                    status = "success" if checkpoint_eligible else ("partial" if downloaded_entries or satisfied else "failed")
+                    status = (
+                        "success" if checkpoint_eligible else "blocked" if auth_required
+                        else "partial" if downloaded_entries or satisfied else "failed"
+                    )
                     reason = (
-                        DOWNLOAD_RATE_LIMIT_REASON
+                        "need_reauth"
+                        if auth_required
+                        else DOWNLOAD_RATE_LIMIT_REASON
                         if rate_limited
                         else "download_incomplete"
                         if missing

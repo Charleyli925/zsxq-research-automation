@@ -372,6 +372,68 @@ def test_failure_categories_control_retry_and_publication_never_rewinds_remote_w
             )
 
 
+def test_login_auth_cooldown_survives_restart_then_reclaims_the_same_stage(tmp_path):
+    database = tmp_path / "pipeline.sqlite3"
+    due = NOW + timedelta(minutes=5)
+    with PipelineState.open(database) as state:
+        state.migrate()
+        document = state.upsert_document("zsxq_digest", "file-1", filename="report.pdf", now=NOW)
+        state.ensure_stage(document.id, Stage.PUBLISH, "workflow-v1", now=NOW)
+        claim = state.claim_due_stage(Stage.PUBLISH, "workflow-v1", now=NOW)
+        assert claim is not None
+        assert state.fail_stage(
+            claim, category=ErrorCategory.AUTH, error_code="login_expired",
+            error_detail="refresh token expired", retry_at=due, now=NOW,
+        ) is StageState.RETRY_WAIT
+
+    with PipelineState.open(database) as reopened:
+        attempt = reopened.get_stage_attempt(document.id, Stage.PUBLISH, "workflow-v1")
+        assert attempt is not None
+        assert attempt["state"] == "retry_wait"
+        assert attempt["error_category"] == ErrorCategory.AUTH.value
+        assert attempt["available_at_epoch"] == int(due.timestamp())
+        assert reopened.claim_due_stage(Stage.PUBLISH, "workflow-v1", now=due - timedelta(seconds=1)) is None
+        recovered = reopened.claim_due_stage(Stage.PUBLISH, "workflow-v1", now=due)
+        assert recovered is not None
+        assert recovered.attempt_id == claim.attempt_id
+        assert recovered.attempt_count == 2
+        reopened.complete_stage(recovered, now=due)
+        assert reopened.get_stage_attempt(document.id, Stage.PUBLISH, "workflow-v1")["state"] == "succeeded"
+
+
+def test_auth_without_cooldown_stays_blocked_after_restart(tmp_path):
+    database = tmp_path / "pipeline.sqlite3"
+    with PipelineState.open(database) as state:
+        state.migrate()
+        document = state.upsert_document("zsxq_digest", "file-1", now=NOW)
+        state.ensure_stage(document.id, Stage.PUBLISH, "workflow-v1", now=NOW)
+        claim = state.claim_due_stage(Stage.PUBLISH, "workflow-v1", now=NOW)
+        assert claim is not None
+        assert state.fail_stage(
+            claim, category=ErrorCategory.AUTH, error_code="permission_denied", now=NOW,
+        ) is StageState.BLOCKED_AUTH
+    with PipelineState.open(database) as reopened:
+        attempt = reopened.get_stage_attempt(document.id, Stage.PUBLISH, "workflow-v1")
+        assert attempt["error_category"] == ErrorCategory.AUTH.value
+        assert attempt["available_at_epoch"] is None
+        assert reopened.claim_due_stage(Stage.PUBLISH, "workflow-v1", now=NOW + timedelta(days=1)) is None
+
+
+@pytest.mark.parametrize("category", [ErrorCategory.RELEASE_CONTRACT, ErrorCategory.CONTENT, ErrorCategory.INVARIANT])
+def test_nonrecoverable_categories_reject_a_retry_time_without_releasing_the_claim(tmp_path, category):
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        document = state.upsert_document("zsxq_digest", "file-1", now=NOW)
+        state.ensure_stage(document.id, Stage.PUBLISH, "workflow-v1", now=NOW)
+        claim = state.claim_due_stage(Stage.PUBLISH, "workflow-v1", now=NOW)
+        assert claim is not None
+        with pytest.raises(ValueError, match="only transient or auth failures"):
+            state.fail_stage(claim, category=category, retry_at=NOW + timedelta(minutes=5), now=NOW)
+        attempt = state.get_stage_attempt(document.id, Stage.PUBLISH, "workflow-v1")
+        assert attempt["state"] == StageState.RUNNING.value
+        assert attempt["lease_token"] == claim.lease_token
+
+
 def test_notification_idempotency_key_is_unique(tmp_path):
     with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
         state.migrate()
@@ -491,3 +553,43 @@ def test_notification_delivery_claims_are_exclusive_recoverable_and_queryable(tm
     finally:
         second.close()
         first.close()
+
+
+def test_window_download_debts_keep_missing_workflows_and_isolate_source_windows(tmp_path):
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        window = state.register_source_window("foreign", NOW - timedelta(hours=1), NOW)
+        sibling = state.register_source_window("foreign", NOW, NOW + timedelta(hours=1))
+        domestic = state.register_source_window("domestic", NOW - timedelta(hours=1), NOW)
+
+        def planned(file_id, *, source="foreign", window_id=window, workflow="download:v1", outcome=None, code=""):
+            document = state.upsert_document(source, file_id, source_window_id=window_id, now=NOW)
+            if workflow is not None:
+                state.ensure_stage(document.id, Stage.DOWNLOAD, workflow, now=NOW)
+                if outcome is not None:
+                    claim = state.claim_due_stage(Stage.DOWNLOAD, workflow, document_ids=(document.id,), now=NOW)
+                    if outcome == "success":
+                        state.complete_stage(claim, now=NOW)
+                    else:
+                        state.fail_stage(claim, category=outcome, error_code=code, now=NOW)
+            return document
+
+        planned("done", outcome="success")
+        planned("protected", outcome=ErrorCategory.CONTENT, code="source_content_protected")
+        permission = planned("permission", outcome=ErrorCategory.AUTH, code="permission_denied")
+        contract = planned("contract", outcome=ErrorCategory.RELEASE_CONTRACT, code="release_invalid")
+        content = planned("other-content", outcome=ErrorCategory.CONTENT, code="other_content_error")
+        no_stage = planned("missing", workflow=None)
+        other_workflow = planned("different-workflow", workflow="download:v2", outcome="success")
+        planned("sibling", window_id=sibling)
+        planned("domestic", source="domestic", window_id=domestic)
+
+        debts = state.list_window_download_debts(window, "download:v1")
+        assert {row["document_id"] for row in debts} == {
+            permission.id, contract.id, content.id, no_stage.id, other_workflow.id,
+        }
+        by_id = {row["document_id"]: row for row in debts}
+        assert by_id[permission.id]["error_code"] == "permission_denied"
+        assert by_id[contract.id]["state"] == StageState.BLOCKED_RELEASE.value
+        assert by_id[no_stage.id]["state"] is None
+        assert by_id[other_workflow.id]["state"] is None

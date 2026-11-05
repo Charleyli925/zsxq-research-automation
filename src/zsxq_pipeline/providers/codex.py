@@ -483,6 +483,9 @@ class CodexSummaryProvider:
             str(schema),
             "--output-last-message",
             str(output),
+            # Usage extraction consumes structured completion events. Human
+            # output also echoes the entire prompt into failure diagnostics.
+            "--json",
             *local_routing_arguments(self.config.routing_config_path),
             "-",
         )

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
+from zsxq_pipeline.lark import LarkCommandError
 from zsxq_pipeline.model import PublicationState
 from zsxq_pipeline.notify import (
     BATCH_COMPLETE_EVENT,
@@ -13,6 +17,7 @@ from zsxq_pipeline.notify import (
     enqueue_document_notification,
     enqueue_pipeline_status_notification,
     enqueue_terminal_notification,
+    is_login_error,
     notification_idempotency_key,
     render_batch_complete_notice,
     render_download_blocked_notice,
@@ -88,7 +93,19 @@ def test_document_delivery_is_idempotent_and_independent_from_publication(tmp_pa
         assert state.get_notification(first.idempotency_key).status == "sent"  # type: ignore[union-attr]
 
 
-def test_send_failure_waits_without_reverting_publication(tmp_path):
+@pytest.mark.parametrize("error", [
+    RuntimeError("network EOF"),
+    RuntimeError('Post "https://accounts.feishu.cn/oauth/v3/token": EOF'),
+    LarkCommandError("im notify", 4, json.dumps({
+        "ok": False,
+        "identity": "bot",
+        "error": {
+            "type": "network", "subtype": "transport",
+            "message": 'API call failed: Post "https://accounts.feishu.cn/oauth/v3/token": EOF',
+        },
+    })),
+])
+def test_send_failure_waits_without_reverting_publication(tmp_path, error):
     with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
         state.migrate()
         publication = _publication(state)
@@ -101,12 +118,186 @@ def test_send_failure_waits_without_reverting_publication(tmp_path):
         )
         deliveries = NotificationDrainer(
             state,
-            FakeNotifier(error=RuntimeError("network EOF")),
+            FakeNotifier(error=error),
             clock=lambda: NOW,
         ).drain()
         assert deliveries[0].status == "retry_wait"
         assert state.get_notification(queued.idempotency_key).status == "retry_wait"  # type: ignore[union-attr]
         assert state.get_publication("a" * 64, "daily", "partition-1", target_document=publication.target_document).state is PublicationState.SUCCESS  # type: ignore[union-attr]
+        notifier = FakeNotifier()
+        recovered = NotificationDrainer(
+            state, notifier, clock=lambda: NOW + timedelta(minutes=5),
+        ).drain()
+        assert [delivery.status for delivery in recovered] == ["sent"]
+        assert len(notifier.calls) == 1
+
+
+@pytest.mark.parametrize("error", [
+    RuntimeError("HTTP 403"),
+    RuntimeError("permission denied (HTTP 403)"),
+    RuntimeError("missing_scope: docs:document:write"),
+    LarkCommandError("im notify", 3, json.dumps({
+        "ok": False,
+        "error": {"type": "permission", "message": "missing required scope"},
+    })),
+])
+def test_permission_failure_stops_automatic_notification_retries(tmp_path, error):
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        publication = _publication(state)
+        queued = enqueue_document_notification(
+            state, publication, chat_id="oc_test", markdown="document", scope_key="run-1",
+        )
+        deliveries = NotificationDrainer(
+            state, FakeNotifier(error=error), clock=lambda: NOW,
+        ).drain()
+        assert [delivery.status for delivery in deliveries] == ["failed"]
+        assert state.get_notification(queued.idempotency_key).status == "failed"  # type: ignore[union-attr]
+        notifier = FakeNotifier()
+        assert NotificationDrainer(
+            state, notifier, clock=lambda: NOW + timedelta(days=1),
+        ).drain() == ()
+        assert notifier.calls == []
+        assert state.get_publication("a" * 64, "daily", "partition-1", target_document=publication.target_document).state is PublicationState.SUCCESS  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("error", [
+    RuntimeError("Unauthorized (HTTP 401)"),
+    RuntimeError("HTTP 401"),
+    RuntimeError("User identity is missing; refresh token expired"),
+    RuntimeError("invalid access token"),
+    LarkCommandError("im notify", 3, json.dumps({
+        "ok": False,
+        "error": {"type": "auth", "message": "User identity is missing; refresh token expired"},
+    })),
+])
+def test_fixed_login_resumes_original_notification_after_sqlite_reopen(tmp_path, error):
+    database = tmp_path / "pipeline.sqlite3"
+    with PipelineState.open(database) as state:
+        state.migrate()
+        publication = _publication(state)
+        queued = enqueue_document_notification(
+            state, publication, chat_id="oc_test", markdown="document", scope_key="run-1",
+        )
+        deliveries = NotificationDrainer(
+            state, FakeNotifier(error=error), clock=lambda: NOW,
+        ).drain()
+        assert [delivery.status for delivery in deliveries] == ["retry_wait"]
+        assert state.get_notification(queued.idempotency_key).status == "retry_wait"  # type: ignore[union-attr]
+
+    # Logging in repairs the external dependency; neither a new message nor
+    # an in-memory timer is needed after a process restart.
+    with PipelineState.open(database) as reopened:
+        notifier = FakeNotifier()
+        assert NotificationDrainer(
+            reopened, notifier, clock=lambda: NOW + timedelta(minutes=5, seconds=-1),
+        ).drain() == ()
+        assert notifier.calls == []
+        deliveries = NotificationDrainer(
+            reopened, notifier, clock=lambda: NOW + timedelta(minutes=5),
+        ).drain()
+        assert [delivery.status for delivery in deliveries] == ["sent"]
+        assert [call[2] for call in notifier.calls] == [queued.idempotency_key]
+        assert reopened.get_notification(queued.idempotency_key).id == queued.id  # type: ignore[union-attr]
+        assert reopened.get_publication("a" * 64, "daily", "partition-1", target_document=publication.target_document).state is PublicationState.SUCCESS  # type: ignore[union-attr]
+        assert NotificationDrainer(
+            reopened, notifier, clock=lambda: NOW + timedelta(days=1),
+        ).drain() == ()
+        assert len(notifier.calls) == 1
+
+
+def test_login_retry_backoff_is_persistent_and_caps_at_one_hour(tmp_path):
+    current = NOW
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        publication = _publication(state)
+        queued = enqueue_document_notification(
+            state, publication, chat_id="oc_test", markdown="document", scope_key="run-1",
+        )
+        notifier = FakeNotifier(error=RuntimeError("refresh token expired"))
+        for attempt, minutes in enumerate((5, 10, 20, 40, 60, 60), 1):
+            deliveries = NotificationDrainer(state, notifier, clock=lambda: current).drain()
+            assert [delivery.status for delivery in deliveries] == ["retry_wait"]
+            assert state.get_notification(queued.idempotency_key).attempt_count == attempt  # type: ignore[union-attr]
+            before_due = FakeNotifier()
+            assert NotificationDrainer(
+                state, before_due, clock=lambda: current + timedelta(minutes=minutes, seconds=-1),
+            ).drain() == ()
+            assert before_due.calls == []
+            current += timedelta(minutes=minutes)
+        assert [call[2] for call in notifier.calls] == [queued.idempotency_key] * 6
+
+
+def test_login_failure_stops_the_current_drain_before_other_messages(tmp_path):
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        first = enqueue_pipeline_status_notification(
+            state, event=DOWNLOAD_COMPLETE_EVENT, identity="first", chat_id="oc_test",
+            markdown="first", scope_key="run-1",
+        )
+        second = enqueue_pipeline_status_notification(
+            state, event=SUMMARY_PROGRESS_EVENT, identity="second", chat_id="oc_test",
+            markdown="second", scope_key="run-1",
+        )
+        notifier = FakeNotifier(error=RuntimeError("refresh token expired"))
+        deliveries = NotificationDrainer(state, notifier, clock=lambda: NOW).drain(max_items=100)
+        assert [delivery.idempotency_key for delivery in deliveries] == [first.idempotency_key]
+        assert len(notifier.calls) == 1
+        assert state.get_notification(first.idempotency_key).status == "retry_wait"  # type: ignore[union-attr]
+        assert state.get_notification(second.idempotency_key).status == "queued"  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(("error", "expected"), [
+    ("User identity is missing; refresh token expired", True),
+    ("status code: 401", True),
+    ("authentication required", True),
+    ("auth required", True),
+    ("credentials missing", True),
+    ("session has expired", True),
+    ("invalid access token", True),
+    ("HTTP 403", False),
+    ("missing_scope", False),
+    ("insufficient_scope: login required for this scope", False),
+    ("HTTP 403: token expired", False),
+    ('Post "https://accounts.feishu.cn/oauth/v3/token": EOF', False),
+    ("tokens used 1234", False),
+    (LarkCommandError("im notify", 4, json.dumps({
+        "error": {"type": "network", "message": "token refresh failed: EOF"},
+    })), False),
+])
+def test_login_error_recognition_distinguishes_permissions_and_transport(error, expected):
+    assert is_login_error(error) is expected
+
+
+@pytest.mark.parametrize("as_string", [False, True])
+@pytest.mark.parametrize(("kind", "message", "expected"), [
+    ("permission", "user identity is missing", False),
+    ("permission", "HTTP 401 Unauthorized", False),
+    ("network", "authentication required: EOF", False),
+    ("transport", "token refresh failed", False),
+    ("timeout", "credentials missing from timed-out response", False),
+    ("auth", "auth required", True),
+    ("auth", "credentials missing", True),
+    ("authentication", "credentials unavailable", True),
+    ("login", "sign-in must be renewed", True),
+    ("auth", "HTTP 403: token expired", False),
+    ("authentication", "missing_scope: login required", False),
+])
+def test_structured_login_error_keeps_category_precedence_when_persisted(as_string, kind, message, expected):
+    error = LarkCommandError("docs create", 4, json.dumps({"error": {"type": kind, "message": message}}))
+    assert is_login_error(str(error) if as_string else error) is expected
+
+
+@pytest.mark.parametrize("as_string", [False, True])
+def test_structured_login_error_accepts_trailing_cli_diagnostics(as_string):
+    diagnostic = json.dumps({"error": {"type": "permission", "message": "auth required"}})
+    error = LarkCommandError("docs create", 4, diagnostic + "\nadditional CLI diagnostics")
+    assert is_login_error(str(error) if as_string else error) is False
+
+
+def test_unrelated_text_does_not_supply_a_structured_cli_error_type():
+    diagnostic = json.dumps({"error": {"type": "auth", "message": "credentials unavailable"}})
+    assert is_login_error("report text " + diagnostic) is False
 
 
 def test_terminal_is_deferred_until_document_delivery_has_finished(tmp_path):

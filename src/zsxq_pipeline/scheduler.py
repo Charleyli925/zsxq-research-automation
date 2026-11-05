@@ -105,19 +105,18 @@ class PipelineScheduler:
         *,
         now: datetime,
     ) -> tuple[datetime, bool]:
-        """Choose the checkpoint-based start and expose any bounded truncation."""
+        """Resume known coverage; bound only a source's initial bootstrap."""
 
         checkpoint = state.latest_source_checkpoint(source.name)
+        if checkpoint is not None:
+            # Power loss or an expired login can leave arbitrarily old work.
+            # Truncating an established checkpoint would discard that gap when
+            # the new window later advances coverage to the present.
+            return checkpoint, False
         lookback = int(source.max_catchup_seconds or self.config.schedule.max_catchup_seconds)
-        cutoff = now - timedelta(seconds=lookback)
-        if checkpoint is None:
-            # A fresh scheduler has no authority to invent historical source
-            # coverage.  Start at the explicit bounded bootstrap horizon and
-            # surface that decision in state/output.
-            return cutoff, True
-        if checkpoint < cutoff:
-            return cutoff, True
-        return checkpoint, False
+        # With no prior coverage, the configured bootstrap horizon is the
+        # explicit starting boundary and remains visible as truncated.
+        return now - timedelta(seconds=lookback), True
 
     def enqueue_due_windows(self, state: PipelineState, *, now: datetime | None = None) -> tuple[ScheduledWindow, ...]:
         """Persist at most one coalesced catch-up window per configured source."""

@@ -77,6 +77,42 @@ zsxq-pipeline outbox drain --config /absolute/path/to/pipeline.toml
 document or run a summary. `tick` returns `busy` without mutating business
 state if another tick/manual stage owns the advisory lock.
 
+## Verify the summary client before recovering a backlog
+
+`codex.command` selects the executable for both report summaries and the daily
+digest. Pin it to the absolute path of an installed CLI that has completed a
+live request with the configured model, reasoning, route, and output schema.
+A working desktop chat does not verify a separately installed command line
+client. Record the selected executable and its `--version` before changing it;
+keep the model and reasoning explicit and do not fall back to another model.
+
+`doctor` checks local capabilities and the summary preflight runs
+`codex exec --help`. Neither sends a model request or verifies Lark user
+authorization. Before requeueing terminal failures:
+
+1. Confirm one real report can produce a schema-valid local summary through
+   the selected executable. Check the response and usage events from `--json`;
+   only `--output-last-message` is accepted as the summary artifact.
+2. Verify the production Lark profile with `auth status --json --verify`.
+   Document creation requires the user identity; a healthy bot identity does
+   not verify the user identity or its refresh token.
+3. Take the runtime lock and back up the local config and pipeline database.
+   Build a retry plan for the exact document/workflow/error combinations that
+   the verified repair addresses. Preserve the candidate fingerprints and
+   expected count; keep unrelated failures and successful publications out.
+4. Apply the reviewed plan, then verify a recovered report through summary,
+   document creation, and remote readback. Existing summary artifacts and
+   successful publication receipts are reused during recovery.
+
+A WebSocket upgrade diagnostic alone does not establish the final failure:
+inspect the CLI exit code and the final response. `model_not_found` is a
+configuration or model-access failure and stops for repair. Explicit login
+expiry and temporary network/429 failures retain cooldown retries as described
+in [runtime-recovery.md](runtime-recovery.md). An OAuth token endpoint EOF is a
+network failure; the word `token` in a URL or usage field is not evidence of an
+expired login. A document-body write with an uncertain remote outcome requires
+reconciliation before another write.
+
 ## Research full-text index
 
 After each successful Obsidian archive, the archive helper updates that

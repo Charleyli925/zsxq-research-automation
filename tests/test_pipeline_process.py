@@ -5,12 +5,16 @@ import unicodedata
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
+
+import pytest
 
 from zsxq_pipeline.extract import ExtractionBatchResult, ExtractionItem, sha256_file
-from zsxq_pipeline.model import ErrorCategory, Stage, StageState
+from zsxq_pipeline.model import ErrorCategory, Stage, StageState, SummaryIdentity
+from zsxq_pipeline.lark import LarkCommandError, LarkTimeoutError
 from zsxq_pipeline.publish import PublicationError
 from zsxq_pipeline.process import DigestProcessor, ProcessConfig, ProcessRequest
-from zsxq_pipeline.providers.codex import CodexTimeoutError
+from zsxq_pipeline.providers.codex import CodexExecutionError, CodexTimeoutError
 from zsxq_pipeline.state import PipelineState
 from zsxq_pipeline.sidecars import SidecarArchiveResult, SidecarError
 
@@ -122,6 +126,16 @@ class TimeoutProvider(FakeProvider):
     def summarize(self, request):
         self.requests.append(request)
         raise CodexTimeoutError("fixture timeout")
+
+
+class ExecutionErrorProvider(FakeProvider):
+    def __init__(self, diagnostic: str) -> None:
+        super().__init__()
+        self.diagnostic = diagnostic
+
+    def summarize(self, request):
+        self.requests.append(request)
+        raise CodexExecutionError(self.diagnostic)
 
 
 class FakePublisher:
@@ -411,6 +425,64 @@ def test_publish_retry_rehydrates_completed_extract_and_summary_without_external
     assert len(publisher.created) == 1
 
 
+
+@pytest.mark.parametrize(("error", "expected_state", "expected_category"), [
+    (
+        LarkCommandError("docs create", 4, json.dumps({
+            "ok": False, "error": {
+                "type": "network",
+                "message": 'Post "https://accounts.feishu.cn/oauth/v3/token": EOF',
+            },
+        })),
+        StageState.RETRY_WAIT, ErrorCategory.TRANSIENT,
+    ),
+    (LarkTimeoutError("docs create timed out"), StageState.BLOCKED_RELEASE, ErrorCategory.INVARIANT),
+    (
+        LarkCommandError("docs create", 3, json.dumps({
+            "ok": False, "error": {
+                "type": "auth", "message": "User identity is missing; refresh token expired",
+            },
+        })),
+        StageState.RETRY_WAIT, ErrorCategory.AUTH,
+    ),
+    (LarkCommandError("docs create", 3, "HTTP 401"), StageState.RETRY_WAIT, ErrorCategory.AUTH),
+    (LarkCommandError("docs create", 3, "HTTP 403"), StageState.BLOCKED_AUTH, ErrorCategory.AUTH),
+])
+def test_publication_cli_failure_preserves_summary_and_recovery_policy(
+    tmp_path, error, expected_state, expected_category
+):
+    class BrokenPublisher(FakePublisher):
+        def create_document(self, markdown):
+            raise error
+
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    pdf = tmp_path / "report.pdf"
+    pdf.write_bytes(b"fixture PDF")
+    provider = FakeProvider()
+    processor = DigestProcessor(
+        _config(runtime), extractor=FakeExtractor(), provider=provider,
+        publisher=BrokenPublisher(), notifier=FakeNotifier(), clock=lambda: NOW,
+    )
+    outcome = processor.run(ProcessRequest(batch_file=_batch(tmp_path / "batch.json", [pdf]), no_notify=True))
+    assert outcome.status == "partial"
+    assert outcome.summarized == 1
+    assert outcome.published == 0
+    with PipelineState.open(runtime / "state" / "pipeline.sqlite3") as state:
+        attempt = state._connection.execute(
+            "SELECT state, error_category, available_at_epoch FROM stage_attempts WHERE stage=?",
+            (Stage.PUBLISH.value,),
+        ).fetchone()
+        summary = state._connection.execute(
+            "SELECT state FROM stage_attempts WHERE stage=?", (Stage.SUMMARY.value,),
+        ).fetchone()
+    assert attempt["state"] == expected_state.value
+    assert attempt["error_category"] == expected_category.value
+    assert (attempt["available_at_epoch"] is not None) is (expected_state is StageState.RETRY_WAIT)
+    assert summary["state"] == StageState.SUCCEEDED.value
+    assert len(provider.requests) == 1
+
+
 def test_partial_publish_stage_recovery_completes_only_the_unacknowledged_pdf(tmp_path):
     runtime = tmp_path / "runtime"
     runtime.mkdir()
@@ -550,14 +622,57 @@ def test_extractor_profile_mismatch_blocks_the_release_contract(tmp_path):
     assert any("extractor profile" in failure for failure in outcome.failures)
 
 
-def test_transient_summary_failure_waits_once_then_blocks_without_repeated_model_calls(tmp_path):
+@pytest.mark.parametrize(
+    ("diagnostic", "expected_state", "expected_category"),
+    (
+        (
+            'Codex exited with status 1: {"code":"model_not_found","message":'
+            '"The gpt-6.1-sol model is not supported when using Codex with a ChatGPT account."}',
+            StageState.BLOCKED_RELEASE,
+            ErrorCategory.RELEASE_CONTRACT,
+        ),
+        (
+            "Codex exited with status 1: HTTP 404: model_not_found; input_tokens=1200",
+            StageState.BLOCKED_RELEASE,
+            ErrorCategory.RELEASE_CONTRACT,
+        ),
+        (
+            "Codex exited with status 1: stream disconnected before completion; tokens used 1200",
+            StageState.RETRY_WAIT,
+            ErrorCategory.TRANSIENT,
+        ),
+        (
+            "Codex exited with status 1: HTTP 502; input_tokens=3000 output_tokens=200; "
+            "report discussed authorization and permission controls",
+            StageState.RETRY_WAIT,
+            ErrorCategory.TRANSIENT,
+        ),
+        (
+            "Codex exited with status 1: HTTP 401 Unauthorized",
+            StageState.RETRY_WAIT,
+            ErrorCategory.AUTH,
+        ),
+        (
+            "Codex exited with status 1: HTTP/1.1 403 Forbidden",
+            StageState.BLOCKED_AUTH,
+            ErrorCategory.AUTH,
+        ),
+        (
+            "Codex exited with status 1: OAuth token refresh failed: refresh_token_reused",
+            StageState.RETRY_WAIT,
+            ErrorCategory.AUTH,
+        ),
+    ),
+)
+def test_summary_execution_failures_preserve_the_correct_recovery_policy(
+    tmp_path, diagnostic, expected_state, expected_category
+):
     runtime = tmp_path / "runtime"
     runtime.mkdir()
     pdf = tmp_path / "report.pdf"
     pdf.write_bytes(b"fixture PDF")
-    provider = TimeoutProvider()
-
-    first = DigestProcessor(
+    provider = ExecutionErrorProvider(diagnostic)
+    processor = DigestProcessor(
         _config(runtime),
         extractor=FakeExtractor(),
         provider=provider,
@@ -565,56 +680,202 @@ def test_transient_summary_failure_waits_once_then_blocks_without_repeated_model
         notifier=FakeNotifier(),
         clock=lambda: NOW,
     )
-    assert first.run(ProcessRequest(batch_file=_batch(tmp_path / "first.json", [pdf]), summary_only=True)).status == "failed"
+
+    outcome = processor.run(ProcessRequest(batch_file=_batch(tmp_path / "batch.json", [pdf]), summary_only=True))
+
+    assert outcome.status == "failed"
     assert len(provider.requests) == 1
     with PipelineState.open(runtime / "state" / "pipeline.sqlite3") as state:
         attempt = state._connection.execute(
-            "SELECT state, attempt_count FROM stage_attempts WHERE stage=?", (Stage.SUMMARY.value,)
+            "SELECT state, attempt_count, error_category, error_code, available_at_epoch "
+            "FROM stage_attempts WHERE stage=?",
+            (Stage.SUMMARY.value,),
         ).fetchone()
-        assert attempt is not None
-        assert attempt["state"] == StageState.RETRY_WAIT.value
-        assert attempt["attempt_count"] == 1
+    assert attempt is not None
+    assert attempt["state"] == expected_state.value
+    assert attempt["error_category"] == expected_category.value
+    assert attempt["error_code"] == "codex_summary_failed"
+    assert attempt["attempt_count"] == 1
+    assert (attempt["available_at_epoch"] is not None) is (expected_state is StageState.RETRY_WAIT)
 
-    cooldown = DigestProcessor(
-        _config(runtime),
-        extractor=FakeExtractor(fail_if_called=True),
-        provider=provider,
-        publisher=FakePublisher(),
-        notifier=FakeNotifier(),
-        clock=lambda: NOW + timedelta(minutes=4),
-    )
-    cooldown.run(ProcessRequest(batch_file=_batch(tmp_path / "cooldown.json", [pdf]), summary_only=True))
-    assert len(provider.requests) == 1
 
-    retry = DigestProcessor(
-        _config(runtime),
-        extractor=FakeExtractor(fail_if_called=True),
-        provider=provider,
-        publisher=FakePublisher(),
-        notifier=FakeNotifier(),
-        clock=lambda: NOW + timedelta(minutes=5),
-    )
-    assert retry.run(ProcessRequest(batch_file=_batch(tmp_path / "retry.json", [pdf]), summary_only=True)).status == "failed"
-    assert len(provider.requests) == 2
-    with PipelineState.open(runtime / "state" / "pipeline.sqlite3") as state:
-        attempt = state._connection.execute(
-            "SELECT state, attempt_count, error_code FROM stage_attempts WHERE stage=?", (Stage.SUMMARY.value,)
-        ).fetchone()
-        assert attempt is not None
-        assert attempt["state"] == StageState.BLOCKED_RELEASE.value
-        assert attempt["attempt_count"] == 2
-        assert str(attempt["error_code"]).endswith("retry_exhausted")
+@pytest.mark.parametrize("diagnostic", [
+    "stream disconnected before completion",
+    "exceeded retry limit, last status: 429 Too Many Requests",
+])
+def test_temporary_model_outage_survives_restarts_and_recovers_after_capped_cooldowns(tmp_path, diagnostic):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    pdf = tmp_path / "report.pdf"
+    pdf.write_bytes(b"fixture PDF")
+    batch = _batch(tmp_path / "batch.json", [pdf])
+    broken = ExecutionErrorProvider(diagnostic)
+    minute = 0
+    for expected_delay in (5, 10, 20, 40, 60, 60):
+        now = NOW + timedelta(minutes=minute)
+        processor = DigestProcessor(
+            _config(runtime), extractor=FakeExtractor(fail_if_called=minute > 0),
+            provider=broken, publisher=FakePublisher(), notifier=FakeNotifier(), clock=lambda: now,
+        )
+        assert processor.run(ProcessRequest(batch_file=batch, summary_only=True)).status == "failed"
+        with PipelineState.open(runtime / "state/pipeline.sqlite3") as state:
+            attempt = state._connection.execute(
+                "SELECT state,error_category,available_at_epoch FROM stage_attempts WHERE stage='summary'"
+            ).fetchone()
+            assert attempt["state"] == StageState.RETRY_WAIT.value
+            assert attempt["error_category"] == ErrorCategory.TRANSIENT.value
+            assert attempt["available_at_epoch"] == int((now + timedelta(minutes=expected_delay)).timestamp())
+        calls = len(broken.requests)
+        # A fresh worker after a restart must honor the persisted cooldown.
+        early = DigestProcessor(
+            _config(runtime), extractor=FakeExtractor(fail_if_called=True), provider=broken,
+            publisher=FakePublisher(), notifier=FakeNotifier(),
+            clock=lambda: now + timedelta(minutes=expected_delay) - timedelta(seconds=1),
+        )
+        early.run(ProcessRequest(batch_file=batch, summary_only=True))
+        assert len(broken.requests) == calls
+        minute += expected_delay
+    recovered = DigestProcessor(
+        _config(runtime), extractor=FakeExtractor(fail_if_called=True), provider=FakeProvider(),
+        publisher=FakePublisher(), notifier=FakeNotifier(), clock=lambda: NOW + timedelta(minutes=minute),
+    ).run(ProcessRequest(batch_file=batch, summary_only=True))
+    assert recovered.status == "success"
+    assert recovered.summarized == 1
 
-    later = DigestProcessor(
-        _config(runtime),
-        extractor=FakeExtractor(fail_if_called=True),
-        provider=provider,
-        publisher=FakePublisher(),
-        notifier=FakeNotifier(),
-        clock=lambda: NOW + timedelta(minutes=20),
+
+def test_completed_summary_survives_power_loss_while_another_report_is_running(tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    first_pdf = tmp_path / "a.pdf"
+    second_pdf = tmp_path / "b.pdf"
+    first_pdf.write_bytes(b"first fixture PDF")
+    second_pdf.write_bytes(b"second fixture PDF")
+    batch = _batch(tmp_path / "batch.json", [first_pdf, second_pdf])
+    first_cached = Event()
+    observed_cache = []
+
+    class InterruptedProvider(FakeProvider):
+        def summarize(self, request):
+            if request.inputs[0].path == str(first_pdf):
+                return super().summarize(request)
+            self.requests.append(request)
+            assert first_cached.wait(timeout=3), "the finished report must be cached before sibling jobs finish"
+            cached = first.summary_store.load(first_identity, expected_path=str(first_pdf))
+            assert cached is not None
+            observed_cache.append(cached.entry.markdown)
+            raise SystemExit("simulated power loss during the second model request")
+
+    interrupted = InterruptedProvider()
+    first = DigestProcessor(
+        _config(runtime), extractor=FakeExtractor(), provider=interrupted,
+        publisher=FakePublisher(), notifier=FakeNotifier(), clock=lambda: NOW,
     )
-    later.run(ProcessRequest(batch_file=_batch(tmp_path / "later.json", [pdf]), summary_only=True))
-    assert len(provider.requests) == 2
+    first_identity = SummaryIdentity(
+        pdf_sha256=sha256_file(first_pdf), extractor_version=first.config.extractor_version,
+        prompt_version=first.prompt_version, model=first.config.codex_model, reasoning=first.config.codex_reasoning,
+    )
+    persist = first.summary_store.persist
+
+    def observe_cache_commit(identity, entry, **kwargs):
+        saved = persist(identity, entry, **kwargs)
+        if entry.path == str(first_pdf):
+            first_cached.set()
+        return saved
+
+    monkeypatch.setattr(first.summary_store, "persist", observe_cache_commit)
+    with pytest.raises(SystemExit, match="simulated power loss"):
+        first.run(ProcessRequest(batch_file=batch, summary_only=True))
+
+    assert observed_cache
+    assert {request.inputs[0].filename for request in interrupted.requests} == {"a.pdf", "b.pdf"}
+    output_json, output_markdown = first._summary_output_paths(first_identity)
+    assert output_json.is_file() and output_markdown.is_file()
+    with PipelineState.open(first.config.database) as state:
+        # Neither main-thread stage acknowledgment ran before the power loss.
+        attempts = state._connection.execute("SELECT state FROM stage_attempts WHERE stage='summary'").fetchall()
+        assert len(attempts) == 2
+        assert all(row["state"] == StageState.RUNNING.value for row in attempts)
+        assert state._connection.execute("SELECT COUNT(*) FROM artifacts WHERE kind='summary'").fetchone()[0] == 0
+
+    recovered_provider = FakeProvider()
+    recovered_extractor = FakeExtractor(fail_if_called=True)
+    resumed = DigestProcessor(
+        _config(runtime), extractor=recovered_extractor, provider=recovered_provider,
+        publisher=FakePublisher(), notifier=FakeNotifier(), clock=lambda: NOW + timedelta(minutes=11),
+    ).run(ProcessRequest(batch_file=batch, summary_only=True))
+
+    assert resumed.status == "success"
+    assert resumed.summarized == 2
+    assert resumed.cache_hits == 1
+    assert recovered_extractor.calls == 0
+    assert [request.inputs[0].filename for request in recovered_provider.requests] == ["b.pdf"]
+    with PipelineState.open(first.config.database) as state:
+        attempts = state._connection.execute("SELECT state FROM stage_attempts WHERE stage='summary'").fetchall()
+        assert all(row["state"] == StageState.SUCCEEDED.value for row in attempts)
+
+
+def test_crashed_summary_claim_does_not_exhaust_network_recovery(tmp_path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    pdf = tmp_path / "report.pdf"
+    pdf.write_bytes(b"fixture PDF")
+    batch = _batch(tmp_path / "batch.json", [pdf])
+    processor = DigestProcessor(
+        _config(runtime), extractor=FakeExtractor(), provider=TimeoutProvider(),
+        publisher=FakePublisher(), notifier=FakeNotifier(), clock=lambda: NOW,
+    )
+    processor.run(ProcessRequest(batch_file=batch, summary_only=True))
+    with PipelineState.open(runtime / "state/pipeline.sqlite3") as state:
+        row = state._connection.execute("SELECT workflow_version FROM stage_attempts WHERE stage='summary'").fetchone()
+        abandoned = state.claim_due_stage(Stage.SUMMARY, row["workflow_version"], now=NOW + timedelta(minutes=5))
+        assert abandoned is not None and abandoned.attempt_count == 2
+    # Simulate power loss: the old claim is never completed. After its lease
+    # expires, a new worker can fail transiently and still retain recovery.
+    now = NOW + timedelta(minutes=11)
+    processor = DigestProcessor(
+        _config(runtime), extractor=FakeExtractor(fail_if_called=True), provider=TimeoutProvider(),
+        publisher=FakePublisher(), notifier=FakeNotifier(), clock=lambda: now,
+    )
+    processor.run(ProcessRequest(batch_file=batch, summary_only=True))
+    with PipelineState.open(runtime / "state/pipeline.sqlite3") as state:
+        row = state.get_stage_attempt(abandoned.document_id, Stage.SUMMARY, abandoned.workflow_version)
+        assert row["state"] == StageState.RETRY_WAIT.value
+        assert row["attempt_count"] == 3
+    processor = DigestProcessor(
+        _config(runtime), extractor=FakeExtractor(fail_if_called=True), provider=FakeProvider(),
+        publisher=FakePublisher(), notifier=FakeNotifier(), clock=lambda: now + timedelta(minutes=20),
+    )
+    assert processor.run(ProcessRequest(batch_file=batch, summary_only=True)).summarized == 1
+
+
+def test_reauthorized_lark_publishes_existing_summary_after_persisted_wait(tmp_path):
+    class ExpiredPublisher(FakePublisher):
+        def create_document(self, markdown):
+            raise LarkCommandError("docs create", 3, "User identity is missing; refresh token expired")
+
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    pdf = tmp_path / "report.pdf"
+    pdf.write_bytes(b"fixture PDF")
+    batch = _batch(tmp_path / "batch.json", [pdf])
+    first = DigestProcessor(
+        _config(runtime), extractor=FakeExtractor(), provider=FakeProvider(),
+        publisher=ExpiredPublisher(), notifier=FakeNotifier(), clock=lambda: NOW,
+    ).run(ProcessRequest(batch_file=batch, no_notify=True))
+    assert first.status == "partial" and first.summarized == 1
+    publisher = FakePublisher()
+    fresh = DigestProcessor(
+        _config(runtime), extractor=FakeExtractor(fail_if_called=True), provider=FakeProvider(fail_if_called=True),
+        publisher=publisher, notifier=FakeNotifier(), clock=lambda: NOW + timedelta(minutes=4),
+    )
+    fresh.run(ProcessRequest(batch_file=batch, no_notify=True))
+    assert publisher.created == []
+    after_login = DigestProcessor(
+        _config(runtime), extractor=FakeExtractor(fail_if_called=True), provider=FakeProvider(fail_if_called=True),
+        publisher=publisher, notifier=FakeNotifier(), clock=lambda: NOW + timedelta(minutes=5),
+    ).run(ProcessRequest(batch_file=batch, no_notify=True))
+    assert after_login.status == "success" and after_login.published == 1
+    assert len(publisher.created) == 1
 
 
 def test_content_failure_is_quarantined_without_blocking_a_good_pdf(tmp_path):

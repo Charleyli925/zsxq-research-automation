@@ -10,8 +10,9 @@ the next tick can safely proceed.
 - A schedule cursor advances only in the same transaction that persists a
   `scheduled` source window. A crash cannot silently skip a configured slot.
 - Missed source slots coalesce into one window from the last successful
-  checkpoint to now. If the bounded maximum lookback shortens that range, the
-  window is explicitly marked truncated.
+  checkpoint to now. An existing checkpoint is never shortened by the maximum
+  lookback, even after a week offline. The configured lookback only bounds the
+  first bootstrap when no successful source checkpoint exists.
 - A download checkpoint advances only after immutable-plan reconciliation.
   Downloaded PDFs, stage claims, extracted text, summaries, publications, and
   notifications retain their independent identities and recovery paths.
@@ -21,9 +22,51 @@ the next tick can safely proceed.
   sanitized browser exception and cleanup counters, the source window remains
   scheduled, and one reason-specific alert is deduplicated per window. The
   worker never terminates a live browser process automatically.
+- Each valid model result is atomically cached as soon as that report's
+  worker finishes, before waiting for the rest of its batch. A restart can
+  reuse it even if the main thread had not acknowledged its SQLite stage.
 - Codex failure does not prevent a later source download; Lark failure does
   not discard local summary artifacts; notification delivery drains from its
   own outbox even when no PDF is due.
+
+## Login and temporary service outages
+
+A new worker resumes `scheduled`, `blocked_auth`, `partial`, and abandoned
+`running` download windows under the same runtime lock. It retains the original
+time boundaries and skips only the prefix already covered by a successful
+checkpoint. A candidate that is still waiting for a retry or a lease is missing
+work, so it cannot accidentally make the whole window checkpoint-eligible.
+
+A ZSXQ `need_reauth` scan keeps that source window as `blocked_auth`. If login
+expires during a candidate download, the worker stops that source's remaining
+candidates, saves the authentication retry time, and preserves already archived
+files. Other sources and local processing can continue. The next tick rescans
+the same pending window; after the user signs in to the dedicated browser, the
+same candidate identities can continue without waiting for the next daily slot.
+
+Explicit Lark login failures, such as HTTP 401, missing user identity, or an
+expired access/refresh token, keep the publication stage or original outbox
+message in `retry_wait`. The user still completes interactive authorization;
+the worker never logs in on their behalf. On the next due attempt, publication
+reuses the saved summary, and notification reuses its original idempotency key.
+Bot readiness and user readiness are different: document publication uses the
+user identity, while group notifications use the bot identity.
+
+Temporary network failures, model HTTP 429, and repairable login failures use
+persistent cooldowns of 5, 10, 20, 40, then at most 60 minutes. Reopening SQLite
+or reclaiming an interrupted claim does not erase that deadline. Lifetime
+attempt counts remain audit information; a temporary outage is not changed into
+a permanent release failure merely because the machine was offline or an old
+configuration failure used several attempts. Queue quotas still bound the
+work performed on each wake-up.
+
+After repairing a login, automatic continuation may wait for the saved cooldown
+and the normal queue; it is not guaranteed to start at the instant login is
+completed. Missing scopes, HTTP 403/resource permissions, model/configuration
+errors, schema violations, and content quarantine keep their explicit blocked
+states. Repair and inspect those causes before using a fingerprint-bound retry
+plan. Older terminal records created by a previous release also require one
+reviewed recovery plan; installing new code does not erase historical failures.
 
 ## Health and recovery commands
 
@@ -55,16 +98,34 @@ or an explicitly direct probe. Ambient macOS HTTP proxy settings are not valid
 evidence for `127.0.0.1:9223`; a proxied timeout must never trigger a browser
 restart.
 
-`intent -> remote_written -> success` remains the only publication recovery
-path. Do not delete a `remote_written` row, text/summary cache, notification
-outbox, or prior manifest to force a retry. Repair the cause, create a narrow
-`retry plan`, review its fingerprints/count, and use `retry apply --apply`.
+`intent -> remote_written -> success` remains the publication recovery path.
+Before creating or appending a document body, the worker persists a write-in-
+flight marker on the intent. If power is lost after submission but before its
+receipt is saved, a new worker cannot assume the write failed: it marks the
+publication as needing reconciliation and does not send the body again. Saved
+member identities also prevent a changed batch from placing an unresolved or
+already-written report into a new group and bypassing its original receipt.
+Timeouts and document-write transport errors with unknown remote outcomes
+retain this guard. Explicit authentication refusals and a failed OAuth token
+exchange can be retried after repair. Once a remote reference is recorded as
+`remote_written`, recovery only verifies content/title/permissions and cannot
+repeat create or append.
+
+Inspect the remote document for an uncertain write before resuming it. The
+operator must preserve or attach its actual receipt if it exists, or confirm
+that no write was applied before clearing the intent marker. Do not delete a
+publication row, text/summary cache, notification outbox, or prior manifest to
+force a retry. Other terminal failures use a narrow fingerprint-bound
+`retry plan`, reviewed count, and `retry apply --apply`.
 
 ## Sleep, wake, and rollback
 
-A powered-off machine cannot run at the intended time. On the next tick the
-durable checkpoint makes the missed business range visible; configured
-lookback limits are reported rather than silently ignored. A release rollback
+A powered-off machine cannot run at the intended time. The user LaunchAgent
+runs once after the user logs into macOS, then checks about every five minutes
+while the machine is available. The next tick uses the durable checkpoint to
+recover the entire missed business range. The bootstrap lookback applies only
+when there is no previous checkpoint. A release rollback
 only re-points `current` after an idle check. It preserves SQLite, local
 artifacts, and any successful remote side effects, so old code must continue
-to honor the same durable identities.
+to honor the same durable identities. Do not roll back unresolved write-in-
+flight intents to a release that ignores their reconciliation markers.
