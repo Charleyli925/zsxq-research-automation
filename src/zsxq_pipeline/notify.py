@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
+from .lark import LarkCommandError
 from .model import NotificationClaim, NotificationRecord, PublicationRecord
 from .state import PipelineState
 
@@ -353,9 +355,38 @@ def _has_pending_document(state: PipelineState, claim: NotificationClaim) -> boo
     return False
 
 
-def _is_auth_error(exc: Exception) -> bool:
+def is_auth_error(exc: Exception) -> bool:
+    """Recognize explicit auth failures for publication and notification."""
+
+    # A failed request to an OAuth/token endpoint can still be a transport
+    # failure. Prefer the CLI's structured category to words in its URL.
+    if isinstance(exc, LarkCommandError):
+        try:
+            payload = json.loads(exc.diagnostic)
+        except (TypeError, ValueError):
+            payload = None
+        error = payload.get("error") if isinstance(payload, Mapping) else None
+        if isinstance(error, Mapping):
+            kind = str(error.get("type", "")).lower()
+            if kind in {"network", "transport", "timeout"}:
+                return False
+            if kind in {"auth", "authentication", "authorization", "permission", "permission_denied", "insufficient_scope"}:
+                return True
     text = str(exc).lower()
-    return any(token in text for token in ("auth", "token", "permission", "keychain", "unauthorized", "forbidden"))
+    if re.search(r"\b(?:http(?:/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:401|403)\b", text):
+        return True
+    return any(marker in text for marker in (
+        "unauthorized", "forbidden", "authentication failed", "authentication error",
+        "authentication_error", "authorization required", "requires authentication",
+        "auth required", "auth error", "login required", "not logged in",
+        "please log in", "please login", "please sign in", "invalid_api_key", "invalid api key",
+        "invalid access token", "invalid token", "expired access token", "token expired",
+        "token has expired", "token is expired", "refresh token expired",
+        "token refresh failed", "failed to refresh", "refresh_token_reused",
+        "user identity is missing", "permission denied", "permission_denied",
+        "insufficient permission", "access denied", "missing scope", "missing required scope",
+        "insufficient_scope", "keychain access denied", "keychain get failed", "keychain not initialized",
+    ))
 
 
 class NotificationDrainer:
@@ -413,7 +444,7 @@ class NotificationDrainer:
                 )
             except Exception as exc:
                 error = str(exc).strip() or type(exc).__name__
-                if _is_auth_error(exc):
+                if is_auth_error(exc):
                     record = self.state.fail_notification(
                         claim,
                         error_code="notification_auth",
@@ -454,6 +485,7 @@ __all__ = [
     "enqueue_terminal_notification",
     "export_notification_audit",
     "notification_idempotency_key",
+    "is_auth_error",
     "render_batch_complete_notice",
     "render_download_blocked_notice",
     "render_download_complete_notice",

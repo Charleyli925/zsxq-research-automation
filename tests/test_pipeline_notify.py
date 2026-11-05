@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
+from zsxq_pipeline.lark import LarkCommandError
 from zsxq_pipeline.model import PublicationState
 from zsxq_pipeline.notify import (
     BATCH_COMPLETE_EVENT,
@@ -88,7 +92,19 @@ def test_document_delivery_is_idempotent_and_independent_from_publication(tmp_pa
         assert state.get_notification(first.idempotency_key).status == "sent"  # type: ignore[union-attr]
 
 
-def test_send_failure_waits_without_reverting_publication(tmp_path):
+@pytest.mark.parametrize("error", [
+    RuntimeError("network EOF"),
+    RuntimeError('Post "https://accounts.feishu.cn/oauth/v3/token": EOF'),
+    LarkCommandError("im notify", 4, json.dumps({
+        "ok": False,
+        "identity": "bot",
+        "error": {
+            "type": "network", "subtype": "transport",
+            "message": 'API call failed: Post "https://accounts.feishu.cn/oauth/v3/token": EOF',
+        },
+    })),
+])
+def test_send_failure_waits_without_reverting_publication(tmp_path, error):
     with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
         state.migrate()
         publication = _publication(state)
@@ -101,11 +117,49 @@ def test_send_failure_waits_without_reverting_publication(tmp_path):
         )
         deliveries = NotificationDrainer(
             state,
-            FakeNotifier(error=RuntimeError("network EOF")),
+            FakeNotifier(error=error),
             clock=lambda: NOW,
         ).drain()
         assert deliveries[0].status == "retry_wait"
         assert state.get_notification(queued.idempotency_key).status == "retry_wait"  # type: ignore[union-attr]
+        assert state.get_publication("a" * 64, "daily", "partition-1", target_document=publication.target_document).state is PublicationState.SUCCESS  # type: ignore[union-attr]
+        notifier = FakeNotifier()
+        recovered = NotificationDrainer(
+            state, notifier, clock=lambda: NOW + timedelta(minutes=5),
+        ).drain()
+        assert [delivery.status for delivery in recovered] == ["sent"]
+        assert len(notifier.calls) == 1
+
+
+@pytest.mark.parametrize("error", [
+    RuntimeError("Unauthorized (HTTP 401)"),
+    RuntimeError("HTTP 401"),
+    RuntimeError("HTTP 403"),
+    RuntimeError("User identity is missing; refresh token expired"),
+    RuntimeError("permission denied (HTTP 403)"),
+    RuntimeError("invalid access token"),
+    LarkCommandError("im notify", 3, json.dumps({
+        "ok": False,
+        "error": {"type": "auth", "message": "User identity is missing; refresh token expired"},
+    })),
+])
+def test_authentication_failure_stops_automatic_notification_retries(tmp_path, error):
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        publication = _publication(state)
+        queued = enqueue_document_notification(
+            state, publication, chat_id="oc_test", markdown="document", scope_key="run-1",
+        )
+        deliveries = NotificationDrainer(
+            state, FakeNotifier(error=error), clock=lambda: NOW,
+        ).drain()
+        assert [delivery.status for delivery in deliveries] == ["failed"]
+        assert state.get_notification(queued.idempotency_key).status == "failed"  # type: ignore[union-attr]
+        notifier = FakeNotifier()
+        assert NotificationDrainer(
+            state, notifier, clock=lambda: NOW + timedelta(days=1),
+        ).drain() == ()
+        assert notifier.calls == []
         assert state.get_publication("a" * 64, "daily", "partition-1", target_document=publication.target_document).state is PublicationState.SUCCESS  # type: ignore[union-attr]
 
 

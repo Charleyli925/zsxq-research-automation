@@ -31,7 +31,7 @@ from .extract import (
     sha256_file,
     validate_extracted_manifest,
 )
-from .lark import LarkCliConfig, LarkNotifier, LarkPublisher
+from .lark import LarkCliConfig, LarkCommandError, LarkNotifier, LarkPublisher, LarkTimeoutError
 from .lock import runtime_lock
 from .model import ErrorCategory, PublicationState, Stage, StageClaim, StageState, SummaryIdentity
 from .notify import (
@@ -41,6 +41,7 @@ from .notify import (
     document_entry_total,
     enqueue_terminal_notification,
     export_notification_audit,
+    is_auth_error,
     render_document_notice,
 )
 from .providers.codex import (
@@ -404,9 +405,25 @@ def _failure_category(error: Exception) -> ErrorCategory:
     if isinstance(error, ExtractionContractError):
         return ErrorCategory.RELEASE_CONTRACT
     text = str(error).lower()
-    if any(token in text for token in ("auth", "unauthorized", "forbidden", "token", "keychain", "permission")):
+    # Unsupported models require an operator to repair the route or model
+    # configuration. Repeating the same request cannot fix that contract.
+    if isinstance(error, CodexExecutionError) and any(
+        marker in text
+        for marker in (
+            "model_not_found",
+            "model not found",
+            "unsupported model",
+            "model is not supported",
+            "model does not exist",
+        )
+    ):
+        return ErrorCategory.RELEASE_CONTRACT
+    # Use the same structured Lark error categories for documents and bot
+    # notifications; an OAuth endpoint URL does not establish an auth failure.
+    if is_auth_error(error):
         return ErrorCategory.AUTH
-    if isinstance(error, (CodexExecutionError, ExtractionError, SummaryError, PublicationError, SidecarError)):
+    if isinstance(error, (CodexExecutionError, ExtractionError, SummaryError, PublicationError, SidecarError,
+                          LarkCommandError, LarkTimeoutError)):
         return ErrorCategory.TRANSIENT
     return ErrorCategory.INVARIANT
 

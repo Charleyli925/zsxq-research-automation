@@ -101,7 +101,13 @@ class _RecordingPopen:
 
 
 def test_direct_codex_call_uses_isolated_argv_and_only_last_message_output(tmp_path):
-    popen = _RecordingPopen(_success_payload(), stdout='{"event":"completed","usage":{"input_tokens":123}}\n')
+    popen = _RecordingPopen(
+        _success_payload(),
+        stdout=(
+            '{"type":"turn.started"}\n'
+            '{"type":"turn.completed","usage":{"input_tokens":123,"cached_input_tokens":40,"output_tokens":25}}\n'
+        ),
+    )
     provider = CodexSummaryProvider(
         CodexProviderConfig(model="gpt-test", work_root=tmp_path, retain_workdir=True),
         popen_factory=popen,
@@ -110,7 +116,8 @@ def test_direct_codex_call_uses_isolated_argv_and_only_last_message_output(tmp_p
     result = provider.summarize(_request())
 
     assert result.output["status"] == "success"
-    assert result.usage == {"input_tokens": 123}
+    assert result.usage == {"input_tokens": 123, "cached_input_tokens": 40, "output_tokens": 25}
+    assert "--json" in popen.argv
     assert result.workdir is not None
     assert popen.argv[:9] == (
         "codex",
