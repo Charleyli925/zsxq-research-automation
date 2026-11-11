@@ -177,6 +177,7 @@ def filter_topics(
     keyword_payload: dict[str, Any],
     archived_names: set[str],
     group_url: str,
+    completed_file_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     results = {
         "topics": [],
@@ -187,6 +188,7 @@ def filter_topics(
     archived_name_keys = {build_filename_key(name) for name in archived_names}
     seen_topic_ids: set[str] = set()
     planned_name_keys: dict[str, dict[str, Any]] = {}
+    planned_file_ids: set[str] = set()
 
     for topic in topics:
         topic_id = str(topic.get("topic_id") or "").strip()
@@ -245,7 +247,19 @@ def filter_topics(
                 "matched_keywords": matched.matched_keywords,
             }
             filename_key = build_filename_key(filename)
-            if filename in archived_names or filename_key in archived_name_keys:
+            file_id = str(file_row["file_id"] or "")
+            if completed_file_ids is not None:
+                if not file_id:
+                    raise ValueError("scanned attachment is missing file_id")
+                if file_id in completed_file_ids or file_id in planned_file_ids:
+                    candidate["duplicate_reason"] = "completed_or_planned_file_id"
+                    skipped_duplicates.append(candidate)
+                    results["skipped_duplicates"].append(candidate)
+                else:
+                    planned_file_ids.add(file_id)
+                    matched_files.append(candidate)
+                    results["download_candidates"].append(candidate)
+            elif filename in archived_names or filename_key in archived_name_keys:
                 candidate["duplicate_reason"] = "already_archived_filename"
                 skipped_duplicates.append(candidate)
                 results["skipped_duplicates"].append(candidate)
@@ -395,6 +409,7 @@ def build_scan_plan(
     keyword_payload: dict[str, Any],
     blocked_reason: str | None,
     raw_topics: list[dict[str, Any]],
+    completed_file_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Build the versioned immutable plan shared by the CLI and pipeline."""
 
@@ -405,8 +420,9 @@ def build_scan_plan(
         window_start=window_start,
         window_end=window_end,
         keyword_payload=keyword_payload,
-        archived_names=build_archived_name_set(archive_root),
+        archived_names=build_archived_name_set(archive_root) if completed_file_ids is None else set(),
         group_url=group_url,
+        completed_file_ids=completed_file_ids,
     )
     result: dict[str, Any] = {
         "schema_version": 3,
@@ -432,6 +448,7 @@ def scan_window(
     window_end: datetime,
     job_config: dict[str, Any],
     keyword_payload: dict[str, Any],
+    completed_file_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Create one immutable plan using the pipeline's existing CDP page."""
 
@@ -454,6 +471,7 @@ def scan_window(
         keyword_payload=keyword_payload,
         blocked_reason=blocked_reason,
         raw_topics=raw_topics,
+        completed_file_ids=completed_file_ids,
     )
 
 

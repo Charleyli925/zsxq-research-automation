@@ -17,7 +17,7 @@ from typing import Any
 from ._time import from_iso
 from .browser import CftLaunchOptions
 from .config import PipelineConfig, SourceConfig
-from .download import DOWNLOAD_RATE_LIMIT_REASON, DownloadOutcome, DownloadPipeline, DownloadRequest
+from .download import DOWNLOAD_RATE_LIMIT_REASON, DownloadOutcome, DownloadPipeline, DownloadRequest, _safe_source_path
 from .daily_digest import DailyDigest
 from .lark import LarkCliConfig, LarkNotifier
 from .lock import runtime_lock
@@ -181,6 +181,7 @@ class PipelineWorker:
 
         with PipelineState.open(self.config.runtime.database) as state:
             state.migrate()
+            self._restore_window_members(state)
             if "schedule" in stages:
                 scheduled = self._scheduler.enqueue_due_windows(state, now=self.clock())
 
@@ -218,10 +219,23 @@ class PipelineWorker:
                 pending_windows = state.list_source_windows(
                     statuses=("scheduled", "blocked_auth", "partial", "running")
                 )
+                source_last_attempt = state.source_download_attempts()
+            # First serve the least recently attempted source, then its least
+            # recently attempted window. A durable attempt marker prevents a
+            # quota of one, an exception or a crash from starving other work.
+            pending_windows.sort(key=lambda row: (
+                source_last_attempt[str(row["source"])],
+                0 if row["status"] == "blocked_auth" else 1,
+                0 if row["status"] == "blocked_auth" else row["last_attempt_at_epoch"],
+                row["window_end_epoch"], row["id"],
+            ))
             auth_blocked_sources: set[str] = set()
+            attempted_sources: set[str] = set()
             attempted_windows = 0
             for row in pending_windows:
                 if str(row.get("source") or "") in auth_blocked_sources:
+                    continue
+                if str(row["source"]) in attempted_sources:
                     continue
                 if attempted_windows >= self.config.schedule.download_quota:
                     break
@@ -229,6 +243,9 @@ class PipelineWorker:
                     budget_exhausted = True
                     break
                 attempted_windows += 1
+                attempted_sources.add(str(row["source"]))
+                with PipelineState.open(self.config.runtime.database) as state:
+                    state.mark_window_attempt(int(row["id"]), now=self.clock())
                 try:
                     outcome = self._run_download_window(row)
                 except Exception as exc:
@@ -251,7 +268,7 @@ class PipelineWorker:
                     reason_code = str(getattr(outcome, "reason_code", "") or "").strip()
                     suffix = f":{reason_code}" if reason_code else ""
                     failures.append(f"download:{outcome.source}:{outcome.status}{suffix}")
-                    if outcome.status == "blocked" and reason_code:
+                    if reason_code:
                         try:
                             self._queue_download_blocked(row, outcome)
                         except Exception as exc:
@@ -336,6 +353,31 @@ class PipelineWorker:
             failures=tuple(failures),
             daily_digest=digest_outcome,
         )
+
+    def _restore_window_members(self, state: PipelineState) -> None:
+        """One-time v3 upgrade: recover overwritten membership from saved plans."""
+        marker = self.config.runtime.root / "state" / "window-members-v4.json"
+        if marker.is_file():
+            return
+        restored = 0
+        windows = state.list_source_windows(statuses=("scheduled", "partial", "blocked", "blocked_auth", "running"))
+        for source_name, source in self.config.sources.items():
+            by_bounds = {(row["window_start_epoch"], row["window_end_epoch"]): row["id"]
+                         for row in windows if row["source"] == source_name}
+            if not by_bounds:
+                continue
+            root = self.config.runtime.root / "plans" / _safe_source_path(source_name)
+            for path in sorted(root.glob("*.json")):
+                plan = json.loads(path.read_text())
+                if not plan.get("window_start") or not plan.get("window_end"):
+                    continue
+                bounds = tuple(int(from_iso(plan[key]).timestamp()) for key in ("window_start", "window_end"))
+                window_id = by_bounds.get(bounds)
+                if window_id is not None:
+                    for candidate in plan.get("download_candidates") or []:
+                        state.restore_window_member(window_id, source_name, candidate, source.workflow_version)
+                        restored += 1
+        _atomic_json(marker, {"schema_version": 4, "restored_plan_members": restored})
 
     def _maybe_reconcile_search(self) -> None:
         library = self.config.pipeline.research_library_root

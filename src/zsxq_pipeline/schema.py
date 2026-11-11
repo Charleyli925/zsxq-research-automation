@@ -289,7 +289,18 @@ MIGRATION_3: tuple[str, ...] = (
     "CREATE INDEX idx_schedule_cursors_updated ON schedule_cursors(updated_at_epoch)",
 )
 
-MIGRATIONS: dict[int, tuple[str, ...]] = {1: MIGRATION_1, 2: MIGRATION_2, 3: MIGRATION_3}
+MIGRATION_4: tuple[str, ...] = (
+    "ALTER TABLE source_windows ADD COLUMN last_attempt_at_epoch INTEGER NOT NULL DEFAULT 0",
+    """CREATE TABLE window_download_members (
+        window_id INTEGER NOT NULL REFERENCES source_windows(id),
+        document_id INTEGER NOT NULL REFERENCES documents(id),
+        PRIMARY KEY(window_id, document_id)
+    )""",
+    """INSERT INTO window_download_members(window_id, document_id)
+       SELECT source_window_id,id FROM documents WHERE source_window_id IS NOT NULL""",
+)
+
+MIGRATIONS: dict[int, tuple[str, ...]] = {1: MIGRATION_1, 2: MIGRATION_2, 3: MIGRATION_3, 4: MIGRATION_4}
 
 # Rebuilding ``publications`` retains its primary keys, but SQLite updates the
 # child foreign-key declaration while a table is renamed.  Foreign-key checks

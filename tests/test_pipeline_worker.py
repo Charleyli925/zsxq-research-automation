@@ -79,6 +79,54 @@ def _notification_config(tmp_path):
     )
 
 
+@pytest.mark.parametrize("quota", [1, 2])
+def test_failed_old_windows_cannot_starve_other_sources_or_new_windows(tmp_path, quota):
+    config = _config(tmp_path)
+    config = replace(config, schedule=replace(config.schedule, download_quota=quota))
+    now = [datetime(2026, 11, 11, 8, tzinfo=UTC)]
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        for index in range(3):
+            state.register_source_window("foreign", now[0] - timedelta(days=3),
+                                         now[0] - timedelta(days=2, minutes=-index), status="partial")
+        state.register_source_window("domestic", now[0] - timedelta(days=1), now[0], status="scheduled")
+    attempts = []
+
+    def download(request):
+        attempts.append((request.source, request.window_end))
+        raise RuntimeError("synthetic transport failure before registration")
+
+    # Recreate the worker on every invocation to verify restart persistence.
+    for _ in range(6):
+        PipelineWorker(config, clock=lambda: now[0], download_runner=download).run_stage("download")
+        now[0] += timedelta(minutes=5)
+    assert {source for source, _ in attempts[:2]} == {"foreign", "domestic"}
+    assert len({end for source, end in attempts if source == "foreign"}) == 3
+
+
+def test_upgrade_restores_owed_attachment_from_old_plan_before_checkpoint_skip(tmp_path):
+    config = _config(tmp_path)
+    now = datetime(2026, 11, 11, 8, tzinfo=UTC)
+    start, end = now - timedelta(days=2), now - timedelta(days=1)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        window = state.register_source_window("foreign", start, end, status="partial")
+        state.register_source_window("foreign", start, now, status="succeeded", checkpoint_eligible=True)
+    plan_root = config.runtime.root / "plans/foreign"
+    plan_root.mkdir(parents=True)
+    (plan_root / "old.json").write_text(json.dumps({
+        "window_start": start.isoformat(), "window_end": end.isoformat(),
+        "download_candidates": [{"file_id": "owed", "filename": "owed.pdf"}],
+    }))
+    requests = []
+    worker = PipelineWorker(config, download_runner=lambda request: requests.append(request) or
+                            SimpleNamespace(status="failed", source="foreign", reason_code="download_incomplete"))
+    worker.run_stage("download")
+    assert len(requests) == 1 and requests[0].window_start == start
+    with PipelineState.open(config.runtime.database) as state:
+        assert len(state.list_window_download_debts(window, "download:v1")) == 1
+
+
 def test_daily_search_reconciliation_runs_once_per_day_and_records_progress(tmp_path):
     config = _config(tmp_path)
     library = config.runtime.root / "projections" / "ResearchLibrary"

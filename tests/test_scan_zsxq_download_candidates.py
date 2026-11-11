@@ -28,6 +28,24 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ScanZsxqDownloadCandidatesTests(unittest.TestCase):
+    def test_pipeline_scan_uses_attachment_completion_not_matching_filenames(self):
+        topics = [{"topic_id": str(index), "create_time": "2026-07-26T10:35:17+08:00",
+                   "talk": {"files": [{"file_id": file_id, "name": "互联网报告.pdf"}]}}
+                  for index, file_id in enumerate((1, 2, 2, 3))]
+        from unittest.mock import patch
+        with patch.object(MODULE, "fetch_topics_from_page", return_value=(None, topics)):
+            result = MODULE.scan_window(
+                object(), window_start=datetime.fromisoformat("2026-07-25T00:00:00+08:00"),
+                window_end=datetime.fromisoformat("2026-07-27T00:00:00+08:00"),
+                job_config={"group_url": "https://wx.zsxq.com/group/12345678901234",
+                            "tag_url": "https://wx.zsxq.com/tags/test/12345678901234"},
+                keyword_payload={"schema_version": 2, "standalone_keywords": ["互联网"],
+                                 "region_keywords": [], "region_required_keywords": [], "exclude_keywords": []},
+                completed_file_ids={"1"},
+            )
+        assert [item["file_id"] for item in result["download_candidates"]] == [2, 3]
+        assert len(result["skipped_duplicates"]) == 2
+
     def test_build_topic_url(self) -> None:
         url = MODULE.build_topic_url(
             "https://wx.zsxq.com/group/12345678901234",
