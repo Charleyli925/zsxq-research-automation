@@ -157,7 +157,7 @@ def test_download_pipeline_uses_one_page_and_commits_only_after_manifest_reconci
         attempt = state.get_stage_attempt(1, Stage.DOWNLOAD, request.workflow_version)
         assert attempt is not None
         assert attempt["state"] == StageState.SUCCEEDED.value
-        extraction = state.get_stage_attempt(1, Stage.TEXT_EXTRACT, request.extractor_version)
+        extraction = state.get_stage_attempt(1, Stage.TEXT_EXTRACT, f"extract:{request.extractor_version}")
         assert extraction is not None
         assert extraction["state"] == StageState.QUEUED.value
 
@@ -180,6 +180,36 @@ def test_content_protection_is_terminal_but_allows_the_window_to_checkpoint(tmp_
         attempt = state.get_stage_attempt(1, Stage.DOWNLOAD, request.workflow_version)
         assert attempt is not None
         assert attempt["state"] == StageState.QUARANTINED.value
+
+
+def test_later_browser_exception_still_finalizes_completed_download(tmp_path):
+    plan = _plan()
+    plan["download_candidates"].append({"file_id": "file-2", "filename": "second.pdf", "topic_url": "https://example.invalid/2"})
+    staging = tmp_path / "staging"
+    downloader = FakeDownloader(staging)
+    original = downloader.download_candidate_on_page
+
+    def download(candidate, **kwargs):
+        if candidate["file_id"] == "file-2":
+            raise RuntimeError("CDP disconnected")
+        return original(candidate, **kwargs)
+
+    downloader.download_candidate_on_page = download
+    archive = tmp_path / "archive.pdf"
+
+    def finalize(request, plan_path, manifest_path, run_id, started_at):
+        (staging / "fixture.pdf").replace(archive)
+        return {"files": [{"source_file_id": "file-1", "filename": "fixture.pdf", "archive_path": str(archive),
+                           "pdf_sha256": hashlib.sha256(archive.read_bytes()).hexdigest()}]}
+
+    request = _request(tmp_path)
+    outcome = DownloadPipeline(scanner=FakeScanner(plan), downloader=downloader,
+                               browser_session_factory=FakeSession, finalizer_runner=finalize).run(request)
+    assert not outcome.checkpoint_eligible
+    with PipelineState.open(request.database) as state:
+        assert state.get_stage_attempt(1, Stage.DOWNLOAD, request.workflow_version)["state"] == "succeeded"
+        assert state.get_stage_attempt(2, Stage.DOWNLOAD, request.workflow_version)["state"] == "retry_wait"
+        assert state.get_document(1).artifact_id is not None
 
 
 def test_download_rate_limit_stops_remaining_candidates_and_defers_until_next_day(tmp_path):

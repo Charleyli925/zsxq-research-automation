@@ -11,6 +11,31 @@ from zsxq_pipeline.state import InvariantViolation, LeaseLostError, PipelineStat
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
 
 
+def test_rescanning_attachment_in_overlapping_window_preserves_both_debts(tmp_path):
+    with PipelineState.open(tmp_path / "state.sqlite") as state:
+        state.migrate()
+        first = state.register_source_window("foreign", NOW - timedelta(hours=2), NOW)
+        second = state.register_source_window("foreign", NOW - timedelta(hours=2), NOW + timedelta(hours=1))
+        document = state.upsert_document("foreign", "file", filename="a.pdf", source_window_id=first)
+        state.ensure_stage(document.id, Stage.DOWNLOAD, "download:v1")
+        state.upsert_document("foreign", "file", source_window_id=second)
+        for window in (first, second):
+            assert [row["document_id"] for row in state.list_window_download_debts(window, "download:v1")] == [document.id]
+
+
+def test_health_does_not_count_obsolete_unclaimed_extractor_placeholder(tmp_path):
+    with PipelineState.open(tmp_path / "state.sqlite") as state:
+        state.migrate()
+        doc = state.upsert_document("foreign", "one")
+        state.ensure_stage(doc.id, Stage.TEXT_EXTRACT, "ocr-v2")
+        state.ensure_stage(doc.id, Stage.TEXT_EXTRACT, "extract:ocr-v2")
+        claim = state.claim_due_stage(Stage.TEXT_EXTRACT, "extract:ocr-v2")
+        state.complete_stage(claim)
+        stages = state.derive_health()["sources"]["foreign"]["stages"]["text_extract"]
+        assert stages["queued"] == 0 and stages["succeeded"] == 1
+        assert state.get_stage_attempt(doc.id, Stage.TEXT_EXTRACT, "ocr-v2")["state"] == "queued"
+
+
 def test_documents_keep_source_identity_while_pdf_content_is_deduplicated(tmp_path):
     database = tmp_path / "pipeline.sqlite3"
     sha = "a" * 64

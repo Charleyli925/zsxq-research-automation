@@ -1504,7 +1504,10 @@ def ensure_text_for_item(item: dict, output_dir: Path) -> dict:
         )
 
     safe_name = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", pdf_path.stem)[:120]
-    txt_path = output_dir / f"{safe_name}.txt"
+    # The adapter reads every result only after the whole batch completes.
+    # Names (including sanitized names) cannot identify those durable inputs:
+    # a later same-name PDF must never replace an earlier report's text.
+    txt_path = output_dir / cache_key / f"{safe_name}.txt"
     warnings: list[str] = []
 
     cached_payload = load_success_cache(cache_key)
@@ -1585,6 +1588,7 @@ def ensure_text_for_item(item: dict, output_dir: Path) -> dict:
     ocr_failures: list[str] = []
     ocr_diagnostics: dict[str, object] = {}
     try:
+        txt_path.parent.mkdir(parents=True, exist_ok=True)
         ocr_text, ocr_source, ocr_truncated, ocr_warnings = local_ocr_extract(
             pdf_path,
             txt_path,

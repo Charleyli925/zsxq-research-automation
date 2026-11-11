@@ -1145,6 +1145,7 @@ class DigestProcessor:
         item["summary_md_path"] = str(destination)
         item["summary_cache_path"] = str(persisted.paths.markdown_path)
         item["summary_cache_key"] = persisted.identity.cache_key
+        item["title"] = persisted.entry.title
 
     def _archive_published_sidecar(
         self,
@@ -1202,6 +1203,7 @@ class DigestProcessor:
                 source=str(source_items[path].get("batch_id", "") or self.config.source),
                 path=path,
                 filename=persisted.entry.filename,
+                title=persisted.entry.title,
                 source_date=str(source_items[path].get("modified_at", "") or batch.get("generated_at", "")),
             )
             for path, persisted in summaries.items()

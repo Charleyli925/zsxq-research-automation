@@ -66,7 +66,8 @@ class ArchiveToObsidianTests(unittest.TestCase):
 
             self.assertEqual(result["archived_count"], 1)
             self.assertTrue(note_path.exists())
-            self.assertEqual(note_path.parent.name, batch_id)
+            self.assertEqual(note_path.parent.parent.name, batch_id)
+            self.assertEqual(note_path.parent.name, "a" * 64)
             self.assertEqual(note_path.name, "alpha.md")
             note_text = note_path.read_text(encoding="utf-8")
             self.assertIn("feishu_doc_url", note_text)

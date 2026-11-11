@@ -30,11 +30,13 @@ try:
     from zsxq_focus_config import load_persistent_config
     from zsxq_keyword_matcher import match_title
     from research_library_index import db_path_for_library, record_event, upsert_report
+    import zsxq_download_receipt as receipts
 except ModuleNotFoundError:  # pragma: no cover - package import fallback
     from scripts.runtime_paths import DEFAULT_RUNTIME_ROOT, REPO_ROOT
     from scripts.zsxq_focus_config import load_persistent_config
     from scripts.zsxq_keyword_matcher import match_title
     from scripts.research_library_index import db_path_for_library, record_event, upsert_report
+    from scripts import zsxq_download_receipt as receipts
 
 
 JOB_CONFIG_PATH = REPO_ROOT / "config/local/zsxq_foreign_reports_job.json"
@@ -53,6 +55,8 @@ class CandidateFile:
     match_rule: str | None
     size_bytes: int
     source_priority: int
+    receipt_path: Path | None = None
+    planned_row: dict[str, Any] | None = None
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -237,6 +241,10 @@ def filter_candidates_to_scan_plan(
                 }
             )
             continue
+        if len({candidate_identity(row) for row in rows}) != 1:
+            rejected.append({"filename": candidate.archive_name, "reason": "ambiguous_attachment_identity",
+                             "source_paths": [str(candidate.path)]})
+            continue
         accepted.append(candidate)
         exact_rows = [row for row in rows if str(row.get("filename") or "") == candidate.archive_name]
         selected_plan_rows[candidate.archive_name] = exact_rows[0] if exact_rows else rows[0]
@@ -257,71 +265,6 @@ def merge_manifest_entries(existing: list[dict[str, Any]], additions: list[dict[
         seen.add(key)
         merged.append(entry)
     return merged
-
-
-def reconcile_same_filename_plan_duplicates(
-    expected_rows: list[dict[str, Any]],
-    downloaded_entries: list[dict[str, Any]],
-    satisfied_entries: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Credit duplicate plan rows that map to one physical archive filename.
-
-    Older immutable plans could contain the same normalized filename from two
-    topics with different file IDs. The filesystem can only retain one file at
-    that path, so once one planned identity is archived the remaining exact
-    filename rows are satisfied duplicates rather than missing downloads.
-    """
-
-    rows_by_name: dict[str, list[dict[str, Any]]] = {}
-    for row in expected_rows:
-        filename = str(row.get("filename") or row.get("name") or "").strip()
-        if filename:
-            rows_by_name.setdefault(build_filename_key(filename), []).append(row)
-
-    completed_entries = [*downloaded_entries, *satisfied_entries]
-    completed_identities = {
-        str(entry.get("candidate_identity") or "")
-        for entry in completed_entries
-        if str(entry.get("candidate_identity") or "").strip()
-    }
-    completed_by_name: dict[str, dict[str, Any]] = {}
-    for entry in completed_entries:
-        filename = str(entry.get("filename") or "").strip()
-        if filename:
-            completed_by_name.setdefault(build_filename_key(filename), entry)
-
-    additions: list[dict[str, Any]] = []
-    for filename_key, rows in rows_by_name.items():
-        if len(rows) < 2:
-            continue
-        source_entry = completed_by_name.get(filename_key)
-        if not source_entry:
-            continue
-        for row in rows:
-            identity = candidate_identity(row)
-            if identity in completed_identities:
-                continue
-            filename = str(row.get("filename") or row.get("name") or "").strip()
-            addition = {
-                "candidate_identity": identity,
-                "source_file_id": row.get("file_id"),
-                "source_topic_id": row.get("topic_id"),
-                "filename": filename,
-                "pdf_sha256": source_entry.get("pdf_sha256"),
-                "disposition": "same_window_filename_duplicate",
-                "duplicate_of_candidate_identity": source_entry.get(
-                    "candidate_identity"
-                ),
-                "existing_archive_path": source_entry.get("archive_path")
-                or source_entry.get("existing_archive_path")
-                or source_entry.get("path")
-                or "",
-                "matched_keywords": row.get("matched_keywords") or [],
-                "match_rule": row.get("match_rule"),
-            }
-            additions.append(addition)
-            completed_identities.add(identity)
-    return additions
 
 
 def build_run_manifest(
@@ -363,14 +306,6 @@ def build_run_manifest(
     satisfied_entries = merge_manifest_entries(
         existing.get("satisfied_entries") if isinstance(existing.get("satisfied_entries"), list) else [],
         attempt_satisfied_entries,
-    )
-    satisfied_entries = merge_manifest_entries(
-        satisfied_entries,
-        reconcile_same_filename_plan_duplicates(
-            expected_rows,
-            downloaded_entries,
-            satisfied_entries,
-        ),
     )
     archive_dirs = [str(value) for value in (existing.get("archive_dirs") or []) if str(value).strip()]
     if batch_dir is not None and str(batch_dir) not in archive_dirs and attempt_entries:
@@ -663,7 +598,8 @@ def archive_candidates(
     use_library_layout = is_library_pdf_root(archive_root, library_root)
     batch_dir = archive_root / batch_dir_name
     manifest_entries: list[dict[str, Any]] = []
-    archived_pdf_paths = existing_pdf_sha256_paths(archive_root) if use_library_layout else {}
+    archived_pdf_paths = (existing_pdf_sha256_paths(archive_root)
+                          if use_library_layout and any(c.receipt_path is None for c in candidates) else {})
     archived_pdf_sha256s = set(archived_pdf_paths)
 
     if not dry_run:
@@ -672,12 +608,21 @@ def archive_candidates(
     for candidate in candidates:
         pdf_sha256 = compute_pdf_sha256(candidate.path)
         report_id = build_report_id(pdf_sha256)
-        planned_row = (
+        planned_row = candidate.planned_row or (
             (planned_rows or {}).get(candidate.archive_name)
             or (planned_rows or {}).get(build_filename_key(candidate.archive_name))
             or {}
         )
-        if use_library_layout:
+        if candidate.receipt_path is not None:
+            value = receipts.load(candidate.receipt_path, planned_row)
+            if value is None or value.get("sha256") != pdf_sha256:
+                raise ValueError("candidate has no verified download receipt")
+            # Stable per-attachment directory prevents same-name overwrites.
+            destination = archive_root / batch_dir_name / candidate.receipt_path.parent.name / candidate.archive_name
+            destination = Path(value.get("archive_path") or destination)
+            if not destination.resolve().is_relative_to(archive_root.resolve()):
+                raise ValueError("download archive receipt escapes configured archive root")
+        elif use_library_layout:
             if pdf_sha256 in archived_pdf_sha256s:
                 if satisfied_duplicates is not None and planned_row:
                     existing_path = archived_pdf_paths.get(pdf_sha256)
@@ -721,7 +666,12 @@ def archive_candidates(
         )
         if not dry_run:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(candidate.path), str(destination))
+            if candidate.receipt_path is not None:
+                receipts.archive(candidate.receipt_path, value, candidate.path, destination)
+            else:
+                if destination.exists():
+                    raise ValueError(f"archive destination already exists: {destination}")
+                shutil.move(str(candidate.path), str(destination))
             archived_pdf_sha256s.add(pdf_sha256)
             archived_pdf_paths.setdefault(pdf_sha256, destination)
             if library_root is not None:
@@ -914,6 +864,36 @@ def run_finalization(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if scan_plan is not None:
             candidates, plan_rejections, planned_rows = filter_candidates_to_scan_plan(candidates, scan_plan)
             rejected_files.extend(plan_rejections)
+            # Receipts bind bytes to attachment identity, not to this run's
+            # wall clock. Include interrupted downloads and archived receipts
+            # even when a fresh scan has a different run ID or time window.
+            receipt_candidates = []
+            receipt_names = set()
+            for planned in scan_plan.get("download_candidates") or []:
+                if not all(planned.get(key) for key in ("file_id", "filename", "topic_url")):
+                    continue  # Legacy manifests did not carry receipt identity.
+                for root in [staging_dir, *extra_staging_dirs]:
+                    receipt = receipts.receipt_path(root, planned)
+                    if not receipt.exists():
+                        continue
+                    receipt_names.add(planned["filename"])
+                    try:
+                        value = receipts.load(receipt, planned)
+                        path = receipts.completed_path(receipt, value)
+                    except (ValueError, OSError) as exc:
+                        rejected_files.append({"filename": planned["filename"], "file_id": planned["file_id"],
+                                               "reason": "download_receipt_invalid", "detail": str(exc)[:300]})
+                        break
+                    if path is not None:
+                        receipt_candidates.append(CandidateFile(
+                            path=path, archive_name=planned["filename"],
+                            modified_at=datetime.fromtimestamp(path.stat().st_mtime).astimezone(),
+                            matched_keywords=planned.get("matched_keywords") or [],
+                            match_rule=planned.get("match_rule"), size_bytes=path.stat().st_size,
+                            source_priority=0, receipt_path=receipt, planned_row=planned,
+                        ))
+                    break
+            candidates = [c for c in candidates if c.archive_name not in receipt_names] + receipt_candidates
 
         new_entries: list[dict[str, Any]] = []
         new_satisfied_entries: list[dict[str, Any]] = []

@@ -10,6 +10,6 @@ from __future__ import annotations
 from .model import SummaryIdentity
 
 __version__ = "0.1.0"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 __all__ = ["SCHEMA_VERSION", "SummaryIdentity", "__version__"]

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -95,7 +96,11 @@ def file_uri(path: str) -> str:
 def note_path_for_item(vault_root: Path, library_root: Path, item: dict[str, Any]) -> Path:
     batch_id = artifact_batch_id(item, library_root)
     stem = artifact_stem(item)
-    return vault_root / "10_Reports" / batch_id / f"{stem}.md"
+    directory = vault_root / "10_Reports" / batch_id
+    digest = str(item.get("pdf_sha256", "") or "").lower()
+    if len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest):
+        directory /= digest
+    return directory / f"{stem}.md"
 
 
 def frontmatter_value(value: str) -> str:
@@ -194,6 +199,21 @@ def archive_batch(
         if not summary_path or not Path(summary_path).exists():
             continue
         note_path = note_path_for_item(vault_root, library_root, item)
+        db_path = library_database or db_path_for_library(library_root)
+        # Preserve existing links when upgrading to collision-safe paths. Only
+        # reuse a note whose catalog and frontmatter bind it to this same PDF.
+        if db_path.is_file():
+            with sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True) as conn:
+                prior = conn.execute(
+                    "SELECT obsidian_note_path,pdf_sha256 FROM reports WHERE report_id=?",
+                    (report_id_for_item(item),),
+                ).fetchone()
+            if prior and prior[0] and prior[1] == item.get("pdf_sha256"):
+                old_path = Path(prior[0])
+                if old_path.is_file() and old_path.resolve().is_relative_to((vault_root / "10_Reports").resolve()):
+                    old_note = load_note(old_path, vault_root)
+                    if old_note.frontmatter.get("report_id") == report_id_for_item(item):
+                        note_path = old_path
         item["batch_id"] = artifact_batch_id(item, library_root)
         try:
             note_path.parent.mkdir(parents=True, exist_ok=True)

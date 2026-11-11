@@ -571,6 +571,43 @@ class PipelineState:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def mark_window_attempt(self, window_id: int, *, now: datetime | None = None) -> None:
+        """Persist fairness before attempting I/O, including crashes/exceptions."""
+        _, _, epoch = _timestamp(now)
+        with self._write_transaction():
+            self._connection.execute(
+                "UPDATE source_windows SET last_attempt_at_epoch=? WHERE id=?", (epoch, int(window_id))
+            )
+
+    def source_download_attempts(self) -> dict[str, int]:
+        return dict(self._connection.execute(
+            "SELECT source,MAX(last_attempt_at_epoch) FROM source_windows GROUP BY source"
+        ).fetchall())
+
+    def completed_download_ids(self, source: str, workflow: str) -> set[str]:
+        return {str(row[0]) for row in self._connection.execute(
+            """SELECT d.source_file_id FROM documents d JOIN stage_attempts s ON s.document_id=d.id
+               WHERE d.source=? AND s.stage='download' AND s.workflow_version=? AND s.state='succeeded'""",
+            (source, workflow),
+        )}
+
+    def restore_window_member(self, window_id: int, source: str, candidate: Mapping[str, Any], workflow: str) -> None:
+        row = self._connection.execute(
+            "SELECT id FROM documents WHERE source=? AND source_file_id=?",
+            (source, str(candidate["file_id"])),
+        ).fetchone()
+        if row is None:
+            document_id = self.upsert_document(source, str(candidate["file_id"]),
+                filename=str(candidate["filename"]), source_window_id=window_id).id
+            self.ensure_stage(document_id, Stage.DOWNLOAD, workflow)
+        else:
+            document_id = int(row["id"])
+        with self._write_transaction():
+            self._connection.execute(
+                "INSERT OR IGNORE INTO window_download_members(window_id,document_id) VALUES (?,?)",
+                (window_id, document_id),
+            )
+
     def list_window_download_debts(
         self, source_window_id: int, workflow_version: str,
     ) -> list[dict[str, Any]]:
@@ -589,7 +626,8 @@ class PipelineState:
             SELECT documents.id AS document_id, documents.source_file_id,
                    documents.filename, attempt.state, attempt.error_code
             FROM source_windows AS window
-            JOIN documents ON documents.source_window_id=window.id
+            JOIN window_download_members member ON member.window_id=window.id
+            JOIN documents ON documents.id=member.document_id
               AND documents.source=window.source
             LEFT JOIN stage_attempts AS attempt
               ON attempt.document_id=documents.id AND attempt.stage='download'
@@ -739,6 +777,11 @@ class PipelineState:
             row = self._connection.execute(
                 "SELECT * FROM documents WHERE source = ? AND source_file_id = ?", (source, source_file_id)
             ).fetchone()
+            if row is not None and source_window_id is not None:
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO window_download_members(window_id,document_id) VALUES (?,?)",
+                    (int(source_window_id), int(row["id"])),
+                )
         assert row is not None
         return _row_document(row)
 
@@ -2134,6 +2177,14 @@ class PipelineState:
               stage_attempts.available_at_iso, stage_attempts.available_at_epoch,
               stage_attempts.lease_expires_at_epoch
             FROM stage_attempts JOIN documents ON documents.id = stage_attempts.document_id
+            WHERE NOT (
+              stage_attempts.stage='text_extract' AND stage_attempts.state='queued'
+              AND stage_attempts.attempt_count=0 AND EXISTS (
+                SELECT 1 FROM stage_attempts actual
+                WHERE actual.document_id=stage_attempts.document_id AND actual.stage='text_extract'
+                  AND actual.workflow_version='extract:' || stage_attempts.workflow_version
+              )
+            )
             ORDER BY documents.source, stage_attempts.stage
             """
         ).fetchall()

@@ -44,6 +44,7 @@ class SummaryForPublish:
     path: str
     filename: str
     source_date: str = ""
+    title: str = ""
 
 
 @dataclass(frozen=True, slots=True)

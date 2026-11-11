@@ -201,6 +201,7 @@ class FakeSidecars:
         self.root = root
         self.summary_paths: list[str] = []
         self.archives: list[tuple[tuple[str, ...], str]] = []
+        self.published_titles = []
 
     def persist_summary(self, item, persisted):
         destination = self.root / "library" / f"{Path(item['filename']).stem}.summary.md"
@@ -211,6 +212,7 @@ class FakeSidecars:
 
     def archive_published_group(self, *, entries, batch_items, document_url):
         self.archives.append((tuple(entry.path for entry in entries), document_url))
+        self.published_titles.extend(entry.title for entry in entries)
         return SidecarArchiveResult(archived_count=len(entries))
 
 
@@ -317,6 +319,7 @@ def test_process_uses_extracted_text_direct_codex_and_lark_boundaries(tmp_path):
     assert "本次新增" in notifier.calls[0][1]
     assert "文档累计" in notifier.calls[0][1]
     assert sidecars.summary_paths == [str(pdf)]
+    assert sidecars.published_titles == ["report.pdf 摘要"]
     assert sidecars.archives == [((str(pdf),), next(iter(publisher.documents)))]
     assert json.loads((runtime / "last_result.json").read_text(encoding="utf-8"))["status"] == "success"
     assert "openclaw" not in (runtime / "run_status.json").read_text(encoding="utf-8").lower()
