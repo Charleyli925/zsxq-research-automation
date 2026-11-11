@@ -161,8 +161,9 @@ corrective release; never restore an old business database to hide failures.
 
 The accepted summary title travels through the real publication entry and
 the Obsidian adapter. It must not fall back to the import filename. New
-summary/note paths include the PDF hash so different PDFs with the same name
-cannot overwrite one another. Existing verified note links are preserved.
+extracted-text/summary/note paths include the PDF hash so different PDFs with
+the same name (or names that sanitize identically) cannot overwrite one
+another before or after summarization. Existing verified note links are preserved.
 
 For historical `source_changed` rows caused by the old title handoff, use
 `scripts/repair_summary_projections.py plan --config ... --plan ...`. The
