@@ -1,4 +1,8 @@
-"""Bounded, one-shot orchestration for the unified local pipeline scheduler."""
+"""Compatibility orchestration and shared adapters for offline maintenance.
+
+Production CLI scheduling lives in service.py; it never calls this synchronous
+window runner. Maintenance callers take an exclusive writer gate.
+"""
 
 from __future__ import annotations
 
@@ -540,7 +544,8 @@ class PipelineWorker:
                 if total < 1:
                     continue
                 scope = self._window_scope(window_id)
-                if summarized == total and published == total:
+                from .incidents import window_complete_ready
+                if window_complete_ready(state, window_id, progress):
                     enqueue_pipeline_status_notification(
                         state,
                         event=BATCH_COMPLETE_EVENT,

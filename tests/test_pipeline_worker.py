@@ -448,6 +448,7 @@ def test_process_statuses_are_one_start_one_milestone_then_one_completion(tmp_pa
             "foreign",
             datetime(2026, 8, 10, 7, 0, tzinfo=UTC),
             datetime(2026, 8, 10, 8, 0, tzinfo=UTC),
+            checkpoint_eligible=True,
         )
         for index, seed in enumerate("abcdef12", start=1):
             document = state.upsert_document(

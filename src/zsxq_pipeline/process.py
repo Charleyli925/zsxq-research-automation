@@ -15,7 +15,7 @@ import os
 import sys
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -346,6 +346,8 @@ class ProcessRequest:
     # direct maintenance/test callers retain immediate draining by default.
     defer_notification_drain: bool = False
     preflight_only: bool = False
+    publish_only: bool = False
+    defer_projections: bool = False
 
     @property
     def local_only(self) -> bool:
@@ -548,16 +550,39 @@ class DigestProcessor:
         failures: list[str] = []
         quarantined = 0
         notifications: tuple[NotificationDelivery, ...] = ()
+        self._defer_projections = request.defer_projections
         with PipelineState.open(self.config.database) as state:
             state.migrate()
             documents = self._register_documents(state, batch)
-            extracted, extraction_failures, extraction_quarantined = self._extract(state, batch_path, batch, documents)
-            failures.extend(extraction_failures)
-            quarantined += extraction_quarantined
-            if extracted:
-                self._write_status(run_id, "running", "summary")
-            summaries, cache_hits, summary_failures = self._summarize(state, batch, extracted, documents)
-            failures.extend(summary_failures)
+            if request.publish_only:
+                # Publication consumes an already-accepted summary identity.
+                # No extractor or model call is allowed on this recovery path.
+                from .projections import accepted_summary
+                extracted = {}
+                summaries = {}
+                for item in batch['files']:
+                    path = str(item['path'])
+                    artifact = accepted_summary(state, documents[path].id)
+                    if artifact is None:
+                        raise ProcessError('publication has no accepted summary')
+                    if artifact['pdf_sha256'] != item['pdf_sha256'] or sha256_file(Path(path)) != artifact['pdf_sha256']:
+                        raise ProcessError('publication PDF differs from accepted summary identity')
+                    identity = SummaryIdentity(*(artifact[key] for key in (
+                        'pdf_sha256','extractor_version','prompt_version','model','reasoning')))
+                    cached = self.summary_store.load(identity)
+                    if cached is None or cached.markdown_sha256 != artifact['content_sha256']:
+                        raise SummaryCacheCorruptionError('accepted publication input is missing or changed')
+                    summaries[path] = replace(cached, entry=replace(cached.entry,path=path,filename=item['filename']))
+                    item.update(title=cached.entry.title, summary_md_path=str(cached.paths.markdown_path))
+                cache_hits = len(summaries)
+            else:
+                extracted, extraction_failures, extraction_quarantined = self._extract(state, batch_path, batch, documents)
+                failures.extend(extraction_failures)
+                quarantined += extraction_quarantined
+                if extracted:
+                    self._write_status(run_id, "running", "summary")
+                summaries, cache_hits, summary_failures = self._summarize(state, batch, extracted, documents)
+                failures.extend(summary_failures)
             _write_json(batch_path, batch)
             published = 0
             publication_records: tuple[tuple[Any, Any], ...] = ()
@@ -1137,6 +1162,14 @@ class DigestProcessor:
     ) -> None:
         """Maintain the readable library projection without changing summary truth."""
 
+        if getattr(self, '_defer_projections', False):
+            from .projections import enqueue_projection
+            with PipelineState.open(self.config.database) as state:
+                document = state.upsert_document(self.config.source, str(item.get('source_file_id') or f"pdf:{item['pdf_sha256']}"), filename=item['filename'])
+                artifact = record_summary_artifact(state, document.id, persisted)
+                enqueue_projection(state, document.id, artifact.id, source=self.config.source)
+            item.update(summary_md_path=str(persisted.paths.markdown_path), title=persisted.entry.title)
+            return
         try:
             destination = self.sidecars.persist_summary(item, persisted)
         except Exception as exc:
@@ -1278,7 +1311,17 @@ class DigestProcessor:
                 failures.append(f"publish {effective_group.title}: {exc}")
                 continue
             try:
-                self._archive_published_sidecar(batch, effective_group, publication)
+                if getattr(self, '_defer_projections', False):
+                    from .projections import accepted_summary, enqueue_projection
+                    for entry in effective_group.entries:
+                        document = documents[entry.path]
+                        artifact = accepted_summary(state, document.id)
+                        if artifact is None:
+                            raise SidecarError('publication has no accepted summary artifact')
+                        enqueue_projection(state, document.id, artifact['id'], source=self.config.source,
+                                           publication_id=publication.id)
+                else:
+                    self._archive_published_sidecar(batch, effective_group, publication)
             except Exception as exc:
                 category = _failure_category(exc)
                 for claim in owned_claims:

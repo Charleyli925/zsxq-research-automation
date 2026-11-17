@@ -158,6 +158,8 @@ class DownloadRequest:
     dry_run: bool = False
     result_path: Path | None = None
     run_id: str = ""
+    prepared_plan: Mapping[str, Any] | None = None
+    defer_library_projection: bool = False
 
     def __post_init__(self) -> None:
         source = str(self.source).strip()
@@ -361,6 +363,7 @@ class DownloadPipeline:
             wait_seconds=0.0,
             wait_interval_seconds=2.0,
             dry_run=request.dry_run,
+            defer_library_projection=request.defer_library_projection,
         )
         try:
             payload, exit_code = finalizer.run_finalization(arguments)
@@ -431,14 +434,19 @@ class DownloadPipeline:
             if request.cft_launch_options is not None:
                 session_kwargs["cft_launch_options"] = request.cft_launch_options
             with self._browser_session_factory(request.cdp_endpoint, **session_kwargs) as session:
-                plan = scanner.scan_window(
-                    session.page,
-                    window_start=request.window_start,
-                    window_end=request.window_end,
-                    job_config=job_config,
-                    keyword_payload=keyword_payload,
-                    completed_file_ids=completed_file_ids,
-                )
+                if request.prepared_plan is not None:
+                    plan = dict(request.prepared_plan)
+                    if plan.get('plan_hash') != scanner.canonical_plan_hash(plan):
+                        raise DownloadError('saved attachment plan checksum mismatch')
+                else:
+                    plan = scanner.scan_window(
+                        session.page,
+                        window_start=request.window_start,
+                        window_end=request.window_end,
+                        job_config=job_config,
+                        keyword_payload=keyword_payload,
+                        completed_file_ids=completed_file_ids,
+                    )
                 if not isinstance(plan, dict):
                     raise DownloadError("scanner returned a non-object plan")
                 _write_json(plan_path, plan)
@@ -502,7 +510,8 @@ class DownloadPipeline:
                         # were frozen/registered before login loss or a crash.
                         debts = self._window_debts(state, source_window_id, request.workflow_version)
                         auth_required = any(item["reason_code"] == "need_reauth" for item in debts)
-                        checkpoint_eligible = not debts
+                        scan = state._connection.execute('SELECT state FROM discovery_scans WHERE window_id=?', (source_window_id,)).fetchone()
+                        checkpoint_eligible = not debts and (scan is None or scan['state'] == 'complete')
                         state.register_source_window(
                             request.source,
                             request.window_start,
@@ -727,7 +736,8 @@ class DownloadPipeline:
                             missing.append(debt)
                         if debt["reason_code"] == "need_reauth":
                             auth_required = True
-                    checkpoint_eligible = not missing
+                    scan = state._connection.execute('SELECT state FROM discovery_scans WHERE window_id=?', (source_window_id,)).fetchone()
+                    checkpoint_eligible = not missing and (scan is None or scan['state'] == 'complete')
                     state.register_source_window(
                         request.source,
                         request.window_start,

@@ -464,7 +464,8 @@ def test_download_blocked_notice_is_reason_specific_and_deduplicated(tmp_path):
 
         assert first.created is True
         assert duplicate.created is False
-        assert "系统已执行有界自愈" in first.payload["markdown"]
+        assert "已保留" in first.payload["markdown"]
+        assert "已执行有界自愈" not in first.payload["markdown"]
         assert "`blocked_browser_cdp_unresponsive`" in first.payload["markdown"]
 
 

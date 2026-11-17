@@ -26,7 +26,8 @@ from .legacy_import import (
 from .schema import SchemaVersionError
 from .state import PipelineState, StateError
 from .status import doctor_state_only, read_status
-from .worker import PipelineWorker, WorkerError
+from .worker import WorkerError
+from .service import supervise, monitor_task, execute_child
 
 
 def _emit(payload: dict[str, Any]) -> None:
@@ -111,6 +112,25 @@ def _parser() -> argparse.ArgumentParser:
     retry_apply.add_argument("--expected-count", required=True, type=int)
     retry_apply.add_argument("--apply", action="store_true", help="Required before any terminal row may be requeued.")
 
+    tasks = top.add_parser('tasks',help='Plan and apply exact terminal-task retries after dependency repair.')
+    task_commands = tasks.add_subparsers(dest='tasks_command',required=True)
+    task_plan = task_commands.add_parser('plan')
+    task_plan.add_argument('--config',required=True)
+    task_plan.add_argument('--kind',required=True)
+    task_plan.add_argument('--error-code',required=True)
+    task_plan.add_argument('--output',required=True)
+    task_apply = task_commands.add_parser('apply')
+    task_apply.add_argument('--config',required=True)
+    task_apply.add_argument('--plan',required=True)
+    task_apply.add_argument('--expected-count',type=int,required=True)
+    task_apply.add_argument('--apply',action='store_true')
+    for name in ('task-worker', 'task-execute'):
+        internal = top.add_parser(name, help=argparse.SUPPRESS)
+        internal.add_argument('--config', required=True)
+        internal.add_argument('--task-id', required=True, type=int)
+        internal.add_argument('--token', required=True)
+        if name == 'task-execute':
+            internal.add_argument('--result', required=True)
     return parser
 
 
@@ -307,10 +327,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             report = _doctor_from_args(args)
             _emit(report)
             return 0 if bool(report["ok"]) else 1
+        if args.command == 'tasks':
+            from .tasks import TaskQueue
+            config = load_pipeline_config(args.config)
+            if args.tasks_command=='plan':
+                with PipelineState.open(config.runtime.database) as state:
+                    plan = TaskQueue(state).retry_plan(args.kind,args.error_code)
+                _atomic_json(Path(args.output),plan)
+                _emit({'planned':plan['expected_count'],'plan_hash':plan['plan_hash']})
+            else:
+                if not args.apply:
+                    raise ConfigError('task retries require --apply after inspecting their cause')
+                with runtime_lock(config.runtime.root) as acquired:
+                    if not acquired:
+                        raise ConfigError('runtime is busy; wait for idle before applying task retries')
+                    with PipelineState.open(config.runtime.database) as state:
+                        count = TaskQueue(state).apply_retry_plan(json.loads(Path(args.plan).read_text()),expected_count=args.expected_count)
+                _emit({'requeued':count})
+            return 0
+        if args.command == 'task-worker':
+            monitor_task(args.config, args.task_id, args.token)
+            return 0
+        if args.command == 'task-execute':
+            execute_child(args.config, args.task_id, args.token, args.result)
+            return 0
         if args.command == "tick":
-            outcome = PipelineWorker(load_pipeline_config(args.config)).tick(budget_seconds=args.budget_seconds)
-            _emit(outcome.to_dict())
-            return 0 if outcome.status in {"success", "busy"} else 1
+            outcome = supervise(args.config, budget_seconds=args.budget_seconds)
+            _emit(outcome)
+            return 0 if outcome["status"] in {"success", "busy"} else 1
         if args.command == "daily-digest":
             config = load_pipeline_config(args.config)
             digest = DailyDigest(config)
@@ -327,17 +371,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                                       reason=args.reason, apply=args.apply))
             return 0
         if args.command == "run-stage":
-            outcome = PipelineWorker(load_pipeline_config(args.config)).run_stage(
-                args.stage, budget_seconds=args.budget_seconds
-            )
-            _emit(outcome.to_dict())
-            return 0 if outcome.status in {"success", "busy"} else 1
+            outcome = supervise(args.config, stage=args.stage, budget_seconds=args.budget_seconds)
+            _emit(outcome)
+            return 0 if outcome["status"] in {"success", "busy"} else 1
         if args.command == "outbox" and args.outbox_command == "drain":
-            outcome = PipelineWorker(load_pipeline_config(args.config)).run_stage(
-                "outbox", budget_seconds=args.budget_seconds
-            )
-            _emit(outcome.to_dict())
-            return 0 if outcome.status in {"success", "busy"} else 1
+            outcome = supervise(args.config, stage="outbox", budget_seconds=args.budget_seconds)
+            _emit(outcome)
+            return 0 if outcome["status"] in {"success", "busy"} else 1
         if args.command == "retry" and args.retry_command == "plan":
             plan = _build_retry_plan(args)
             if args.output:

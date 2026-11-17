@@ -390,3 +390,12 @@ class ScanZsxqDownloadCandidatesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_http_success_with_missing_or_malformed_topics_is_not_empty_success():
+    import json
+    for value in ({},[],{'succeeded':True,'resp_data':{}},
+                  {'succeeded':True,'resp_data':{'topics':None}}):
+        error,topics = MODULE.parse_topics_api_payload({'ok':True,'status':200,'text':json.dumps(value)})
+        assert error is not None
+        assert topics==[]

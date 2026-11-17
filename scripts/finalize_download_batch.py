@@ -87,6 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Archive newly downloaded ZSXQ foreign-report PDFs into a time-window folder."
     )
+    parser.add_argument("--defer-library-projection", action="store_true", help="Archive only; the durable projection worker owns catalog writes.")
     parser.add_argument("--config", default=str(JOB_CONFIG_PATH))
     parser.add_argument("--keywords", default=str(KEYWORDS_PATH))
     parser.add_argument("--state", default=str(STATE_PATH))
@@ -592,6 +593,7 @@ def archive_candidates(
     library_root: Path | None = None,
     planned_rows: dict[str, dict[str, Any]] | None = None,
     satisfied_duplicates: list[dict[str, Any]] | None = None,
+    project_library: bool = True,
 ) -> tuple[Path, list[dict[str, Any]]]:
     """Move accepted files into one batch folder and build the manifest data."""
 
@@ -674,7 +676,7 @@ def archive_candidates(
                 shutil.move(str(candidate.path), str(destination))
             archived_pdf_sha256s.add(pdf_sha256)
             archived_pdf_paths.setdefault(pdf_sha256, destination)
-            if library_root is not None:
+            if library_root is not None and project_library:
                 try:
                     db_path = db_path_for_library(library_root)
                     upsert_report(
@@ -907,6 +909,7 @@ def run_finalization(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 library_root=library_root,
                 planned_rows=planned_rows,
                 satisfied_duplicates=new_satisfied_entries,
+                project_library=not getattr(args, 'defer_library_projection', False),
             )
             if not args.dry_run:
                 batch_manifest_path = batch_dir / "batch_manifest.json"

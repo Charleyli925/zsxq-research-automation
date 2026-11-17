@@ -79,3 +79,27 @@ def test_archive_crash_after_destination_intent_resumes_without_overwrite(tmp_pa
     destination.write_bytes(b"unrelated")
     with pytest.raises(ValueError, match="content mismatch"):
         receipts.completed_path(receipt, value)
+
+
+def test_deferred_download_archive_never_overwrites_summary_catalog(tmp_path,monkeypatch):
+    staging,archive,config,keywords,state,plan_file = write_run_fixture(tmp_path,['报告.pdf'])
+    job = json.loads(config.read_text())
+    job['research_library'] = {'root':str(tmp_path/'library')}
+    config.write_text(json.dumps(job))
+    plan = json.loads(plan_file.read_text())
+    candidate = plan['download_candidates'][0]
+    candidate['topic_url'] = 'https://example.invalid/topic/1'
+    plan_file.write_text(json.dumps(plan))
+    receipt,value = receipts.prepare(staging,candidate)
+    (receipt.parent/candidate['filename']).write_bytes(b'%PDF-1.7\n'+b'x'*2048)
+    def forbidden(*args,**kwargs):
+        pytest.fail('browser worker must not upsert the library catalog')
+    monkeypatch.setattr(finalizer,'upsert_report',forbidden)
+    args = Namespace(config=str(config),keywords=str(keywords),state=str(state),window_start=plan['window_start'],
+        window_end=plan['window_end'],downloaded_after=None,downloaded_before=None,run_id=str(uuid.uuid4()),
+        scan_plan=str(plan_file),run_manifest=str(tmp_path/'manifest.json'),skip_state_update=True,commit_state=False,
+        wait_seconds=0,wait_interval_seconds=1,dry_run=False,defer_library_projection=True)
+    result,code = finalizer.run_finalization(args)
+    assert code==0
+    assert result['file_count']==1
+    assert len(list(archive.rglob('*.pdf')))==1

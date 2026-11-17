@@ -255,6 +255,19 @@ class PipelineState:
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
         self._require_migrated()
+        if self._connection.in_transaction:
+            # Composite ledger operations (page + members + tasks + cursor)
+            # must commit together, even when they reuse these public methods.
+            savepoint = "nested_" + uuid.uuid4().hex
+            self._connection.execute(f"SAVEPOINT {savepoint}")
+            try:
+                yield
+                self._connection.execute(f"RELEASE {savepoint}")
+            except Exception:
+                self._connection.execute(f"ROLLBACK TO {savepoint}")
+                self._connection.execute(f"RELEASE {savepoint}")
+                raise
+            return
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             yield
@@ -664,10 +677,10 @@ class PipelineState:
         row = self._connection.execute(
             """
             WITH window_documents AS (
-              SELECT documents.id
+              SELECT documents.id, documents.artifact_id
               FROM documents
-              JOIN artifacts ON artifacts.id=documents.artifact_id AND artifacts.kind='pdf'
-              WHERE documents.source_window_id=?
+              JOIN window_download_members member ON member.document_id=documents.id
+              WHERE member.window_id=?
             ),
             latest AS (
               SELECT
@@ -683,16 +696,24 @@ class PipelineState:
             )
             SELECT
               COUNT(window_documents.id) AS total,
+              COALESCE(SUM(CASE WHEN download_stage.state='succeeded' OR
+                (download_stage.state IS NULL AND window_documents.artifact_id IS NOT NULL)
+                THEN 1 ELSE 0 END), 0) AS downloaded,
               COALESCE(SUM(CASE WHEN summary_stage.state='succeeded' THEN 1 ELSE 0 END), 0) AS summarized,
               COALESCE(SUM(CASE WHEN publish_stage.state='succeeded' THEN 1 ELSE 0 END), 0) AS published,
               COALESCE(SUM(
                 CASE WHEN
-                  extract_stage.state IN ('blocked_auth', 'blocked_release', 'quarantined')
+                  download_stage.state IN ('blocked_auth', 'blocked_release', 'quarantined')
+                  OR extract_stage.state IN ('blocked_auth', 'blocked_release', 'quarantined')
                   OR summary_stage.state IN ('blocked_auth', 'blocked_release', 'quarantined')
                   OR publish_stage.state IN ('blocked_auth', 'blocked_release', 'quarantined')
                 THEN 1 ELSE 0 END
               ), 0) AS blocked
             FROM window_documents
+            LEFT JOIN latest download_stage
+              ON download_stage.document_id=window_documents.id
+             AND download_stage.stage='download'
+             AND download_stage.row_number=1
             LEFT JOIN latest extract_stage
               ON extract_stage.document_id=window_documents.id
              AND extract_stage.stage='text_extract'
@@ -713,6 +734,7 @@ class PipelineState:
             "source_window_id": window_id,
             "source": str(window["source"]),
             "total": int(row["total"]),
+            "downloaded": int(row["downloaded"]),
             "summarized": int(row["summarized"]),
             "published": int(row["published"]),
             "blocked": int(row["blocked"]),
@@ -2219,8 +2241,24 @@ class PipelineState:
             _finalize_counts(source_payload["totals"])
             for stage_payload in source_payload["stages"].values():
                 _finalize_counts(stage_payload)
+        from .discovery import coverage
+        for source, payload in sources.items():
+            end = coverage(self, source)
+            payload['discovery'] = {
+                'covered_until': end.isoformat() if end else None,
+                'lag_seconds': max(0, now_epoch-int(end.timestamp())) if end else None,
+                'pending_pages': self._connection.execute("SELECT COUNT(*) FROM discovery_scans s JOIN source_windows w ON w.id=s.window_id WHERE w.source=? AND s.state='pending'",(source,)).fetchone()[0],
+            }
+        task_counts = {row['state']:row['n'] for row in self._connection.execute('SELECT state,COUNT(*) n FROM tasks GROUP BY state')}
+        active_faults = self._connection.execute("SELECT COUNT(*) FROM incidents WHERE state='open'").fetchone()[0]
+        if any(task_counts.get(s,0) for s in ('needs_action','needs_reconciliation')):
+            health = PipelineHealth.BLOCKED
+        elif health == PipelineHealth.HEALTHY and (active_faults or task_counts.get('retry_wait',0)):
+            health = PipelineHealth.DEGRADED
         return {
             "schema_version": SCHEMA_VERSION,
+            "tasks": task_counts,
+            "open_incidents": active_faults,
             "health": health.value,
             "as_of": now_iso,
             "sources": sources,

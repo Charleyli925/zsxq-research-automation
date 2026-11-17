@@ -1,9 +1,10 @@
 # Runtime recovery contract
 
 `launchd` merely wakes `zsxq-pipeline tick`; SQLite is the recovery authority.
-Every wake takes `runtime/.pipeline.lock` with non-blocking `fcntl.flock`.
-There is no PID file or stale-owner cleanup: a crash closes the descriptor and
-the next tick can safely proceed.
+Each wake dispatches durable tasks under a short scheduler lock. Independent
+workers retain resource/document locks and heartbeats until their bounded work
+ends. Expiry is not proof of process death. See the [schema-5 runtime contract](durable-task-runtime.md)
+for page commits, writer fencing, incident lifecycle and exact task recovery.
 
 ## What survives interruption
 
@@ -60,12 +61,11 @@ time boundaries and skips only the prefix already covered by a successful
 checkpoint. A candidate that is still waiting for a retry or a lease is missing
 work, so it cannot accidentally make the whole window checkpoint-eligible.
 
-A ZSXQ `need_reauth` scan keeps that source window as `blocked_auth`. If login
-expires during a candidate download, the worker stops that source's remaining
-candidates, saves the authentication retry time, and preserves already archived
-files. Other sources and local processing can continue. The next tick rescans
-the same pending window; after the user signs in to the dedicated browser, the
-same candidate identities can continue without waiting for the next daily slot.
+A ZSXQ `need_reauth` scan retains its durable cursor and uses a one-hour source
+cooldown. Other sources and independent phases continue. After the user restores
+the dedicated browser login, a successful scan releases only that source's
+blocked download login rows. Permissions, protected content and other dependency
+errors remain manual. Download debt never forces a full source-window rescan.
 
 Explicit Lark login failures, such as HTTP 401, missing user identity, or an
 expired access/refresh token, keep the publication stage or original outbox

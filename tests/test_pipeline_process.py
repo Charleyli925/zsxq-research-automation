@@ -948,3 +948,37 @@ def test_later_empty_batch_drains_notification_outbox_without_new_pipeline_work(
     assert idle_provider.requests == []
     assert idle_publisher.created == []
     assert idle_publisher.appended == []
+
+
+def test_publish_only_and_projection_tasks_never_call_model_or_inline_sidecars(tmp_path):
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    pdf = tmp_path/'report.pdf'
+    pdf.write_bytes(b'fixture PDF')
+    batch = _batch(tmp_path/'batch.json',[pdf])
+    payload = json.loads(batch.read_text())
+    payload['files'][0]['source_file_id'] = 'attachment-123'
+    batch.write_text(json.dumps(payload))
+    class ForbiddenSidecars:
+        def persist_summary(self,*args,**kwargs):
+            raise AssertionError('projection must run in separate worker')
+        def archive_published_group(self,*args,**kwargs):
+            raise AssertionError('projection must run in separate worker')
+    provider = FakeProvider()
+    first = DigestProcessor(_config(runtime),extractor=FakeExtractor(),provider=provider,
+        publisher=FakePublisher(),notifier=FakeNotifier(),sidecars=ForbiddenSidecars(),clock=lambda:NOW)
+    result = first.run(ProcessRequest(batch_file=batch,summary_only=True,defer_projections=True))
+    assert result.status=='success',result.failures
+    publisher = FakePublisher()
+    second = DigestProcessor(_config(runtime),extractor=FakeExtractor(fail_if_called=True),
+        provider=FakeProvider(fail_if_called=True),publisher=publisher,notifier=FakeNotifier(),
+        sidecars=ForbiddenSidecars(),clock=lambda:NOW)
+    result = second.run(ProcessRequest(batch_file=batch,publish_only=True,defer_projections=True))
+    assert result.status=='success',result.failures
+    result = second.run(ProcessRequest(batch_file=batch,publish_only=True,defer_projections=True))
+    assert result.status=='success'
+    assert len(publisher.created)==1
+    assert len(provider.requests)==1
+    with PipelineState.open(runtime/'state/pipeline.sqlite3') as state:
+        assert state._connection.execute("SELECT count(*) FROM tasks WHERE kind='projection'").fetchone()[0]==2
+        assert state._connection.execute("SELECT state FROM stage_attempts WHERE stage='publish'").fetchone()[0]=='succeeded'

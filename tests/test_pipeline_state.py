@@ -145,6 +145,7 @@ def test_source_window_progress_uses_latest_durable_document_stages(tmp_path):
             "source_window_id": window,
             "source": "zsxq_foreign",
             "total": 4,
+            "downloaded": 4,
             "summarized": 2,
             "published": 2,
             "blocked": 1,

@@ -265,3 +265,53 @@ def test_legacy_scheduler_presence_refuses_non_cutover_install(tmp_path):
     assert completed.returncode != 0
     assert "legacy scheduler" in completed.stderr
     assert not (runtime / "current").exists()
+
+
+def test_deployment_guard_rejects_live_independent_worker_and_claimed_startup_gap(tmp_path):
+    import argparse
+    import pytest
+    from zsxq_pipeline.lock import held_lock
+    from zsxq_pipeline.tasks import TaskQueue
+    root = tmp_path/'runtime'
+    args = argparse.Namespace(apply=True,runtime_root=str(root))
+    guarded = INSTALLER_MODULE._guarded_action(lambda args:'entered')
+    with held_lock(root/'.maintenance.lock',shared=True):
+        with pytest.raises(INSTALLER_MODULE.InstallError,match='writers are active'):
+            guarded(args)
+    with PipelineState.open(root/'state/pipeline.sqlite3') as state:
+        state.migrate()
+        tid = TaskQueue(state).enqueue('claimed','scan',{})
+        TaskQueue(state).claim(tid)
+    with pytest.raises(INSTALLER_MODULE.InstallError,match='claimed tasks'):
+        guarded(args)
+
+
+def test_rollback_rejects_schema_incompatible_old_release(tmp_path):
+    import pytest
+    root = tmp_path/'runtime'
+    target = tmp_path/'old'
+    (target/'src/zsxq_pipeline').mkdir(parents=True)
+    (target/'src/zsxq_pipeline/__init__.py').write_text('SCHEMA_VERSION = 3\n')
+    with PipelineState.open(root/'state/pipeline.sqlite3') as state:
+        state.migrate()
+    with pytest.raises(INSTALLER_MODULE.InstallError,match='cannot read current schema'):
+        INSTALLER_MODULE._check_rollback_schema(target,root,{})
+
+
+def test_failed_install_restores_preflight_database_under_held_gate(tmp_path):
+    import argparse
+    import sqlite3
+    import pytest
+    root = tmp_path/'runtime'
+    database = root/'state/pipeline.sqlite3'
+    with PipelineState.open(database) as state:
+        state.migrate()
+        state.upsert_document('source','original')
+    def _install(args):
+        with sqlite3.connect(database) as db:
+            db.execute("UPDATE documents SET filename='changed during preflight'")
+        raise INSTALLER_MODULE.InstallError('simulated activation failure before gates open')
+    with pytest.raises(INSTALLER_MODULE.InstallError,match='activation failure'):
+        INSTALLER_MODULE._guarded_action(_install)(argparse.Namespace(apply=True,runtime_root=str(root)))
+    with sqlite3.connect(database) as db:
+        assert db.execute('SELECT filename FROM documents').fetchone()[0]==''
