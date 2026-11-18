@@ -158,6 +158,8 @@ class DownloadRequest:
     dry_run: bool = False
     result_path: Path | None = None
     run_id: str = ""
+    prepared_plan: Mapping[str, Any] | None = None
+    defer_library_projection: bool = False
 
     def __post_init__(self) -> None:
         source = str(self.source).strip()
@@ -361,6 +363,7 @@ class DownloadPipeline:
             wait_seconds=0.0,
             wait_interval_seconds=2.0,
             dry_run=request.dry_run,
+            defer_library_projection=request.defer_library_projection,
         )
         try:
             payload, exit_code = finalizer.run_finalization(arguments)
@@ -422,19 +425,28 @@ class DownloadPipeline:
         scanner = self.scanner
         job_config = scanner.load_json(request.job_config_path)
         keyword_payload = scanner.load_persistent_config(request.keyword_path)
+        with PipelineState.open(request.database) as state:
+            state.migrate()
+            completed_file_ids = state.completed_download_ids(request.source, request.workflow_version)
 
         try:
             session_kwargs: dict[str, Any] = {"connect_timeout_ms": request.timeout_ms}
             if request.cft_launch_options is not None:
                 session_kwargs["cft_launch_options"] = request.cft_launch_options
             with self._browser_session_factory(request.cdp_endpoint, **session_kwargs) as session:
-                plan = scanner.scan_window(
-                    session.page,
-                    window_start=request.window_start,
-                    window_end=request.window_end,
-                    job_config=job_config,
-                    keyword_payload=keyword_payload,
-                )
+                if request.prepared_plan is not None:
+                    plan = dict(request.prepared_plan)
+                    if plan.get('plan_hash') != scanner.canonical_plan_hash(plan):
+                        raise DownloadError('saved attachment plan checksum mismatch')
+                else:
+                    plan = scanner.scan_window(
+                        session.page,
+                        window_start=request.window_start,
+                        window_end=request.window_end,
+                        job_config=job_config,
+                        keyword_payload=keyword_payload,
+                        completed_file_ids=completed_file_ids,
+                    )
                 if not isinstance(plan, dict):
                     raise DownloadError("scanner returned a non-object plan")
                 _write_json(plan_path, plan)
@@ -498,7 +510,8 @@ class DownloadPipeline:
                         # were frozen/registered before login loss or a crash.
                         debts = self._window_debts(state, source_window_id, request.workflow_version)
                         auth_required = any(item["reason_code"] == "need_reauth" for item in debts)
-                        checkpoint_eligible = not debts
+                        scan = state._connection.execute('SELECT state FROM discovery_scans WHERE window_id=?', (source_window_id,)).fetchone()
+                        checkpoint_eligible = not debts and (scan is None or scan['state'] == 'complete')
                         state.register_source_window(
                             request.source,
                             request.window_start,
@@ -572,16 +585,26 @@ class DownloadPipeline:
                                 break
                             continue
                         claims[file_id] = claim
-                        result = self.downloader.download_candidate_on_page(
-                            dict(candidate),
-                            page=session.page,
-                            staging_dir=self.downloader.choose_staging_dir(job_config),
-                            timeout_ms=request.timeout_ms,
-                            group_url=str(job_config.get("group_url") or "").strip(),
-                            group_name=str(job_config.get("group_name") or "前沿信息收录").strip(),
-                            tag_name=str(job_config.get("tag_name") or "").strip(),
-                            navigation_attempts=request.navigation_attempts,
-                        )
+                        try:
+                            result = self.downloader.download_candidate_on_page(
+                                dict(candidate),
+                                page=session.page,
+                                staging_dir=self.downloader.choose_staging_dir(job_config),
+                                timeout_ms=request.timeout_ms,
+                                group_url=str(job_config.get("group_url") or "").strip(),
+                                group_name=str(job_config.get("group_name") or "前沿信息收录").strip(),
+                                tag_name=str(job_config.get("tag_name") or "").strip(),
+                                navigation_attempts=request.navigation_attempts,
+                            )
+                        except Exception as exc:
+                            # Finalize earlier successful downloads even when a
+                            # later browser action raises outside its adapter.
+                            result = {
+                                "status": "blocked", "reason_code": "browser_download_exception"
+                                if not isinstance(exc, ValueError) else "download_receipt_invalid",
+                                "file_id": file_id, "filename": candidate.get("filename"),
+                                "message": str(exc)[:800],
+                            }
                         attempted[file_id] = result
                         if str(result.get("status") or "") == "blocked":
                             reason_code = str(result.get("reason_code") or "")
@@ -673,9 +696,22 @@ class DownloadPipeline:
                                     metadata={"plan_hash": plan.get("plan_hash"), "run_id": run_id},
                                 )
                                 state.complete_stage(claim, output_artifact_id=artifact.id)
-                                state.ensure_stage(document_id, Stage.TEXT_EXTRACT, request.extractor_version)
+                                state.ensure_stage(document_id, Stage.TEXT_EXTRACT, f"extract:{request.extractor_version}")
                         elif file_id in satisfied_ids:
-                            state.complete_stage(claim)
+                            duplicate = next(item for item in finalizer_satisfied if str(item.get("source_file_id")) == file_id)
+                            existing_path = Path(str(duplicate.get("existing_archive_path") or ""))
+                            if existing_path.is_file():
+                                artifact = state.record_artifact(
+                                    document_ids[file_id], kind="pdf", path=existing_path,
+                                    pdf_sha256=str(duplicate.get("pdf_sha256") or "") or None,
+                                    size_bytes=existing_path.stat().st_size,
+                                )
+                                state.complete_stage(claim, output_artifact_id=artifact.id)
+                                state.ensure_stage(document_ids[file_id], Stage.TEXT_EXTRACT, f"extract:{request.extractor_version}")
+                            else:
+                                state.fail_stage(claim, category=ErrorCategory.INVARIANT,
+                                                 error_code="finalizer_artifact_missing")
+                                missing.append({"source_file_id": file_id, "reason_code": "finalizer_artifact_missing"})
                         else:
                             result = attempted.get(file_id, {})
                             code = str(result.get("reason_code") or "browser_download_unstable")
@@ -700,7 +736,8 @@ class DownloadPipeline:
                             missing.append(debt)
                         if debt["reason_code"] == "need_reauth":
                             auth_required = True
-                    checkpoint_eligible = not missing
+                    scan = state._connection.execute('SELECT state FROM discovery_scans WHERE window_id=?', (source_window_id,)).fetchone()
+                    checkpoint_eligible = not missing and (scan is None or scan['state'] == 'complete')
                     state.register_source_window(
                         request.source,
                         request.window_start,

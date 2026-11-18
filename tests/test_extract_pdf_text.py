@@ -331,6 +331,48 @@ Page    2 size:  1065 x 12631.5 pts
             self.assertEqual(updated["text_source"], "markitdown_clean")
             self.assertEqual(updated["text_extract_cache_key"], "abc123")
 
+    def test_same_name_and_sanitized_name_collisions_preserve_each_reports_text(self) -> None:
+        for names in (("same.pdf", "same.pdf"), ("report (v1).pdf", "report [v1].pdf")):
+            for use_ocr in (False, True):
+                with self.subTest(names=names, use_ocr=use_ocr), tempfile.TemporaryDirectory() as tmp_dir:
+                    root = Path(tmp_dir).resolve()
+                    paths = [root / str(index) / name for index, name in enumerate(names)]
+                    texts = {}
+                    for index, path in enumerate(paths):
+                        path.parent.mkdir()
+                        path.write_bytes(f"%PDF-1.4\nreport {index}".encode())
+                        texts[path] = self.build_structured_report(80, 0).replace(
+                            "semiconductor", ("automotive", "software")[index]
+                        )
+
+                    def direct(path):
+                        return ("", "") if use_ocr else (texts[path], "")
+
+                    def ocr(path, destination, **kwargs):
+                        self.assertTrue(destination.parent.is_dir())
+                        destination.write_text(texts[path])
+                        return texts[path], "ocr_ocrmypdf_sidecar", False, []
+
+                    with (
+                        patch.object(MODULE, "TEXT_CACHE_DIR", root / "cache"),
+                        patch.object(MODULE, "LOCAL_OCR_FALLBACK_ENABLE", True),
+                        patch.object(MODULE, "direct_extract", side_effect=direct),
+                        patch.object(MODULE, "local_ocr_extract", side_effect=ocr),
+                    ):
+                        results = [MODULE.ensure_text_for_item(
+                            {"path": str(path), "filename": path.name}, root / "out"
+                        ) for path in paths]
+                        self.assertNotEqual(results[0]["extracted_text_path"], results[1]["extracted_text_path"])
+                        # Read both only after the batch, as the production adapter does.
+                        for path, result in zip(paths, results):
+                            self.assertEqual(result["text_extract_status"], "success")
+                            self.assertEqual(Path(result["extracted_text_path"]).read_text().strip(), texts[path])
+                            cached = MODULE.ensure_text_for_item(
+                                {"path": str(path), "filename": path.name}, root / "out"
+                            )
+                            self.assertTrue(cached["text_extract_cached"])
+                            self.assertEqual(Path(cached["extracted_text_path"]).read_text().strip(), texts[path])
+
     def test_ensure_text_falls_back_when_markitdown_clean_has_long_line(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)

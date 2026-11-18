@@ -12,6 +12,35 @@ from zsxq_pipeline.sidecars import ArtifactSidecars, SidecarError
 from zsxq_pipeline.summary import PersistedSummary, SummaryArtifactPaths, SummaryEntry
 
 
+def test_different_pdfs_with_same_name_do_not_overwrite_projections(tmp_path):
+    from zsxq_pipeline.summary import SummaryStore
+    from zsxq_pipeline.publish import SummaryForPublish
+
+    sidecars = ArtifactSidecars(library_root=tmp_path / "library", library_database=tmp_path / "catalog.sqlite",
+                              vault_root=tmp_path / "vault", work_root=tmp_path / "work")
+    destinations = []
+    for index in range(2):
+        pdf = tmp_path / str(index) / "same.pdf"
+        pdf.parent.mkdir()
+        pdf.write_bytes(f"%PDF-{index}".encode())
+        digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+        title = f"Report {index}"
+        cached = SummaryStore(tmp_path / "cache").persist(SummaryIdentity(digest, "e", "p", "m", "high"),
+                 SummaryEntry(str(pdf), pdf.name, title, "", f"# {title}\n\nDistinct finding {index}."))
+        item = {"path": str(pdf), "filename": pdf.name, "pdf_sha256": digest, "batch_id": "shared"}
+        destination = sidecars.persist_summary(item, cached)
+        destinations.append(destination)
+        item["summary_md_path"] = str(destination)
+        entry = SummaryForPublish(cached.markdown_sha256, cached.entry.markdown, "shared", str(pdf), pdf.name, title=title)
+        sidecars.archive_published_group(entries=(entry,), batch_items={str(pdf): item}, document_url="https://example.invalid/doc")
+    assert destinations[0] != destinations[1]
+    assert "finding 0" in destinations[0].read_text()
+    assert "finding 1" in destinations[1].read_text()
+    assert len(list((tmp_path / "vault").rglob("*.md"))) == 2
+    with sqlite3.connect(tmp_path / "catalog.sqlite") as conn:
+        assert conn.execute("SELECT count(*) FROM report_evidence_state WHERE status='ready'").fetchone()[0] == 2
+
+
 def test_sidecar_helpers_share_one_runtime_owned_library_database(tmp_path):
     library = tmp_path / "ResearchLibrary"
     vault = tmp_path / "ResearchVault"

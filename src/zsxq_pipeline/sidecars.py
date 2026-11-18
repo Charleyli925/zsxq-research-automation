@@ -85,7 +85,11 @@ def _report_id(item: Mapping[str, Any]) -> str:
 def _summary_destination(library_root: Path, item: Mapping[str, Any]) -> Path:
     stem = Path(str(item.get("filename", "report"))).stem or "report"
     safe_stem = re.sub(r"[\\/:\x00]+", "_", stem).strip() or "report"
-    return library_root / "summaries" / _batch_id(item, library_root) / f"{safe_stem}.summary.md"
+    digest = str(item.get("pdf_sha256", "")).lower()
+    directory = library_root / "summaries" / _batch_id(item, library_root)
+    if re.fullmatch(r"[0-9a-f]{64}", digest):
+        directory /= digest
+    return directory / f"{safe_stem}.summary.md"
 
 
 class ArtifactSidecars:

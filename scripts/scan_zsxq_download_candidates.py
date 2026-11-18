@@ -45,6 +45,22 @@ TOPICS_API_MAX_RETRIES = 5
 TOPICS_API_RETRY_DELAYS_SECONDS = (1.0, 3.0, 8.0, 15.0)
 TAG_NAVIGATION_MAX_RETRIES = 3
 TAG_PAGE_STATE_WAIT_MS = 12000
+SCAN_MAX_PAGES = 500
+SCAN_BUDGET_SECONDS = 180
+
+
+def fetch_topics_page(page: Any, url: str) -> dict[str, Any]:
+    """One bounded request; callers persist each page before requesting more."""
+    return page.evaluate(
+        """async (u) => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 20000);
+            try {
+                const response = await fetch(u, {credentials: 'include', signal: controller.signal});
+                return {ok: response.ok, status: response.status, text: await response.text()};
+            } finally { clearTimeout(timer); }
+        }""", url,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,11 +134,16 @@ def parse_topics_api_payload(payload: dict[str, Any]) -> tuple[str | None, list[
     except json.JSONDecodeError:
         return "api_invalid_json", []
 
+    if not isinstance(data, dict):
+        return "api_invalid_payload", []
     code = normalize_api_code(data.get("code"))
     if data.get("succeeded") is False or code:
         return f"api_error_{code or 'unknown'}", []
 
-    topics = (((data or {}).get("resp_data") or {}).get("topics")) or []
+    response = data.get("resp_data")
+    if data.get('succeeded') is not True or not isinstance(response, dict) or 'topics' not in response:
+        return "api_invalid_payload", []
+    topics = response['topics']
     if not isinstance(topics, list):
         return "api_invalid_topics", []
     return None, [topic for topic in topics if isinstance(topic, dict)]
@@ -177,6 +198,7 @@ def filter_topics(
     keyword_payload: dict[str, Any],
     archived_names: set[str],
     group_url: str,
+    completed_file_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     results = {
         "topics": [],
@@ -187,6 +209,7 @@ def filter_topics(
     archived_name_keys = {build_filename_key(name) for name in archived_names}
     seen_topic_ids: set[str] = set()
     planned_name_keys: dict[str, dict[str, Any]] = {}
+    planned_file_ids: set[str] = set()
 
     for topic in topics:
         topic_id = str(topic.get("topic_id") or "").strip()
@@ -245,7 +268,19 @@ def filter_topics(
                 "matched_keywords": matched.matched_keywords,
             }
             filename_key = build_filename_key(filename)
-            if filename in archived_names or filename_key in archived_name_keys:
+            file_id = str(file_row["file_id"] or "")
+            if completed_file_ids is not None:
+                if not file_id:
+                    raise ValueError("scanned attachment is missing file_id")
+                if file_id in completed_file_ids or file_id in planned_file_ids:
+                    candidate["duplicate_reason"] = "completed_or_planned_file_id"
+                    skipped_duplicates.append(candidate)
+                    results["skipped_duplicates"].append(candidate)
+                else:
+                    planned_file_ids.add(file_id)
+                    matched_files.append(candidate)
+                    results["download_candidates"].append(candidate)
+            elif filename in archived_names or filename_key in archived_name_keys:
                 candidate["duplicate_reason"] = "already_archived_filename"
                 skipped_duplicates.append(candidate)
                 results["skipped_duplicates"].append(candidate)
@@ -321,6 +356,9 @@ def fetch_topics_from_page(
     """Scan through a caller-owned, authenticated browser page."""
 
     window_topics: list[dict[str, Any]] = []
+    started = time.monotonic()
+    seen_cursors: set[str] = set()
+    page_count = 0
     try:
         navigation_reason = navigate_tag_page(
             page,
@@ -334,17 +372,16 @@ def fetch_topics_from_page(
 
         url = topics_api_url
         while url:
+            if page_count >= SCAN_MAX_PAGES or time.monotonic() - started >= SCAN_BUDGET_SECONDS:
+                return "api_scan_budget_exhausted", []
+            if url in seen_cursors:
+                return "api_pagination_stalled", []
+            seen_cursors.add(url)
+            page_count += 1
             topics: list[dict[str, Any]] | None = None
             last_error: str | None = None
             for attempt in range(TOPICS_API_MAX_RETRIES):
-                payload = page.evaluate(
-                    """async (u) => {
-                        const response = await fetch(u, { credentials: 'include' });
-                        const text = await response.text();
-                        return { ok: response.ok, status: response.status, text };
-                    }""",
-                    url,
-                )
+                payload = fetch_topics_page(page, url)
                 error, topics = parse_topics_api_payload(payload)
                 if error is None:
                     break
@@ -373,7 +410,11 @@ def fetch_topics_from_page(
             if not last_create or parse_iso_datetime(last_create) < window_start:
                 break
             url = f"{topics_api_url}&end_time={quote(last_create, safe='')}"
-    except PlaywrightError:
+    except PlaywrightError as exc:
+        # Keep the public two-value adapter but retain a sanitized diagnostic
+        # for the immutable plan; the durable scanner also records it per task.
+        from zsxq_pipeline.tasks import diagnostic
+        page._zsxq_scan_error = diagnostic(exc)
         return "api_unavailable", []
     return None, window_topics
 
@@ -395,6 +436,7 @@ def build_scan_plan(
     keyword_payload: dict[str, Any],
     blocked_reason: str | None,
     raw_topics: list[dict[str, Any]],
+    completed_file_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Build the versioned immutable plan shared by the CLI and pipeline."""
 
@@ -405,8 +447,9 @@ def build_scan_plan(
         window_start=window_start,
         window_end=window_end,
         keyword_payload=keyword_payload,
-        archived_names=build_archived_name_set(archive_root),
+        archived_names=build_archived_name_set(archive_root) if completed_file_ids is None else set(),
         group_url=group_url,
+        completed_file_ids=completed_file_ids,
     )
     result: dict[str, Any] = {
         "schema_version": 3,
@@ -432,6 +475,7 @@ def scan_window(
     window_end: datetime,
     job_config: dict[str, Any],
     keyword_payload: dict[str, Any],
+    completed_file_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Create one immutable plan using the pipeline's existing CDP page."""
 
@@ -447,14 +491,20 @@ def scan_window(
         group_name=str(job_config.get("group_name") or "前沿信息收录").strip(),
         tag_name=str(job_config.get("tag_name") or "").strip(),
     )
-    return build_scan_plan(
+    plan = build_scan_plan(
         window_start=window_start,
         window_end=window_end,
         job_config=job_config,
         keyword_payload=keyword_payload,
         blocked_reason=blocked_reason,
         raw_topics=raw_topics,
+        completed_file_ids=completed_file_ids,
     )
+    detail = getattr(page, "_zsxq_scan_error", "")
+    if isinstance(detail, str) and detail:
+        plan["blocked_detail"] = detail
+        plan["plan_hash"] = canonical_plan_hash(plan)
+    return plan
 
 
 def main() -> int:

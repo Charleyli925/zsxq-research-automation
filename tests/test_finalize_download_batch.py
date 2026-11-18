@@ -524,7 +524,7 @@ class FinalizeDownloadBatchTests(unittest.TestCase):
             self.assertEqual(saved_state["last_successful_check_at"], "2026-07-14T12:00:00+08:00")
             self.assertEqual(saved_state["last_batch_file_count"], 0)
 
-    def test_same_filename_plan_rows_reconcile_to_one_physical_download(self) -> None:
+    def test_same_filename_cannot_acknowledge_distinct_attachment_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             filename = "高盛-互联网行业深度报告.pdf"
@@ -575,25 +575,21 @@ class FinalizeDownloadBatchTests(unittest.TestCase):
 
             self.assertEqual(
                 completed.returncode,
-                0,
+                3,
                 completed.stdout + completed.stderr,
             )
             summary = json.loads(completed.stdout)
             saved_manifest = json.loads(manifest.read_text(encoding="utf-8"))
             saved_state = json.loads(state.read_text(encoding="utf-8"))
-            self.assertEqual(summary["file_count"], 1)
-            self.assertEqual(summary["satisfied_candidate_count"], 1)
-            self.assertEqual(saved_manifest["downloaded_count"], 1)
-            self.assertEqual(saved_manifest["satisfied_count"], 1)
-            self.assertEqual(saved_manifest["missing_candidate_count"], 0)
-            self.assertTrue(saved_manifest["state_commit_eligible"])
-            self.assertEqual(
-                saved_manifest["satisfied_entries"][0]["disposition"],
-                "same_window_filename_duplicate",
-            )
+            self.assertEqual(summary["file_count"], 0)
+            self.assertEqual(summary["satisfied_candidate_count"], 0)
+            self.assertEqual(saved_manifest["downloaded_count"], 0)
+            self.assertEqual(saved_manifest["satisfied_count"], 0)
+            self.assertEqual(saved_manifest["missing_candidate_count"], 2)
+            self.assertFalse(saved_manifest["state_commit_eligible"])
             self.assertEqual(
                 saved_state["last_successful_check_at"],
-                "2026-07-14T12:00:00+08:00",
+                "2026-07-14T08:00:00+08:00",
             )
 
 

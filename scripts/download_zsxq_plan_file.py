@@ -25,6 +25,7 @@ from zsxq_page_state import (  # noqa: E402
     LOGIN_MARKERS as LOGIN_MARKERS,
     wait_for_zsxq_page_state,
 )
+import zsxq_download_receipt as receipts  # noqa: E402
 
 CONTENT_PROTECTION_MARKER = "星主已开启「内容保护」"
 GROUP_MARKER = DEFAULT_GROUP_NAME
@@ -313,17 +314,20 @@ def download_candidate_on_page(
     if Path(filename).name != filename or not filename.lower().endswith(".pdf"):
         raise ValueError(f"unsafe planned filename: {filename!r}")
 
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    destination = staging_dir / filename
-    if destination.exists():
+    receipt, receipt_value = receipts.prepare(staging_dir, candidate)
+    recovered = receipts.completed_path(receipt, receipt_value)
+    if recovered is not None:
         return {
-            "status": "blocked",
-            "reason_code": "staging_collision",
+            "status": "downloaded",
+            "reason_code": "download_recovered",
             "file_id": file_id,
             "filename": filename,
             "topic_url": topic_url,
-            "path": str(destination),
+            "path": str(recovered),
+            "size_bytes": recovered.stat().st_size,
         }
+    staging_dir = receipt.parent
+    destination = staging_dir / filename
 
     try:
         page_state, navigation_error = navigate_to_candidate_page(
@@ -397,7 +401,10 @@ def download_candidate_on_page(
         try:
             download.save_as(temp_path)
             validate_pdf(temp_path)
+            with temp_path.open("rb") as handle:
+                os.fsync(handle.fileno())
             temp_path.rename(destination)
+            receipts.completed_path(receipt, receipt_value)
         finally:
             temp_path.unlink(missing_ok=True)
 

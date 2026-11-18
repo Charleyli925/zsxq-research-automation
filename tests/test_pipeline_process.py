@@ -201,6 +201,7 @@ class FakeSidecars:
         self.root = root
         self.summary_paths: list[str] = []
         self.archives: list[tuple[tuple[str, ...], str]] = []
+        self.published_titles = []
 
     def persist_summary(self, item, persisted):
         destination = self.root / "library" / f"{Path(item['filename']).stem}.summary.md"
@@ -211,6 +212,7 @@ class FakeSidecars:
 
     def archive_published_group(self, *, entries, batch_items, document_url):
         self.archives.append((tuple(entry.path for entry in entries), document_url))
+        self.published_titles.extend(entry.title for entry in entries)
         return SidecarArchiveResult(archived_count=len(entries))
 
 
@@ -317,6 +319,7 @@ def test_process_uses_extracted_text_direct_codex_and_lark_boundaries(tmp_path):
     assert "本次新增" in notifier.calls[0][1]
     assert "文档累计" in notifier.calls[0][1]
     assert sidecars.summary_paths == [str(pdf)]
+    assert sidecars.published_titles == ["report.pdf 摘要"]
     assert sidecars.archives == [((str(pdf),), next(iter(publisher.documents)))]
     assert json.loads((runtime / "last_result.json").read_text(encoding="utf-8"))["status"] == "success"
     assert "openclaw" not in (runtime / "run_status.json").read_text(encoding="utf-8").lower()
@@ -945,3 +948,37 @@ def test_later_empty_batch_drains_notification_outbox_without_new_pipeline_work(
     assert idle_provider.requests == []
     assert idle_publisher.created == []
     assert idle_publisher.appended == []
+
+
+def test_publish_only_and_projection_tasks_never_call_model_or_inline_sidecars(tmp_path):
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    pdf = tmp_path/'report.pdf'
+    pdf.write_bytes(b'fixture PDF')
+    batch = _batch(tmp_path/'batch.json',[pdf])
+    payload = json.loads(batch.read_text())
+    payload['files'][0]['source_file_id'] = 'attachment-123'
+    batch.write_text(json.dumps(payload))
+    class ForbiddenSidecars:
+        def persist_summary(self,*args,**kwargs):
+            raise AssertionError('projection must run in separate worker')
+        def archive_published_group(self,*args,**kwargs):
+            raise AssertionError('projection must run in separate worker')
+    provider = FakeProvider()
+    first = DigestProcessor(_config(runtime),extractor=FakeExtractor(),provider=provider,
+        publisher=FakePublisher(),notifier=FakeNotifier(),sidecars=ForbiddenSidecars(),clock=lambda:NOW)
+    result = first.run(ProcessRequest(batch_file=batch,summary_only=True,defer_projections=True))
+    assert result.status=='success',result.failures
+    publisher = FakePublisher()
+    second = DigestProcessor(_config(runtime),extractor=FakeExtractor(fail_if_called=True),
+        provider=FakeProvider(fail_if_called=True),publisher=publisher,notifier=FakeNotifier(),
+        sidecars=ForbiddenSidecars(),clock=lambda:NOW)
+    result = second.run(ProcessRequest(batch_file=batch,publish_only=True,defer_projections=True))
+    assert result.status=='success',result.failures
+    result = second.run(ProcessRequest(batch_file=batch,publish_only=True,defer_projections=True))
+    assert result.status=='success'
+    assert len(publisher.created)==1
+    assert len(provider.requests)==1
+    with PipelineState.open(runtime/'state/pipeline.sqlite3') as state:
+        assert state._connection.execute("SELECT count(*) FROM tasks WHERE kind='projection'").fetchone()[0]==2
+        assert state._connection.execute("SELECT state FROM stage_attempts WHERE stage='publish'").fetchone()[0]=='succeeded'

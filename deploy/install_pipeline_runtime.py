@@ -10,6 +10,11 @@ is referenced in place and only its SHA-256 is recorded in the manifest.
 from __future__ import annotations
 
 import argparse
+import ast
+from contextlib import ExitStack
+from functools import wraps
+import fcntl
+import sqlite3
 import hashlib
 import json
 import os
@@ -112,27 +117,85 @@ def _copy_release(release_root: Path, destination: Path) -> None:
 
 
 def _runtime_lock_available(runtime_root: Path, *, create: bool = False) -> bool:
-    # Import only from the release's dependency-free source tree.  The helper
-    # has no repository or credential side effect and uses the same flock
-    # semantics as the entrypoint itself.
-    import fcntl
+    if not runtime_root.exists() and not create:
+        return True
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as stack:
+        for name in ('.maintenance.lock', '.pipeline.lock'):
+            handle = stack.enter_context((runtime_root / name).open('a+'))
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+        return not _active_tasks(runtime_root / 'state/pipeline.sqlite3')
 
-    if not runtime_root.exists():
-        if not create:
-            return True
-        runtime_root.mkdir(parents=True, exist_ok=True)
-    if not runtime_root.is_dir():
+
+def _active_tasks(database: Path) -> bool:
+    if not database.is_file():
         return False
-    lock_path = runtime_root / ".pipeline.lock"
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return False
-        try:
-            return True
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with sqlite3.connect(database.as_uri()+'?mode=ro', uri=True) as db:
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='tasks'").fetchone():
+            return db.execute("SELECT 1 FROM tasks WHERE state='running' LIMIT 1").fetchone() is not None
+    return False
+
+
+def _guarded_action(function):
+    @wraps(function)
+    def guarded(args):
+        if not args.apply:
+            return function(args)
+        root = _absolute_path(args.runtime_root, field='--runtime-root')
+        root.mkdir(parents=True, exist_ok=True)
+        with ExitStack() as stack:
+            for name in ('.maintenance.lock', '.pipeline.lock'):
+                handle = stack.enter_context((root/name).open('a+'))
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise InstallError('pipeline writers are active; wait for idle before switching') from exc
+            database = root/'state/pipeline.sqlite3'
+            if getattr(args, 'config', None):
+                payload = tomllib.loads(Path(args.config).read_text())
+                configured = Path(payload['runtime'].get('database','state/pipeline.sqlite3'))
+                database = configured if configured.is_absolute() else root/configured
+            elif (root/'deployment-manifest.json').is_file():
+                manifest = json.loads((root/'deployment-manifest.json').read_text())
+                database = Path(manifest.get('pipeline_database') or database)
+            if _active_tasks(database):
+                raise InstallError('claimed tasks remain; let the supervisor reconcile them before switching')
+            args._runtime_lock_held = True
+            current = root/'current'
+            previous = os.readlink(current) if current.is_symlink() else None
+            with tempfile.TemporaryDirectory(prefix='pipeline-preflight-') as temporary:
+                backup = Path(temporary)/'state.sqlite3'
+                if function.__name__=='_install' and database.is_file():
+                    with sqlite3.connect(database) as source, sqlite3.connect(backup) as dest:
+                        source.backup(dest)
+                try:
+                    return function(args)
+                except Exception:
+                    actual = os.readlink(current) if current.is_symlink() else None
+                    if backup.is_file() and actual==previous:
+                        # The writer gates never opened and activation was
+                        # reverted. No remote write can have escaped this gate.
+                        with sqlite3.connect(backup) as source, sqlite3.connect(database) as dest:
+                            source.backup(dest)
+                    raise
+    return guarded
+
+
+def _check_rollback_schema(target: Path, runtime_root: Path, manifest: dict) -> None:
+    database = Path(manifest.get('pipeline_database') or runtime_root/'state/pipeline.sqlite3')
+    if not database.is_file():
+        return
+    with sqlite3.connect(database.as_uri()+'?mode=ro', uri=True) as db:
+        version = db.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] or 0
+    tree = ast.parse((target/'src/zsxq_pipeline/__init__.py').read_text())
+    supported = next((node.value.value for node in tree.body if isinstance(node, ast.Assign)
+        and any(isinstance(t,ast.Name) and t.id=='SCHEMA_VERSION' for t in node.targets)
+        and isinstance(node.value,ast.Constant)), 0)
+    if supported < version:
+        raise InstallError('previous release cannot read current schema; use a reviewed compatible rollback release')
 
 
 def _legacy_runtime_busy(root: Path) -> bool:
@@ -261,6 +324,7 @@ def _manifest(
         "schema_version": 1,
         "release_sha": sha,
         "pipeline_schema_version": doctor.get("schema_version"),
+        "pipeline_database": doctor.get("database"),
         "installed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "python": str(python),
         "config_sha256": _sha256(config),
@@ -364,6 +428,7 @@ def _restore_legacy_launchd(plists: list[Path]) -> None:
         subprocess.run(["launchctl", "bootstrap", domain, str(plist)], capture_output=True, text=True, check=False)
 
 
+@_guarded_action
 def _install(args: argparse.Namespace) -> dict[str, Any]:
     release_root = _absolute_existing(args.release_root, field="--release-root", directory=True)
     runtime_root = _absolute_path(args.runtime_root, field="--runtime-root")
@@ -374,7 +439,7 @@ def _install(args: argparse.Namespace) -> dict[str, Any]:
         raise InstallError("--runtime-root must match pipeline configuration runtime.root")
     sha = _release_sha(release_root)
     plists, cron_files, wrappers, crontab_lines, original_crontab = _preflight_legacy(args)
-    if not _runtime_lock_available(runtime_root, create=bool(args.apply)):
+    if not getattr(args, '_runtime_lock_held', False) and not _runtime_lock_available(runtime_root, create=bool(args.apply)):
         raise InstallError("unified pipeline runtime is active; wait for idle before switching")
     release = runtime_root / "releases" / sha
     current = runtime_root / "current"
@@ -386,9 +451,8 @@ def _install(args: argparse.Namespace) -> dict[str, Any]:
         raise InstallError("--skip-launchd cannot be combined with --cutover")
     _copy_release(release_root, release)
     doctor = _doctor(release, config, args.python)
-    # Recheck after potentially long copy/doctor work, before the irreversible
-    # entrypoint switch.  ``flock`` itself remains held only for this check.
-    if not _runtime_lock_available(runtime_root, create=True):
+    # Both maintenance and legacy scheduler gates remain held through activation.
+    if not getattr(args, '_runtime_lock_held', False) and not _runtime_lock_available(runtime_root, create=True):
         raise InstallError("unified pipeline became active during pre-activation checks")
     backup_root = runtime_root / "backups" / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     backup_root.mkdir(parents=True, exist_ok=True)
@@ -474,6 +538,7 @@ def _install(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+@_guarded_action
 def _rollback(args: argparse.Namespace) -> dict[str, Any]:
     runtime_root = _absolute_path(args.runtime_root, field="--runtime-root")
     manifest_path = runtime_root / "deployment-manifest.json"
@@ -491,10 +556,11 @@ def _rollback(args: argparse.Namespace) -> dict[str, Any]:
         target = (runtime_root / target).resolve(strict=False)
     if not target.is_dir():
         raise InstallError("previous release is unavailable; refusing partial rollback")
-    if not _runtime_lock_available(runtime_root, create=bool(args.apply)):
+    if not getattr(args, '_runtime_lock_held', False) and not _runtime_lock_available(runtime_root, create=bool(args.apply)):
         raise InstallError("unified pipeline runtime is active; wait for idle before rollback")
     if not args.apply:
         return {"planned": True, "activated": False, "rollback_to": target.name}
+    _check_rollback_schema(target, runtime_root, manifest)
     _atomic_symlink(runtime_root / "current", target)
     if not args.skip_launchd:
         plist = _absolute_path(args.launch_agents_dir, field="--launch-agents-dir") / f"{args.label}.plist"

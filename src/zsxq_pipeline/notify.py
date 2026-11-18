@@ -36,6 +36,7 @@ PIPELINE_STATUS_EVENTS = frozenset(
         SUMMARY_STARTED_EVENT,
         SUMMARY_PROGRESS_EVENT,
         BATCH_COMPLETE_EVENT,
+        "incident_open", "incident_reminder", "incident_resolved",
     }
 )
 _ACTIVE_NOTIFICATION_STATES = frozenset({"queued", "pending", "retry_wait", "running"})
@@ -246,7 +247,7 @@ def render_download_blocked_notice(*, source: str, reason_code: str) -> str:
     }:
         action = "需要检查专用浏览器运行配置；该窗口不会被跳过。"
     else:
-        action = "系统已执行有界自愈并保留窗口，将在后续调度中自动重试。"
+        action = "窗口与已保存进度已保留；待重试条件满足后继续处理。"
     return (
         "## ⚠️ 知识星球研报｜下载暂时受阻\n\n"
         f"{_source_label(source)}：本轮尚未完成。{action}\n\n"

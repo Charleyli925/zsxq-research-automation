@@ -39,7 +39,10 @@ and `StartInterval=300`. It invokes the finite command
 limits, quotas, stage recovery, and notifications are all driven by the same
 SQLite-backed pipeline rather than PID files, cron quiet windows, or directory
 mtime. See [deployment.md](docs/deployment.md) and the
-[cutover runbook](docs/cutover-runbook.md).
+[cutover runbook](docs/cutover-runbook.md). Schema 5 separates page discovery,
+attachment downloads, prepare, publish, projections and notifications into
+fenced tasks; see [the runtime contract](docs/durable-task-runtime.md) and
+[production-copy rehearsal](docs/recovery-rehearsal-2026-11-17.md).
 
 Merging code does not install it. Production activation needs a separate
 explicit release decision and idle check; the repository no longer ships a

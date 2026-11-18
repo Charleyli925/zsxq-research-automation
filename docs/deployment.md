@@ -48,7 +48,10 @@ python3 deploy/install_pipeline_runtime.py install --apply \
 The installer records SHA, schema version, Python, Playwright/Codex/lark/CFT
 capability booleans, and a configuration hash. It never copies or prints
 configuration content, auth profiles, reports, or credentials. A failed
-doctor leaves `current` and the active LaunchAgent unchanged.
+doctor leaves `current` and the active LaunchAgent unchanged and restores the
+preflight database backup under held writer gates. Installation holds both
+maintenance and pipeline gates through activation and rejects outstanding
+claimed tasks, including the worker startup gap.
 
 `--cutover` is a separate explicit operation. Supply every old LaunchAgent,
 cron fragment, exact active crontab line, wrapper, and legacy runtime root only
@@ -57,13 +60,15 @@ the complete user crontab, requires each `--legacy-crontab-line` to match
 exactly once, removes only those approved lines in the activation transaction,
 and restores them if activation fails. Do not use `--skip-launchd` for a
 production cutover. `rollback --apply` only moves the code entrypoint back to
-the prior unified release; it never rewrites SQLite, artifacts, Lark documents,
+a prior schema-compatible unified release; an older schema reader is rejected.
+It never rewrites SQLite, artifacts, Lark documents,
 or notifications.
 
 ## Operations
 
-All operational commands share the same validated config, runtime lock, and
-SQLite database:
+All operational commands share the validated config and SQLite database.
+Schema 5 uses the supervisor/worker gates described in
+[durable-task-runtime.md](durable-task-runtime.md):
 
 ```bash
 zsxq-pipeline doctor --config /absolute/path/to/pipeline.toml
@@ -115,17 +120,12 @@ reconciliation before another write.
 
 ## Research full-text index
 
-After each successful Obsidian archive, the archive helper updates that
-report's SQLite `report_search` row. The scheduled `tick` also completes
-reconciliation once per local day. It checks the configured
-`ResearchVault/10_Reports` directory, follows that explicitly configured
-report-directory symlink, and repairs all new, changed, and removed notes and
-catalog sources. There is no scheduled batch size or subprocess timeout;
-`--max-updates` is an optional operator-selected batch. This pass can extend beyond
-the soft tick deadline while holding the existing runtime flock. Successful daily
-completion is recorded in `runtime.root/state/kb-reconcile.json`. A failed
-reconciliation appears as `kb_reconcile` in the tick outcome and is retried.
-The marker records the indexed count and latest non-future report date.
+After each successful Obsidian archive, the archive helper updates the report's
+search row. Periodic reconciliation runs as an independent library task, with
+100 updates per pass and a 150-second subprocess deadline. Source-evidence
+errors retain their accepted bytes and back off six hours. They do not occupy
+the browser or compute slots. Last audit output is stored in SQLite runtime
+metadata. A local projection failure is separate from publication success.
 
 For a one-time rebuild after migration or a major metadata rule change, take a
 SQLite backup and run the following while holding the pipeline runtime lock:
@@ -141,11 +141,9 @@ The query uses the existing SQLite index. It does not scan the home directory.
 The `--rebuild` option refreshes the whole FTS table and its file signatures;
 normal publication and daily maintenance update only affected rows.
 
-Before a tick enters potentially long PDF/model processing, it drains durable
-notifications left by the prior tick. It drains again after processing when
-the soft deadline still has time remaining. Therefore an over-budget process
-may defer its own new notification until the next wake-up, but a sustained
-processing backlog cannot starve the outbox.
+The notification outbox has its own worker slot and deadline. Long processing
+cannot hold its resource. Terminal batch notices wait for the cohort's document
+notices; faults deduplicate by source/phase rather than overlapping windows.
 
 For a resolved terminal failure, first create a narrow, reviewed retry plan
 matching one stage/workflow/error code, then apply exactly its expected row
@@ -162,3 +160,21 @@ zsxq-pipeline retry apply --config /absolute/path/to/pipeline.toml \
 The historical task wrappers and multi-scheduler installer have been retired
 from the repository. Production rollback selects a prior unified release; it
 does not restore the former cron or per-source LaunchAgents.
+
+## Release acceptance for schema 5
+
+Review [the production-copy rehearsal](recovery-rehearsal-2026-11-17.md) and merge
+the Draft PR only after CI passes. Merging is not a release decision. At the
+explicit release boundary, stop new wake-ups, wait for all writers and claimed
+tasks to settle, capture fresh SQLite/config snapshots and regenerate exact
+recovery plans. Install the clean detached reviewed SHA, then verify one source
+page, one real PDF, one local summary, one publication readback, one projection
+and one notification before admitting the full reviewed recovery cohort.
+
+Observe contiguous coverage advancing and actual oldest debt/queue counts
+decreasing over multiple scheduled cycles. Reject duplicate remote bodies,
+repeated incident opens for the same fault, new source_changed evidence, or
+completed notices with missing members. Keep writer gates closed if migration
+or capability preflight fails. After schema migration, code rollback requires a
+compatible release; never point schema-3 code at schema-5 data or restore an old
+database over remote writes.

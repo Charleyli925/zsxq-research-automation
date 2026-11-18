@@ -1,11 +1,35 @@
 # Runtime recovery contract
 
 `launchd` merely wakes `zsxq-pipeline tick`; SQLite is the recovery authority.
-Every wake takes `runtime/.pipeline.lock` with non-blocking `fcntl.flock`.
-There is no PID file or stale-owner cleanup: a crash closes the descriptor and
-the next tick can safely proceed.
+Each wake dispatches durable tasks under a short scheduler lock. Independent
+workers retain resource/document locks and heartbeats until their bounded work
+ends. Expiry is not proof of process death. See the [schema-5 runtime contract](durable-task-runtime.md)
+for page commits, writer fencing, incident lifecycle and exact task recovery.
 
 ## What survives interruption
+
+- New downloads use an attachment-specific directory and durable receipt under
+  `.zsxq-downloads` in the configured staging root. Identity is file ID,
+  filename and topic URL. The intent precedes browser I/O; validated bytes are
+  atomically installed, checksummed and reused after a crash. Archive intent
+  precedes a no-overwrite copy. Both staged and already archived receipts are
+  reconciled independently of the new run's download time range. Unknown loose
+  staging files remain untouched and cannot be adopted just by matching names.
+  Production scans deduplicate completed attachment IDs, not filenames. Two
+  different IDs with the same name need separate byte/receipt proof; one file
+  can no longer falsely satisfy both planned attachments.
+- A later candidate's browser exception does not discard earlier completed
+  downloads. The finalizer still accounts for them; remaining candidates keep
+  their retry or blocked states.
+- Each tick attempts at most one window per source. Sources and windows rotate
+  by persisted last-attempt time (including exceptions and restarts). Login
+  failures retain the oldest login-blocked window for one deduplicated alert.
+  A quota of one therefore still makes progress across sources. Incomplete
+  downloads now produce a durable, deduplicated blocked notification too.
+- Schema 4 retains membership of every scanned window independently from a
+  document's latest source window. On first wake, saved plans restore old
+  memberships before checkpoint-based skipping. An overlapping scan cannot
+  erase an earlier window's missing attachment.
 
 - A schedule cursor advances only in the same transaction that persists a
   `scheduled` source window. A crash cannot silently skip a configured slot.
@@ -37,12 +61,11 @@ time boundaries and skips only the prefix already covered by a successful
 checkpoint. A candidate that is still waiting for a retry or a lease is missing
 work, so it cannot accidentally make the whole window checkpoint-eligible.
 
-A ZSXQ `need_reauth` scan keeps that source window as `blocked_auth`. If login
-expires during a candidate download, the worker stops that source's remaining
-candidates, saves the authentication retry time, and preserves already archived
-files. Other sources and local processing can continue. The next tick rescans
-the same pending window; after the user signs in to the dedicated browser, the
-same candidate identities can continue without waiting for the next daily slot.
+A ZSXQ `need_reauth` scan retains its durable cursor and uses a one-hour source
+cooldown. Other sources and independent phases continue. After the user restores
+the dedicated browser login, a successful scan releases only that source's
+blocked download login rows. Permissions, protected content and other dependency
+errors remain manual. Download debt never forces a full source-window rescan.
 
 Explicit Lark login failures, such as HTTP 401, missing user identity, or an
 expired access/refresh token, keep the publication stage or original outbox
@@ -129,3 +152,32 @@ only re-points `current` after an idle check. It preserves SQLite, local
 artifacts, and any successful remote side effects, so old code must continue
 to honor the same durable identities. Do not roll back unresolved write-in-
 flight intents to a release that ignores their reconciliation markers.
+
+Schema 4 is forward-only. After upgrading, selecting a schema-3 release is
+not a valid rollback: it rejects the newer database. Use a schema-4-compatible
+corrective release; never restore an old business database to hide failures.
+
+## Local projection repairs
+
+The accepted summary title travels through the real publication entry and
+the Obsidian adapter. It must not fall back to the import filename. New
+extracted-text/summary/note paths include the PDF hash so different PDFs with
+the same name (or names that sanitize identically) cannot overwrite one
+another before or after summarization. Existing verified note links are preserved.
+
+For historical `source_changed` rows caused by the old title handoff, use
+`scripts/repair_summary_projections.py plan --config ... --plan ...`. The
+read-only plan requires unchanged accepted summary bytes, a matching PDF hash
+and a verified committed summary cache. Review its exact count/exclusions,
+then use `apply --config ... --plan ... --expected-count N --apply` from the
+approved release. Apply takes the pipeline lock, revalidates the entire plan,
+backs up the catalog and affected notes, and reprojects the original cached
+summaries. It never calls a model, changes a remote document or sends a
+notification. The per-report completion journal allows inspection after an
+interruption; generate a fresh plan for the remaining failures before retrying.
+
+Old `staging_collision` terminal stages still require a fingerprint-bound
+download retry plan. Requeue only inspected rows after the receipt-enabled
+release is active. Leave old loose staging files intact; new downloads use
+separate attachment directories. Uncertain remote publication intents and
+unrelated historical terminal failures are not part of this recovery.

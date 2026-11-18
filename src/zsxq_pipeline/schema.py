@@ -289,7 +289,69 @@ MIGRATION_3: tuple[str, ...] = (
     "CREATE INDEX idx_schedule_cursors_updated ON schedule_cursors(updated_at_epoch)",
 )
 
-MIGRATIONS: dict[int, tuple[str, ...]] = {1: MIGRATION_1, 2: MIGRATION_2, 3: MIGRATION_3}
+MIGRATION_4: tuple[str, ...] = (
+    "ALTER TABLE source_windows ADD COLUMN last_attempt_at_epoch INTEGER NOT NULL DEFAULT 0",
+    """CREATE TABLE window_download_members (
+        window_id INTEGER NOT NULL REFERENCES source_windows(id),
+        document_id INTEGER NOT NULL REFERENCES documents(id),
+        PRIMARY KEY(window_id, document_id)
+    )""",
+    """INSERT INTO window_download_members(window_id, document_id)
+       SELECT source_window_id,id FROM documents WHERE source_window_id IS NOT NULL""",
+)
+
+MIGRATION_5: tuple[str, ...] = (
+    """CREATE TABLE tasks (
+      id INTEGER PRIMARY KEY, identity TEXT NOT NULL UNIQUE,
+      kind TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', resource TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'queued' CHECK(state IN
+        ('queued','running','retry_wait','succeeded','needs_action','quarantined','needs_reconciliation')),
+      attempt_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0,
+      available_at_epoch INTEGER NOT NULL DEFAULT 0,
+      owner_token TEXT, lease_expires_at_epoch INTEGER, heartbeat_at_epoch INTEGER,
+      started_at_epoch INTEGER, finished_at_epoch INTEGER,
+      error_code TEXT NOT NULL DEFAULT '', error_detail TEXT NOT NULL DEFAULT '',
+      created_at_epoch INTEGER NOT NULL, updated_at_epoch INTEGER NOT NULL
+    )""",
+    "CREATE INDEX idx_tasks_due ON tasks(resource,state,available_at_epoch)",
+    """CREATE TABLE discovery_targets (
+      source TEXT PRIMARY KEY, desired_end_iso TEXT NOT NULL, slot_cursor_iso TEXT NOT NULL
+    )""",
+    """CREATE TABLE discovery_scans (
+      window_id INTEGER PRIMARY KEY REFERENCES source_windows(id),
+      state TEXT NOT NULL CHECK(state IN ('pending','complete')),
+      config_json TEXT NOT NULL, config_sha256 TEXT NOT NULL,
+      cursor TEXT NOT NULL DEFAULT '', page_count INTEGER NOT NULL DEFAULT 0,
+      completed_at_epoch INTEGER
+    )""",
+    """CREATE TABLE discovery_pages (
+      window_id INTEGER NOT NULL REFERENCES source_windows(id), page_index INTEGER NOT NULL,
+      cursor TEXT NOT NULL, next_cursor TEXT NOT NULL, payload_json TEXT NOT NULL,
+      PRIMARY KEY(window_id,page_index), UNIQUE(window_id,cursor)
+    )""",
+    """CREATE TABLE attachment_plans (
+      document_id INTEGER PRIMARY KEY REFERENCES documents(id),
+      window_id INTEGER NOT NULL REFERENCES source_windows(id), candidate_json TEXT NOT NULL,
+      job_config_json TEXT NOT NULL, workflow_version TEXT NOT NULL,
+      updated_at_epoch INTEGER NOT NULL
+    )""",
+    """CREATE TABLE incidents (
+      scope TEXT PRIMARY KEY, generation INTEGER NOT NULL, state TEXT NOT NULL,
+      reason_code TEXT NOT NULL, first_seen_epoch INTEGER NOT NULL,
+      last_seen_epoch INTEGER NOT NULL, last_notified_epoch INTEGER NOT NULL DEFAULT 0,
+      affected_count INTEGER NOT NULL DEFAULT 0, details_json TEXT NOT NULL DEFAULT '{}'
+    )""",
+    """CREATE TABLE dependency_cooldowns (
+      scope TEXT PRIMARY KEY, available_at_epoch INTEGER NOT NULL,
+      reason_code TEXT NOT NULL, updated_at_epoch INTEGER NOT NULL
+    )""",
+    """CREATE TABLE runtime_metadata (key TEXT PRIMARY KEY, value_json TEXT NOT NULL)""",
+)
+
+MIGRATIONS: dict[int, tuple[str, ...]] = {
+    1: MIGRATION_1, 2: MIGRATION_2, 3: MIGRATION_3, 4: MIGRATION_4, 5: MIGRATION_5,
+}
 
 # Rebuilding ``publications`` retains its primary keys, but SQLite updates the
 # child foreign-key declaration while a table is renamed.  Foreign-key checks

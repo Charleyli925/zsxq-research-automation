@@ -255,6 +255,19 @@ class PipelineState:
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
         self._require_migrated()
+        if self._connection.in_transaction:
+            # Composite ledger operations (page + members + tasks + cursor)
+            # must commit together, even when they reuse these public methods.
+            savepoint = "nested_" + uuid.uuid4().hex
+            self._connection.execute(f"SAVEPOINT {savepoint}")
+            try:
+                yield
+                self._connection.execute(f"RELEASE {savepoint}")
+            except Exception:
+                self._connection.execute(f"ROLLBACK TO {savepoint}")
+                self._connection.execute(f"RELEASE {savepoint}")
+                raise
+            return
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             yield
@@ -571,6 +584,43 @@ class PipelineState:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def mark_window_attempt(self, window_id: int, *, now: datetime | None = None) -> None:
+        """Persist fairness before attempting I/O, including crashes/exceptions."""
+        _, _, epoch = _timestamp(now)
+        with self._write_transaction():
+            self._connection.execute(
+                "UPDATE source_windows SET last_attempt_at_epoch=? WHERE id=?", (epoch, int(window_id))
+            )
+
+    def source_download_attempts(self) -> dict[str, int]:
+        return dict(self._connection.execute(
+            "SELECT source,MAX(last_attempt_at_epoch) FROM source_windows GROUP BY source"
+        ).fetchall())
+
+    def completed_download_ids(self, source: str, workflow: str) -> set[str]:
+        return {str(row[0]) for row in self._connection.execute(
+            """SELECT d.source_file_id FROM documents d JOIN stage_attempts s ON s.document_id=d.id
+               WHERE d.source=? AND s.stage='download' AND s.workflow_version=? AND s.state='succeeded'""",
+            (source, workflow),
+        )}
+
+    def restore_window_member(self, window_id: int, source: str, candidate: Mapping[str, Any], workflow: str) -> None:
+        row = self._connection.execute(
+            "SELECT id FROM documents WHERE source=? AND source_file_id=?",
+            (source, str(candidate["file_id"])),
+        ).fetchone()
+        if row is None:
+            document_id = self.upsert_document(source, str(candidate["file_id"]),
+                filename=str(candidate["filename"]), source_window_id=window_id).id
+            self.ensure_stage(document_id, Stage.DOWNLOAD, workflow)
+        else:
+            document_id = int(row["id"])
+        with self._write_transaction():
+            self._connection.execute(
+                "INSERT OR IGNORE INTO window_download_members(window_id,document_id) VALUES (?,?)",
+                (window_id, document_id),
+            )
+
     def list_window_download_debts(
         self, source_window_id: int, workflow_version: str,
     ) -> list[dict[str, Any]]:
@@ -589,7 +639,8 @@ class PipelineState:
             SELECT documents.id AS document_id, documents.source_file_id,
                    documents.filename, attempt.state, attempt.error_code
             FROM source_windows AS window
-            JOIN documents ON documents.source_window_id=window.id
+            JOIN window_download_members member ON member.window_id=window.id
+            JOIN documents ON documents.id=member.document_id
               AND documents.source=window.source
             LEFT JOIN stage_attempts AS attempt
               ON attempt.document_id=documents.id AND attempt.stage='download'
@@ -626,10 +677,10 @@ class PipelineState:
         row = self._connection.execute(
             """
             WITH window_documents AS (
-              SELECT documents.id
+              SELECT documents.id, documents.artifact_id
               FROM documents
-              JOIN artifacts ON artifacts.id=documents.artifact_id AND artifacts.kind='pdf'
-              WHERE documents.source_window_id=?
+              JOIN window_download_members member ON member.document_id=documents.id
+              WHERE member.window_id=?
             ),
             latest AS (
               SELECT
@@ -645,16 +696,24 @@ class PipelineState:
             )
             SELECT
               COUNT(window_documents.id) AS total,
+              COALESCE(SUM(CASE WHEN download_stage.state='succeeded' OR
+                (download_stage.state IS NULL AND window_documents.artifact_id IS NOT NULL)
+                THEN 1 ELSE 0 END), 0) AS downloaded,
               COALESCE(SUM(CASE WHEN summary_stage.state='succeeded' THEN 1 ELSE 0 END), 0) AS summarized,
               COALESCE(SUM(CASE WHEN publish_stage.state='succeeded' THEN 1 ELSE 0 END), 0) AS published,
               COALESCE(SUM(
                 CASE WHEN
-                  extract_stage.state IN ('blocked_auth', 'blocked_release', 'quarantined')
+                  download_stage.state IN ('blocked_auth', 'blocked_release', 'quarantined')
+                  OR extract_stage.state IN ('blocked_auth', 'blocked_release', 'quarantined')
                   OR summary_stage.state IN ('blocked_auth', 'blocked_release', 'quarantined')
                   OR publish_stage.state IN ('blocked_auth', 'blocked_release', 'quarantined')
                 THEN 1 ELSE 0 END
               ), 0) AS blocked
             FROM window_documents
+            LEFT JOIN latest download_stage
+              ON download_stage.document_id=window_documents.id
+             AND download_stage.stage='download'
+             AND download_stage.row_number=1
             LEFT JOIN latest extract_stage
               ON extract_stage.document_id=window_documents.id
              AND extract_stage.stage='text_extract'
@@ -675,6 +734,7 @@ class PipelineState:
             "source_window_id": window_id,
             "source": str(window["source"]),
             "total": int(row["total"]),
+            "downloaded": int(row["downloaded"]),
             "summarized": int(row["summarized"]),
             "published": int(row["published"]),
             "blocked": int(row["blocked"]),
@@ -739,6 +799,11 @@ class PipelineState:
             row = self._connection.execute(
                 "SELECT * FROM documents WHERE source = ? AND source_file_id = ?", (source, source_file_id)
             ).fetchone()
+            if row is not None and source_window_id is not None:
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO window_download_members(window_id,document_id) VALUES (?,?)",
+                    (int(source_window_id), int(row["id"])),
+                )
         assert row is not None
         return _row_document(row)
 
@@ -2134,6 +2199,14 @@ class PipelineState:
               stage_attempts.available_at_iso, stage_attempts.available_at_epoch,
               stage_attempts.lease_expires_at_epoch
             FROM stage_attempts JOIN documents ON documents.id = stage_attempts.document_id
+            WHERE NOT (
+              stage_attempts.stage='text_extract' AND stage_attempts.state='queued'
+              AND stage_attempts.attempt_count=0 AND EXISTS (
+                SELECT 1 FROM stage_attempts actual
+                WHERE actual.document_id=stage_attempts.document_id AND actual.stage='text_extract'
+                  AND actual.workflow_version='extract:' || stage_attempts.workflow_version
+              )
+            )
             ORDER BY documents.source, stage_attempts.stage
             """
         ).fetchall()
@@ -2168,8 +2241,24 @@ class PipelineState:
             _finalize_counts(source_payload["totals"])
             for stage_payload in source_payload["stages"].values():
                 _finalize_counts(stage_payload)
+        from .discovery import coverage
+        for source, payload in sources.items():
+            end = coverage(self, source)
+            payload['discovery'] = {
+                'covered_until': end.isoformat() if end else None,
+                'lag_seconds': max(0, now_epoch-int(end.timestamp())) if end else None,
+                'pending_pages': self._connection.execute("SELECT COUNT(*) FROM discovery_scans s JOIN source_windows w ON w.id=s.window_id WHERE w.source=? AND s.state='pending'",(source,)).fetchone()[0],
+            }
+        task_counts = {row['state']:row['n'] for row in self._connection.execute('SELECT state,COUNT(*) n FROM tasks GROUP BY state')}
+        active_faults = self._connection.execute("SELECT COUNT(*) FROM incidents WHERE state='open'").fetchone()[0]
+        if any(task_counts.get(s,0) for s in ('needs_action','needs_reconciliation')):
+            health = PipelineHealth.BLOCKED
+        elif health == PipelineHealth.HEALTHY and (active_faults or task_counts.get('retry_wait',0)):
+            health = PipelineHealth.DEGRADED
         return {
             "schema_version": SCHEMA_VERSION,
+            "tasks": task_counts,
+            "open_incidents": active_faults,
             "health": health.value,
             "as_of": now_iso,
             "sources": sources,
