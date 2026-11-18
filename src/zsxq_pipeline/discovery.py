@@ -31,26 +31,32 @@ def coverage(
     if discovered:
         predicate = "(w.checkpoint_eligible=1 OR s.state='complete')"
     rows = db.execute(
-        f"""SELECT w.window_start_epoch lo,w.window_end_epoch hi,w.status
+        f"""SELECT w.window_start_iso,w.window_end_iso,{predicate} AS proved
         FROM source_windows w LEFT JOIN discovery_scans s ON s.window_id=w.id
-        WHERE w.source=? AND {predicate} ORDER BY lo,hi""",
+        WHERE w.source=?""",
         (source,),
-    ).fetchall()
+    )
     # The earliest known window (including a failed bootstrap) fixes the lower
     # boundary. Never infer coverage by discarding an unscanned prefix.
-    first = db.execute(
-        "SELECT MIN(window_start_epoch) FROM source_windows WHERE source=?", (source,)
-    ).fetchone()[0]
-    if first is None:
+    intervals = sorted(
+        (
+            from_iso(r["window_start_iso"]),
+            from_iso(r["window_end_iso"]),
+            bool(r["proved"]),
+        )
+        for r in rows
+    )
+    if not intervals:
         return None
-    end = first
+    end = intervals[0][0]
     advanced = False
-    for row in rows:
-        if row["lo"] > end:
+    for start, stop, proved in intervals:
+        if start > end:
             break
-        end = max(end, row["hi"])
-        advanced = True
-    return datetime.fromtimestamp(end, timezone.utc) if advanced else None
+        if proved:
+            end = max(end, stop)
+            advanced = True
+    return end if advanced else None
 
 
 def register_candidate(state, window_id, source, candidate, job, workflow):
@@ -96,23 +102,44 @@ def register_candidate(state, window_id, source, candidate, job, workflow):
     return document.id
 
 
+def _discovery_window(state, source, start, end):
+    # Legacy identity keys are whole seconds. Reuse a containing interval or
+    # widen the new scan to a free key without changing an existing receipt.
+    while True:
+        row = state._connection.execute(
+            """SELECT id,window_start_iso,window_end_iso FROM source_windows WHERE source=?
+            AND window_start_epoch=? AND window_end_epoch=?""",
+            (source, int(start.timestamp()), int(end.timestamp())),
+        ).fetchone()
+        if row is None:
+            return state.register_source_window(source, start, end, status="scheduled")
+        if (
+            from_iso(row["window_start_iso"]) <= start
+            and from_iso(row["window_end_iso"]) >= end
+        ):
+            return row["id"]
+        start -= timedelta(seconds=1)
+
+
 def new_scan(state: PipelineState, config, source, start, end) -> int:
     scanner = _script_module("scan_zsxq_download_candidates")
     job = scanner.load_json(source.job_config_path)
     keywords = scanner.load_persistent_config(source.keyword_path)
     snapshot = {"job": job, "keywords": keywords, "workflow": source.workflow_version}
     with state._write_transaction():
-        window_id = state.register_source_window(
-            source.name, start, end, status="scheduled"
-        )
-        state._connection.execute(
+        window_id = _discovery_window(state, source.name, start, end)
+        inserted = state._connection.execute(
             """INSERT INTO discovery_scans(window_id,state,config_json,config_sha256)
             VALUES(?,'pending',?,?) ON CONFLICT(window_id) DO NOTHING""",
             (window_id, encoded(snapshot), fingerprint(snapshot)),
         )
-        TaskQueue(state).enqueue(
-            f"scan:{window_id}", "scan", {"window_id": window_id}, source=source.name
-        )
+        if inserted.rowcount:
+            TaskQueue(state).enqueue(
+                f"scan:{window_id}",
+                "scan",
+                {"window_id": window_id},
+                source=source.name,
+            )
     return window_id
 
 
@@ -164,18 +191,17 @@ def schedule_discovery(state: PipelineState, config, now: datetime) -> list[int]
         end = from_iso(target["desired_end_iso"])
         start = checkpoint
         if start is None:
-            earliest = state._connection.execute(
-                "SELECT MIN(window_start_iso) FROM source_windows WHERE source=?",
+            starts = state._connection.execute(
+                "SELECT window_start_iso FROM source_windows WHERE source=?",
                 (source.name,),
-            ).fetchone()[0]
-            start = (
-                from_iso(earliest)
-                if earliest
-                else end
+            )
+            start = min(
+                (from_iso(row[0]) for row in starts),
+                default=end
                 - timedelta(
                     seconds=source.max_catchup_seconds
                     or config.schedule.max_catchup_seconds
-                )
+                ),
             )
         if start < end:
             created.append(new_scan(state, config, source, start, end))
@@ -188,9 +214,15 @@ def schedule_discovery(state: PipelineState, config, now: datetime) -> list[int]
             and checkpoint >= end
             and queue.metadata("overlap:" + source.name) != day
         ):
-            created.append(
-                new_scan(state, config, source, checkpoint - timedelta(days=1), now)
+            window = new_scan(
+                state, config, source, checkpoint - timedelta(days=1), now
             )
+            pending = state._connection.execute(
+                "SELECT 1 FROM discovery_scans WHERE window_id=? AND state='pending'",
+                (window,),
+            ).fetchone()
+            if pending:
+                created.append(window)
             queue.set_metadata("overlap:" + source.name, day)
     return created
 
@@ -262,7 +294,7 @@ def run_scan(config, task, *, session_factory=None, max_pages: int = 4) -> TaskR
     window_id = task["payload"]["window_id"]
     with PipelineState.open(config.runtime.database) as state:
         row = state._connection.execute(
-            """SELECT d.*,w.window_start_iso FROM discovery_scans d
+            """SELECT d.*,w.window_start_iso,w.window_end_iso FROM discovery_scans d
             JOIN source_windows w ON w.id=d.window_id WHERE window_id=?""",
             (window_id,),
         ).fetchone()
@@ -273,6 +305,7 @@ def run_scan(config, task, *, session_factory=None, max_pages: int = 4) -> TaskR
         return TaskResult("needs_action", "scan_config_corrupt")
     job = snapshot["job"]
     cursor = row["cursor"]
+    context = f"window={window_id} phase=tag_navigation"
     try:
         with (session_factory or BrowserSession)(
             source.cdp_endpoint,
@@ -293,23 +326,35 @@ def run_scan(config, task, *, session_factory=None, max_pages: int = 4) -> TaskR
                     config,
                     task,
                     reason,
-                    "Tag navigation did not establish a ready page",
+                    f"{context} Tag navigation did not establish a ready page",
                 )
-            for _ in range(max_pages):
-                tag = scanner.extract_tag_id(job["tag_url"])
-                url = f"https://api.zsxq.com/v2/hashtags/{tag}/topics?count=20"
-                if cursor:
-                    url += "&end_time=" + quote(cursor, safe="")
+            tag = scanner.extract_tag_id(job["tag_url"])
+            # The source accepts an end_time cursor. Start just above the
+            # inclusive window end, then preserve each source cursor verbatim.
+            upper = from_iso(row["window_end_iso"]).replace(microsecond=0) + timedelta(
+                seconds=1
+            )
+            first_bound = upper.astimezone(timezone(timedelta(hours=8))).strftime(
+                "%Y-%m-%dT%H:%M:%S.000%z"
+            )
+            for saved_pages in range(row["page_count"], row["page_count"] + max_pages):
+                context = f"window={window_id} page={saved_pages + 1} saved_pages={saved_pages}"
+                bound = cursor or first_bound
+                url = f"https://api.zsxq.com/v2/hashtags/{tag}/topics?count=20&end_time={quote(bound, safe='')}"
                 payload = scanner.fetch_topics_page(session.page, url)
                 error, topics = scanner.parse_topics_api_payload(payload)
                 if error:
+                    status = payload.get("status")
+                    http = status if type(status) is int else "unknown"
                     return scan_failure(
-                        config, task, error, f"Topics request returned {error}"
+                        config,
+                        task,
+                        error,
+                        f"{context} http={http}",
                     )
                 next_cursor = str(topics[-1].get("create_time") or "") if topics else ""
                 if topics and (
-                    not next_cursor
-                    or (cursor and from_iso(next_cursor) >= from_iso(cursor))
+                    not next_cursor or from_iso(next_cursor) >= from_iso(bound)
                 ):
                     return TaskResult(
                         "needs_action",
@@ -338,14 +383,17 @@ def run_scan(config, task, *, session_factory=None, max_pages: int = 4) -> TaskR
         )
     except Exception as exc:
         code = str(getattr(exc, "code", "") or "api_unavailable")
+        detail = diagnostic(f"{context} {exc}")
         if isinstance(exc, (ValueError, KeyError, TypeError)):
-            return TaskResult("needs_action", "scan_contract_invalid", diagnostic(exc))
-        return scan_failure(config, task, code, diagnostic(exc))
+            return TaskResult("needs_action", "scan_contract_invalid", detail)
+        return scan_failure(config, task, code, detail)
 
 
 def scan_failure(config, task, code, detail):
     delay = retry_seconds(int(task.get("failure_count", 0)) + 1)
-    if code in {"need_reauth", "api_status_401", "api_error_401"}:
+    if code == "api_error_1059":
+        scope = "topics:" + task["source"]
+    elif code in {"need_reauth", "api_status_401", "api_error_401"}:
         delay = 3600
         scope = "source:" + task["source"]
     elif code.startswith("blocked_browser_"):
@@ -386,7 +434,7 @@ def import_saved_discovery(state, config) -> dict:
     imported = 0
     invalid = 0
     windows = {
-        (w["source"], int(w["window_start_epoch"]), int(w["window_end_epoch"])): w
+        (w["source"], from_iso(w["window_start_iso"]), from_iso(w["window_end_iso"])): w
         for w in state.list_source_windows()
     }
     for source in config.sources.values():
@@ -405,8 +453,8 @@ def import_saved_discovery(state, config) -> dict:
                     continue
                 key = (
                     source.name,
-                    int(from_iso(plan["window_start"]).timestamp()),
-                    int(from_iso(plan["window_end"]).timestamp()),
+                    from_iso(plan["window_start"]),
+                    from_iso(plan["window_end"]),
                 )
                 window = windows.get(key)
                 if window is None:

@@ -145,6 +145,8 @@ class TaskQueue:
                 scopes.append("browser")
             if row["kind"] == "download":
                 scopes.append("download")
+            if row["kind"] == "scan":
+                scopes.append("topics:" + row["source"])
             if (
                 scopes
                 and self.db.execute(
@@ -280,6 +282,7 @@ class TaskQueue:
              FROM tasks t WHERE t.state IN ('queued','retry_wait') AND t.available_at_epoch<=?
              AND NOT EXISTS (SELECT 1 FROM dependency_cooldowns c WHERE c.available_at_epoch>?
                AND (c.scope='browser' AND t.resource='browser' OR c.scope='download' AND t.kind='download'
+                    OR c.scope='topics:'||t.source AND t.kind='scan'
                     OR c.scope='source:'||t.source AND t.resource='browser'))
              """
             + clause

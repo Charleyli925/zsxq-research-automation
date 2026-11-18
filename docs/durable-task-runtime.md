@@ -37,6 +37,11 @@ flowchart LR
   immutable attachment inputs and download tasks together. Four pages per task,
   20-second HTTP request aborts, strict backward cursors and a process deadline
   prevent pagination loops. Invalid response shapes cannot become empty success.
+- A historical scan sends its inclusive upper bound on the first topics
+  request, rounded up to the following second for the wire cursor. The page
+  transaction checks each topic against the exact stored timestamps. Retries
+  use the last committed source cursor verbatim. Legacy imports match both
+  timestamps at full precision. A matching completed interval keeps its receipt.
 - Discovery coverage is the union of proven contiguous intervals from the
   earliest known boundary. A later success cannot hide an earlier gap. Download
   settlement does not prevent discovery of the next scheduled interval. A daily
@@ -56,6 +61,10 @@ flowchart LR
   **1**, outbox **1**. Browser/source/rate-limit cooldowns do not stop compute,
   publication, index or notification work. Successful authenticated scans release
   only same-source download `need_reauth` rows, never Lark permission failures.
+- A topics response carrying business code `1059` delays further list requests
+  for that source. It records the affected window, page, committed page count
+  and HTTP status. Already-discovered attachments retain their normal eligibility.
+  HTTP 401 and 429 still suspend browser work for the affected source.
 - The supervisor spends at most its wall-clock loop budget dispatching/polling;
   workers can outlive it. Schema/bootstrap work precedes that loop and is intended
   to be rehearsed and performed at the release maintenance boundary. Each worker
@@ -103,6 +112,14 @@ notice. An upgrade suppresses retrospective batch notifications for old windows.
 Incidents deduplicate by source/phase, remind at most every four hours, retain
 waiting faults, and resolve only after the affected tasks succeed. No message
 claims self-healing from an attempted retry alone.
+
+A first topics failure with code `1059` appears immediately in local status.
+The first retry is due in five minutes. A repeat failure or another five minutes
+past that deadline makes the incident eligible for notification. The message
+includes the window dates, next page and retry status. Resolution waits for an
+in-flight warning's delivery receipt. A superseded warning produces no recovery
+message. The [November 18 rehearsal](recovery-rehearsal-2026-11-18.md) records
+both the live read and the controlled failure sequence.
 
 `status --json` includes task counts, open incidents, contiguous discovery
 coverage and source lag. Historical stage counters remain visible, so an old

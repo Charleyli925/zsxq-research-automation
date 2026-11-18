@@ -1,21 +1,28 @@
+from contextlib import nullcontext
 from datetime import datetime, timezone, timedelta
 from dataclasses import replace
 import json
 import signal
 import subprocess
 import sys
+import time
+from types import SimpleNamespace
 from unittest import mock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 from zsxq_pipeline.discovery import (
     commit_page,
     coverage,
+    import_saved_discovery,
     new_scan,
     run_scan,
+    scan_failure,
     schedule_discovery,
     recover_authenticated_downloads,
 )
+from zsxq_pipeline.download import _script_module
 from zsxq_pipeline.incidents import refresh_notifications, window_complete_ready
 from zsxq_pipeline.lock import held_lock, runtime_lock
 from zsxq_pipeline.model import Stage, ErrorCategory
@@ -197,6 +204,68 @@ def test_coverage_cannot_jump_over_unscanned_gap(state):
     assert coverage(state, "s") == NOW - timedelta(days=2)
 
 
+def test_discovery_preserves_exact_endpoints_and_does_not_reopen_a_finished_window(
+    tmp_path,
+):
+    config = config_fixture(tmp_path)
+    end = NOW.replace(microsecond=648677)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        initial = schedule_discovery(state, config, end)
+        for window in initial:
+            commit_page(state, window, [], cursor="", next_cursor="", complete=True)
+        assert coverage(state, "foreign") == end
+        # The daily overlap exactly matches this source's one-day bootstrap.
+        assert schedule_discovery(state, config, end) == []
+        assert schedule_discovery(state, config, end + timedelta(seconds=30)) == []
+        assert len(state.list_source_windows()) == len(initial) == 2
+        assert all(w["checkpoint_eligible"] for w in state.list_source_windows())
+        assert coverage(state, "foreign", discovered=False) == end
+
+        # Two intervals meeting only in their integer seconds still have a gap.
+        state.register_source_window(
+            "gap", NOW - timedelta(days=1), NOW, checkpoint_eligible=True
+        )
+        state.register_source_window(
+            "gap",
+            NOW.replace(microsecond=1),
+            end + timedelta(days=1),
+            checkpoint_eligible=True,
+        )
+        assert coverage(state, "gap") == NOW
+
+
+def test_subsecond_legacy_window_cannot_certify_a_longer_interval(tmp_path):
+    config = config_fixture(tmp_path)
+    start = NOW - timedelta(days=1)
+    end = NOW.replace(microsecond=600000)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        old = state.register_source_window(
+            "foreign", start, NOW, checkpoint_eligible=True
+        )
+        scanner = _script_module("scan_zsxq_download_candidates")
+        plan = {
+            "window_start": start.isoformat(),
+            "window_end": end.isoformat(),
+            "api_probe_status": "ok",
+            "download_candidates": [],
+        }
+        plan["plan_hash"] = scanner.canonical_plan_hash(plan)
+        root = config.runtime.root / "plans/foreign"
+        root.mkdir(parents=True)
+        (root / "different-window.json").write_text(json.dumps(plan))
+        assert import_saved_discovery(state, config)["imported_plans"] == 0
+        assert coverage(state, "foreign") == NOW
+        new = new_scan(state, config, config.sources["foreign"], start, end)
+        assert new != old
+        commit_page(
+            state, new, [topic("at-end", end)], cursor="", next_cursor="", complete=True
+        )
+        assert coverage(state, "foreign") == end
+        assert state.source_window_progress(new)["total"] == 1
+
+
 def test_schedule_keeps_one_pending_scan_and_advances_target_despite_download_debt(
     tmp_path,
 ):
@@ -265,6 +334,7 @@ def test_scan_resumes_committed_cursor_and_repeated_cursor_is_terminal(
     result = run_scan(config, task, session_factory=Session)
     assert result.state == "retry_wait"
     assert "hidden" not in result.detail
+    assert f"window={window} page=2 saved_pages=1" in result.detail
     with PipelineState.open(config.runtime.database) as state:
         assert (
             state._connection.execute(
@@ -277,6 +347,176 @@ def test_scan_resumes_committed_cursor_and_repeated_cursor_is_terminal(
     assert "end_time=" in calls[-1]
     with PipelineState.open(config.runtime.database) as state:
         assert state.source_window_progress(window)["total"] == 1
+
+
+def test_historical_scan_retries_the_exact_page_after_one_1059(tmp_path, monkeypatch):
+    config = config_fixture(tmp_path)
+    config = replace(
+        config,
+        lark=replace(config.lark, notifications_enabled=True, target_chat_id="test"),
+    )
+    scanner = _script_module("scan_zsxq_download_candidates")
+    end = NOW.replace(microsecond=648677)
+    start = end - timedelta(days=1)
+    page_one = [topic("too-new", end + timedelta(microseconds=1)), topic("at-end", end)]
+
+    def body_ok(topics):
+        return {"succeeded": True, "resp_data": {"topics": topics}}
+
+    responses = iter(
+        [
+            body_ok(page_one),
+            {"succeeded": False, "code": 1059},
+            body_ok(
+                [
+                    topic("at-start", start),
+                    topic("too-old", start - timedelta(seconds=1)),
+                ]
+            ),
+        ]
+    )
+    bounds = []
+
+    def fetch(page, url):
+        bounds.append(parse_qs(urlsplit(url).query).get("end_time", [""])[0])
+        return {"ok": True, "status": 200, "text": json.dumps(next(responses))}
+
+    def session(*args, **kwargs):
+        return nullcontext(SimpleNamespace(page=object()))
+
+    monkeypatch.setattr(scanner, "navigate_tag_page", lambda *a, **kw: None)
+    monkeypatch.setattr(scanner, "fetch_topics_page", fetch)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        window = new_scan(state, config, config.sources["foreign"], start, end)
+        now = int(time.time()) + 2
+        q = TaskQueue(state, clock=lambda: now)
+        scan = q.due({"scan"})[0]["id"]
+        first = q.claim(scan)
+        result = run_scan(config, first, session_factory=session)
+        q.finish(scan, first["owner_token"], result)
+        assert result.code == "api_error_1059" and result.retry_after == 300
+        assert f"window={window} page=2 saved_pages=1 http=200" in result.detail
+        assert datetime.fromisoformat(bounds[0]) == NOW + timedelta(seconds=1)
+        assert bounds[1] == page_one[-1]["create_time"]
+        sibling = q.enqueue("another-scan", "scan", {}, source="foreign")
+        download = q.due({"download"})[0]["id"]
+        assert not q.due({"scan"}) and q.claim(sibling) is None
+        # A list failure does not suspend attachments already found on page one.
+        claim = q.claim(download)
+        assert claim
+        q.finish(download, claim["owner_token"], TaskResult())
+        refresh_notifications(state, config, now=now)
+        assert not state.list_notifications()
+        assert q.get(scan)["error_code"] == "api_error_1059"
+        now += 300
+        second = q.claim(scan)
+        result = run_scan(config, second, session_factory=session)
+        q.finish(scan, second["owner_token"], result)
+        assert result.state == "succeeded" and bounds[2] == bounds[1]
+        refresh_notifications(state, config, now=now)
+        assert not state.list_notifications()
+        assert state.source_window_progress(window)["total"] == 2
+        assert {
+            r[0]
+            for r in state._connection.execute("SELECT source_file_id FROM documents")
+        } == {"at-start", "at-end"}
+        assert coverage(state, "foreign") == end
+
+
+@pytest.mark.parametrize("second_failure", [True, False], ids=["repeated", "overdue"])
+def test_persistent_or_overdue_1059_alerts_once_and_resets_after_recovery(
+    tmp_path, second_failure
+):
+    config = config_fixture(tmp_path)
+    config = replace(
+        config,
+        lark=replace(config.lark, notifications_enabled=True, target_chat_id="test"),
+    )
+    now = 100
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        window = new_scan(
+            state, config, config.sources["foreign"], NOW - timedelta(days=1), NOW
+        )
+        q = TaskQueue(state, clock=lambda: now)
+        scan = q.due({"scan"})[0]["id"]
+
+        def fail(task_id, delay):
+            owned = q.claim(task_id)
+            q.finish(
+                task_id,
+                owned["owner_token"],
+                TaskResult("retry_wait", "api_error_1059", "", delay),
+            )
+
+        fail(scan, 300)
+        refresh_notifications(state, config, now=now)
+        assert not state.list_notifications()
+        now = 400
+        if second_failure:
+            fail(scan, 600)
+        else:
+            refresh_notifications(state, config, now=699)
+            assert not state.list_notifications()
+            now = 700
+        refresh_notifications(state, config, now=now)
+        refresh_notifications(state, config, now=now + 1)
+        (notice,) = state.list_notifications()
+        assert notice.event == "incident_open"
+        assert (
+            "主题列表" in notice.payload["markdown"]
+            and f"#{window}" in notice.payload["markdown"]
+        )
+        assert "第 1 页" in notice.payload["markdown"]
+        delivery = state.claim_due_notification() if second_failure else None
+        now = 1100
+        owned = q.claim(scan)
+        q.finish(scan, owned["owner_token"], TaskResult())
+        refresh_notifications(state, config, now=now)
+        if delivery:
+            assert [(n.event, n.status) for n in state.list_notifications()] == [
+                ("incident_open", "running")
+            ]
+            state.complete_notification(delivery)
+            refresh_notifications(state, config, now=now)
+        earlier = [(n.event, n.status) for n in state.list_notifications()]
+        assert earlier == (
+            [("incident_open", "sent"), ("incident_resolved", "queued")]
+            if second_failure
+            else [("incident_open", "superseded")]
+        )
+        # A new one-off failure in this scope must not inherit the old notification.
+        next_task = q.enqueue("new-window", "scan", {}, source="foreign")
+        fail(next_task, 300)
+        refresh_notifications(state, config, now=now)
+        now += 300
+        owned = q.claim(next_task)
+        q.finish(next_task, owned["owner_token"], TaskResult())
+        refresh_notifications(state, config, now=now)
+        assert [(n.event, n.status) for n in state.list_notifications()] == earlier
+
+
+@pytest.mark.parametrize("code", ["api_status_401", "api_status_429"])
+def test_source_auth_and_throttle_still_block_downloads_and_alert_on_first_failure(
+    tmp_path, code
+):
+    config = config_fixture(tmp_path)
+    config = replace(
+        config,
+        lark=replace(config.lark, notifications_enabled=True, target_chat_id="test"),
+    )
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        q = TaskQueue(state)
+        scan = q.enqueue("scan", "scan", {}, source="foreign")
+        download = q.enqueue("download", "download", {}, source="foreign")
+        other = q.enqueue("other", "scan", {}, source="domestic")
+        owned = q.claim(scan)
+        q.finish(scan, owned["owner_token"], scan_failure(config, owned, code, code))
+        assert {t["id"] for t in q.due()} == {other} and q.claim(download) is None
+        refresh_notifications(state, config)
+        assert [n.event for n in state.list_notifications()] == ["incident_open"]
 
 
 def test_positive_scan_releases_only_same_source_download_login_failures(state):
@@ -324,15 +564,18 @@ def test_incidents_dedupe_by_source_phase_and_only_resolve_after_success(tmp_pat
             )
         refresh_notifications(state, config, now=100)
         refresh_notifications(state, config, now=200)
-        assert len(state.list_notifications()) == 1
+        (notice,) = state.list_notifications()
+        claim = state.claim_due_notification()
+        assert claim.id == notice.id
+        state.complete_notification(claim)
         q.clock = lambda: 1000
-        for task in q.due():
-            owned = q.claim(task["id"])
-            q.finish(
-                task["id"],
-                owned["owner_token"],
-                TaskResult("retry_wait", "resource_busy", "", 1),
-            )
+        # One task starts a quiet wait while the others still report errors.
+        waiting = q.claim(q.due()[0]["id"])
+        q.finish(
+            waiting["id"],
+            waiting["owner_token"],
+            TaskResult("retry_wait", "resource_busy", "", 3000),
+        )
         refresh_notifications(state, config, now=1000)
         assert len(state.list_notifications()) == 1
         q.clock = lambda: 2000
@@ -340,9 +583,14 @@ def test_incidents_dedupe_by_source_phase_and_only_resolve_after_success(tmp_pat
             owned = q.claim(task["id"])
             q.finish(task["id"], owned["owner_token"], TaskResult())
         refresh_notifications(state, config, now=2000)
+        assert len(state.list_notifications()) == 1
+        q.clock = lambda: 4000
+        owned = q.claim(waiting["id"])
+        q.finish(owned["id"], owned["owner_token"], TaskResult())
+        refresh_notifications(state, config, now=4000)
         notices = state.list_notifications()
         assert [(n.event, n.status) for n in notices] == [
-            ("incident_open", "superseded"),
+            ("incident_open", "sent"),
             ("incident_resolved", "queued"),
         ]
 
