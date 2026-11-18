@@ -14,7 +14,7 @@ from .notify import (
     render_batch_complete_notice,
     _source_label,
 )
-from .tasks import TaskQueue, encoded
+from .tasks import TRANSIENT_SCAN_CODES, TaskQueue, encoded
 
 QUIET_CODES = {
     "",
@@ -28,20 +28,20 @@ QUIET_CODES = {
 
 # Allow one scheduler wake after the first durable five-minute retry is due.
 TOPICS_RETRY_GRACE_SECONDS = 300
-TRANSIENT_SCAN_CODES = {"api_error_1059", "api_unavailable"}
 
 
-def _waiting_for_first_topics_retry(row, now):
+def _waiting_for_first_topics_retry(row, now, topics_due):
+    retry_due = max(row["available_at_epoch"], topics_due)
     return (
         row["kind"] == "scan"
         and row["error_code"] in TRANSIENT_SCAN_CODES
         and row["state"] in {"retry_wait", "running"}
         and row["failure_count"] == 1
-        and now < row["available_at_epoch"] + TOPICS_RETRY_GRACE_SECONDS
+        and now < retry_due + TOPICS_RETRY_GRACE_SECONDS
     )
 
 
-def _topics_retry_action(state, config, task, now):
+def _topics_retry_action(state, config, task, now, topics_due):
     window_id = json.loads(task["payload_json"]).get("window_id")
     scan = state._connection.execute(
         """SELECT d.page_count,w.window_start_iso,w.window_end_iso FROM discovery_scans d
@@ -57,12 +57,13 @@ def _topics_retry_action(state, config, task, now):
             f"窗口 #{window_id}（{start:%Y-%m-%d %H:%M} 至 {end:%Y-%m-%d %H:%M}）"
             f"已保存 {scan['page_count']} 页，从第 {scan['page_count'] + 1} 页续读。"
         )
+    earliest = max(task["available_at_epoch"], topics_due)
     if task["state"] == "running":
         timing = "正在重试"
-    elif task["available_at_epoch"] <= now:
+    elif earliest <= now:
         timing = "已到重试时间，等待调度"
     else:
-        due = datetime.fromtimestamp(task["available_at_epoch"], zone)
+        due = datetime.fromtimestamp(earliest, zone)
         timing = f"最早重试时间为 {due:%m-%d %H:%M}（{config.schedule.timezone}）"
     return f"{progress}{timing}"
 
@@ -150,10 +151,16 @@ def refresh_notifications(state, config, *, now=None):
     with state._write_transaction():
         faults = defaultdict(list)
         unfinished = set()
+        resumed_scans = set()
+        topics_due = state._connection.execute(
+            "SELECT COALESCE(MAX(available_at_epoch),0) FROM dependency_cooldowns WHERE scope='topics' AND reason_code<>'topics_pacing'"
+        ).fetchone()[0]
         for row in state._connection.execute(
             "SELECT * FROM tasks WHERE state<>'succeeded'"
         ):
             unfinished.add(row["id"])
+            if row["kind"] == "scan" and row["error_code"] == "scan_yield":
+                resumed_scans.add(row["id"])
             if row["error_code"] not in QUIET_CODES:
                 faults[f"{row['source'] or 'pipeline'}:{row['kind']}"].append(row)
         existing = {
@@ -169,7 +176,9 @@ def refresh_notifications(state, config, *, now=None):
                 else prior["generation"]
             )
             reportable = [
-                row for row in rows if not _waiting_for_first_topics_retry(row, now)
+                row
+                for row in rows
+                if not _waiting_for_first_topics_retry(row, now, topics_due)
             ]
             if not reportable and len(rows) > 1:
                 reportable = rows
@@ -217,7 +226,9 @@ def refresh_notifications(state, config, *, now=None):
                 action = "需要核对后恢复" if manual else "已保留进度，按退避时间重试"
                 source, kind = scope.rsplit(":", 1)
                 if kind == "scan" and code in TRANSIENT_SCAN_CODES and not manual:
-                    action = _topics_retry_action(state, config, primary, now)
+                    action = _topics_retry_action(
+                        state, config, primary, now, topics_due
+                    )
                     kind = "主题列表扫描"
                 _retire_scope(state, scope, now)
                 notice = enqueue_pipeline_status_notification(
@@ -234,9 +245,16 @@ def refresh_notifications(state, config, *, now=None):
                     (now, encoded(details), scope),
                 )
         for scope, prior in existing.items():
+            if scope in faults or prior["state"] != "open":
+                continue
             prior_ids = json.loads(prior["details_json"]).get("task_ids", [])
-            unresolved = not unfinished.isdisjoint(prior_ids)
-            if scope in faults or prior["state"] != "open" or unresolved:
+            pending = unfinished.intersection(prior_ids)
+            resumed = bool(pending) and (
+                scope.endswith(":scan")
+                and prior["reason_code"] in TRANSIENT_SCAN_CODES
+                and pending <= resumed_scans
+            )
+            if pending and not resumed:
                 continue
             _retire_scope(state, scope, now)
             # A queued warning can be superseded by recovery before delivery.
@@ -249,13 +267,18 @@ def refresh_notifications(state, config, *, now=None):
                 (now, scope),
             )
             if enabled and "sent" in deliveries:
+                message = (
+                    f"{_source_label(scope.rsplit(':', 1)[0])}的主题列表已从断点续读，后续页面仍按计划扫描。"
+                    if resumed
+                    else f"{scope} 的故障任务已处理完成。全流程完成情况另按批次统计。"
+                )
                 enqueue_pipeline_status_notification(
                     state,
                     event="incident_resolved",
                     identity=f"{scope}:{prior['generation']}",
                     chat_id=config.lark.target_chat_id,
                     scope_key=scope,
-                    markdown=f"## 知识星球研报｜阶段故障已解除\n\n{scope} 的故障任务已处理完成；全流程完成情况另按批次统计。",
+                    markdown=f"## 知识星球研报｜阶段故障已解除\n\n{message}",
                 )
     if not enabled:
         return

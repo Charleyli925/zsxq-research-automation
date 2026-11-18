@@ -57,7 +57,8 @@ def fetch_topics_page(page: Any, url: str) -> dict[str, Any]:
             const timer = setTimeout(() => controller.abort(), 20000);
             try {
                 const response = await fetch(u, {credentials: 'include', signal: controller.signal});
-                return {ok: response.ok, status: response.status, text: await response.text()};
+                return {ok: response.ok, status: response.status,
+                        retry_after: response.headers.get('Retry-After'), text: await response.text()};
             } finally { clearTimeout(timer); }
         }""", url,
     )

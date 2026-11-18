@@ -1,6 +1,7 @@
 from contextlib import nullcontext
 from datetime import datetime, timezone, timedelta
 from dataclasses import replace
+from email.utils import format_datetime
 import json
 import signal
 import subprocess
@@ -13,6 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from zsxq_pipeline.discovery import (
+    _retry_after_seconds,
     commit_page,
     coverage,
     import_saved_discovery,
@@ -27,7 +29,12 @@ from zsxq_pipeline.incidents import refresh_notifications, window_complete_ready
 from zsxq_pipeline.lock import held_lock, runtime_lock
 from zsxq_pipeline.model import Stage, ErrorCategory
 from zsxq_pipeline.state import PipelineState, LeaseLostError
-from zsxq_pipeline.tasks import TaskQueue, TaskResult, diagnostic
+from zsxq_pipeline.tasks import (
+    TOPICS_PAGE_INTERVAL_SECONDS,
+    TaskQueue,
+    TaskResult,
+    diagnostic,
+)
 from zsxq_pipeline import service
 from test_pipeline_worker import _config
 
@@ -85,6 +92,9 @@ def test_stale_token_cannot_commit_or_heartbeat_and_live_writer_is_not_reclaimed
     assert q.get(tid)["state"] == "running"
     assert q.recover_dead(tid, writer_is_dead=True)
     now[0] += 5
+    assert q.get(tid)["available_at_epoch"] == now[0]
+    assert q.claim(tid) is None
+    now[0] += TOPICS_PAGE_INTERVAL_SECONDS - 5
     second = q.claim(tid)
     assert first["owner_token"] != second["owner_token"]
     assert not q.heartbeat(tid, first["owner_token"])
@@ -202,6 +212,53 @@ def test_coverage_cannot_jump_over_unscanned_gap(state):
         "s", NOW - timedelta(days=1), NOW, checkpoint_eligible=True
     )
     assert coverage(state, "s") == NOW - timedelta(days=2)
+
+
+@pytest.mark.parametrize("proved_prefix", [True, False])
+def test_catchup_schedules_only_the_unproved_intervals(tmp_path, proved_prefix):
+    config = config_fixture(tmp_path)
+    config = replace(config, sources={"foreign": config.sources["foreign"]})
+    gap_start = NOW - timedelta(days=4)
+    island_start = gap_start + timedelta(microseconds=1)
+    island_end = NOW - timedelta(days=1)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        if proved_prefix:
+            state.register_source_window(
+                "foreign",
+                gap_start - timedelta(days=1),
+                gap_start,
+                checkpoint_eligible=True,
+            )
+        state.register_source_window("foreign", gap_start, NOW, status="partial")
+        state.register_source_window(
+            "foreign", island_start, island_end, checkpoint_eligible=True
+        )
+        with state._write_transaction():
+            state._connection.execute(
+                "INSERT INTO discovery_targets VALUES(?,?,?)",
+                ("foreign", NOW.isoformat(), NOW.isoformat()),
+            )
+        tomorrow = NOW + timedelta(days=1)
+        expected = [
+            (island_end, NOW, NOW),
+            (gap_start, island_start, tomorrow),
+            (NOW, tomorrow, tomorrow),
+        ]
+        for expected_start, expected_end, wake in expected:
+            (window,) = schedule_discovery(state, config, wake)
+            row = state._connection.execute(
+                "SELECT window_start_iso,window_end_iso FROM source_windows WHERE id=?",
+                (window,),
+            ).fetchone()
+            assert [datetime.fromisoformat(x) for x in row] == [
+                expected_start,
+                expected_end,
+            ]
+            # A new slot arrives while the recent interval is still running.
+            assert not schedule_discovery(state, config, tomorrow)
+            commit_page(state, window, [], cursor="", next_cursor="", complete=True)
+        assert coverage(state, "foreign") == tomorrow
 
 
 def test_discovery_preserves_exact_endpoints_and_does_not_reopen_a_finished_window(
@@ -331,6 +388,13 @@ def test_scan_resumes_committed_cursor_and_repeated_cursor_is_terminal(
             state, config, config.sources["foreign"], NOW - timedelta(days=1), NOW
         )
         task = TaskQueue(state).get(1)
+    assert (
+        run_scan(config, task, session_factory=Session, max_pages=0).code
+        == "stage_deferred"
+    )
+    assert not calls
+    result = run_scan(config, task, session_factory=Session, max_pages=4)
+    assert result.code == "scan_yield" and len(calls) == 1
     result = run_scan(config, task, session_factory=Session)
     assert result.state == "retry_wait"
     assert "hidden" not in result.detail
@@ -395,6 +459,12 @@ def test_historical_scan_retries_the_exact_page_after_one_1059(tmp_path, monkeyp
         first = q.claim(scan)
         result = run_scan(config, first, session_factory=session)
         q.finish(scan, first["owner_token"], result)
+        assert result.code == "scan_yield" and len(bounds) == 1
+        assert q.claim(scan) is None
+        now += TOPICS_PAGE_INTERVAL_SECONDS
+        page_two = q.claim(scan)
+        result = run_scan(config, page_two, session_factory=session)
+        q.finish(scan, page_two["owner_token"], result)
         assert result.code == "api_error_1059" and result.retry_after == 300
         assert f"window={window} page=2 saved_pages=1 http=200" in result.detail
         assert datetime.fromisoformat(bounds[0]) == NOW + timedelta(seconds=1)
@@ -465,11 +535,13 @@ def test_navigation_unavailable_keeps_window_and_source_backoff_until_retry(
         assert result.code == "api_unavailable" and result.retry_after == 300
         assert f"window={window} phase=tag_navigation" in result.detail
         fetch.assert_not_called()
+        assert not q.due()
+        now += TOPICS_PAGE_INTERVAL_SECONDS
         assert {t["id"] for t in q.due()} == {other}
         assert q.claim(attachment) is None
         refresh_notifications(state, config, now=now)
         assert not state.list_notifications()
-        now += 300
+        now += 300 - TOPICS_PAGE_INTERVAL_SECONDS
         task = q.claim(scan)
         q.finish(
             scan, task["owner_token"], run_scan(config, task, session_factory=session)
@@ -478,6 +550,201 @@ def test_navigation_unavailable_keeps_window_and_source_backoff_until_retry(
         assert q.get(scan)["state"] == "succeeded" and q.claim(attachment)
         assert not state.list_notifications()
         assert coverage(state, "foreign") == NOW
+
+
+def test_new_page_resets_the_stall_but_a_repeated_failure_at_one_cursor_alerts(
+    tmp_path, monkeypatch
+):
+    config = config_fixture(tmp_path)
+    config = replace(
+        config,
+        lark=replace(config.lark, notifications_enabled=True, target_chat_id="test"),
+    )
+    now = int(NOW.timestamp())
+    monkeypatch.setattr(time, "time", lambda: now)
+    scanner = _script_module("scan_zsxq_download_candidates")
+    monkeypatch.setattr(scanner, "navigate_tag_page", lambda *args, **kw: None)
+    refusal = {"succeeded": False, "code": 1059}
+
+    def page(n):
+        return [topic(str(n), NOW - timedelta(hours=n))]
+
+    def accepted(items):
+        return {"succeeded": True, "resp_data": {"topics": items}}
+
+    bodies = iter(
+        [refusal, accepted(page(2)), refusal, refusal, accepted(page(3)), accepted([])]
+    )
+    requested = []
+
+    def fetch(_page, url):
+        requested.append(parse_qs(urlsplit(url).query)["end_time"][0])
+        return {"ok": True, "status": 200, "text": json.dumps(next(bodies))}
+
+    monkeypatch.setattr(scanner, "fetch_topics_page", fetch)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        window = new_scan(
+            state, config, config.sources["foreign"], NOW - timedelta(days=1), NOW
+        )
+        first_cursor = page(1)[0]["create_time"]
+        commit_page(
+            state, window, page(1), cursor="", next_cursor=first_cursor, complete=False
+        )
+        queue = TaskQueue(state)
+        tid = queue.due({"scan"})[0]["id"]
+
+        def attempt():
+            nonlocal now
+            owned = queue.claim(tid)
+            result = run_scan(
+                config,
+                owned,
+                session_factory=lambda *a, **kw: nullcontext(
+                    SimpleNamespace(page=object())
+                ),
+            )
+            if result.code == "scan_yield":
+                # The page transaction is durable even before worker completion.
+                assert queue.get(tid)["failure_count"] == 0
+            queue.finish(tid, owned["owner_token"], result)
+            refresh_notifications(state, config, now=now)
+            now += result.retry_after
+            return result
+
+        assert attempt().retry_after == 300
+        assert attempt().code == "scan_yield"
+        assert attempt().retry_after == 300
+        assert not state.list_notifications()
+        assert attempt().retry_after == 600
+        (notice,) = state.list_notifications()
+        assert (
+            notice.event == "incident_open" and "第 3 页" in notice.payload["markdown"]
+        )
+        state.complete_notification(state.claim_due_notification())
+        assert attempt().code == "scan_yield"
+        opening, recovery = state.list_notifications()
+        assert opening.status == "sent" and recovery.event == "incident_resolved"
+        assert "断点续读" in recovery.payload["markdown"]
+        assert (
+            state._connection.execute(
+                "SELECT state FROM discovery_scans WHERE window_id=?", (window,)
+            ).fetchone()[0]
+            == "pending"
+        )
+        assert attempt().state == "succeeded" and coverage(state, "foreign") == NOW
+        assert requested == [first_cursor] * 2 + [page(2)[0]["create_time"]] * 3 + [
+            page(3)[0]["create_time"]
+        ]
+
+
+@pytest.mark.parametrize(
+    "header", ["7200", format_datetime(NOW + timedelta(hours=2), usegmt=True)]
+)
+def test_provider_retry_after_survives_restart_and_blocks_only_relevant_work(
+    tmp_path, monkeypatch, header
+):
+    config = config_fixture(tmp_path)
+    now = int(NOW.timestamp())
+    monkeypatch.setattr(time, "time", lambda: now)
+    scanner = _script_module("scan_zsxq_download_candidates")
+    monkeypatch.setattr(scanner, "navigate_tag_page", lambda *args, **kw: None)
+    monkeypatch.setattr(
+        scanner,
+        "fetch_topics_page",
+        lambda page, url: {
+            "ok": False,
+            "status": 429,
+            "retry_after": header,
+            "text": "",
+        },
+    )
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        new_scan(state, config, config.sources["foreign"], NOW - timedelta(days=1), NOW)
+        queue = TaskQueue(state)
+        scan = queue.due({"scan"})[0]["id"]
+        other = queue.enqueue("other", "scan", {}, source="domestic")
+        attachment = queue.enqueue(
+            "other-attachment", "download", {}, source="domestic"
+        )
+        owned = queue.claim(scan)
+        result = run_scan(
+            config,
+            owned,
+            session_factory=lambda *a, **kw: nullcontext(
+                SimpleNamespace(page=object())
+            ),
+        )
+        assert result.code == "api_status_429" and result.retry_after == 7200
+        queue.finish(scan, owned["owner_token"], result)
+    with PipelineState.open(config.runtime.database) as state:
+        queue = TaskQueue(state)
+        owned = queue.claim(attachment)
+        assert owned
+        queue.finish(attachment, owned["owner_token"], TaskResult())
+        now += 7199
+        assert not queue.due({"scan"}) and queue.claim(other) is None
+        assert (
+            state._connection.execute(
+                "SELECT reason_code FROM dependency_cooldowns WHERE scope='topics'"
+            ).fetchone()[0]
+            == "api_status_429"
+        )
+        now += 1
+        assert {r["id"] for r in queue.due({"scan"})} == {scan, other}
+        assert queue.claim(other)
+
+
+def test_interrupted_worker_is_not_a_second_provider_rejection(tmp_path, monkeypatch):
+    config = config_fixture(tmp_path)
+    now = int(NOW.timestamp())
+    monkeypatch.setattr(time, "time", lambda: now)
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        queue = TaskQueue(state)
+        scan = queue.enqueue("scan", "scan", {}, source="foreign")
+        owned = queue.claim(scan)
+        queue.finish(
+            scan,
+            owned["owner_token"],
+            TaskResult("retry_wait", "worker_interrupted", "", 5),
+        )
+        now += TOPICS_PAGE_INTERVAL_SECONDS
+        owned = queue.claim(scan)
+        result = scan_failure(config, owned, "api_error_1059", "unchanged cursor")
+        queue.finish(scan, owned["owner_token"], result)
+        assert result.retry_after == 300 and queue.get(scan)["failure_count"] == 1
+
+
+def test_first_failure_grace_uses_the_shared_provider_deadline(tmp_path):
+    config = config_fixture(tmp_path)
+    config = replace(
+        config,
+        lark=replace(config.lark, notifications_enabled=True, target_chat_id="test"),
+    )
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        queue = TaskQueue(state, clock=lambda: 100)
+        scan = queue.enqueue("scan", "scan", {}, source="foreign")
+        owned = queue.claim(scan)
+        queue.finish(
+            scan,
+            owned["owner_token"],
+            TaskResult("retry_wait", "api_error_1059", "", 300),
+        )
+        queue.cool_down("topics", 7200, "api_status_429")
+        refresh_notifications(state, config, now=7300)
+        assert not state.list_notifications()
+        refresh_notifications(state, config, now=7600)
+        assert [n.event for n in state.list_notifications()] == ["incident_open"]
+
+
+@pytest.mark.parametrize(
+    "header", [None, "", "-12", "unavailable", "Sun, 06 Nov 1994 08:49:37 GMT"]
+)
+def test_unusable_retry_after_leaves_local_backoff_in_force(header):
+    assert _retry_after_seconds(header) == 0
 
 
 @pytest.mark.parametrize("code", ["api_error_1059", "api_unavailable"])
@@ -545,6 +812,7 @@ def test_persistent_or_overdue_scan_failure_alerts_once_and_resets_after_recover
         )
         # A new one-off failure in this scope must not inherit the old notification.
         next_task = q.enqueue("new-window", "scan", {}, source="foreign")
+        now += TOPICS_PAGE_INTERVAL_SECONDS
         fail(next_task, 300)
         refresh_notifications(state, config, now=now)
         now += 300
@@ -571,6 +839,8 @@ def test_source_auth_and_throttle_still_block_downloads_and_alert_on_first_failu
         other = q.enqueue("other", "scan", {}, source="domestic")
         owned = q.claim(scan)
         q.finish(scan, owned["owner_token"], scan_failure(config, owned, code, code))
+        assert not q.due()
+        q.clock = lambda: int(time.time()) + TOPICS_PAGE_INTERVAL_SECONDS
         assert {t["id"] for t in q.due()} == {other} and q.claim(download) is None
         refresh_notifications(state, config)
         assert [n.event for n in state.list_notifications()] == ["incident_open"]
@@ -610,7 +880,8 @@ def test_incidents_dedupe_by_source_phase_and_only_resolve_after_success(tmp_pat
     )
     with PipelineState.open(config.runtime.database) as state:
         state.migrate()
-        q = TaskQueue(state, clock=lambda: 100)
+        now = 100
+        q = TaskQueue(state, clock=lambda: now)
         for i in range(3):
             tid = q.enqueue(f"scan:{i}", "scan", {}, source="foreign")
             task = q.claim(tid)
@@ -619,13 +890,14 @@ def test_incidents_dedupe_by_source_phase_and_only_resolve_after_success(tmp_pat
                 task["owner_token"],
                 TaskResult("retry_wait", "api_unavailable", "offline", 1),
             )
-        refresh_notifications(state, config, now=100)
-        refresh_notifications(state, config, now=200)
+            now += TOPICS_PAGE_INTERVAL_SECONDS
+        refresh_notifications(state, config, now=now)
+        refresh_notifications(state, config, now=now + 1)
         (notice,) = state.list_notifications()
         claim = state.claim_due_notification()
         assert claim.id == notice.id
         state.complete_notification(claim)
-        q.clock = lambda: 1000
+        now = 1000
         # One task starts a quiet wait while the others still report errors.
         waiting = q.claim(q.due()[0]["id"])
         q.finish(
@@ -635,13 +907,14 @@ def test_incidents_dedupe_by_source_phase_and_only_resolve_after_success(tmp_pat
         )
         refresh_notifications(state, config, now=1000)
         assert len(state.list_notifications()) == 1
-        q.clock = lambda: 2000
+        now = 2000
         for task in q.due():
             owned = q.claim(task["id"])
             q.finish(task["id"], owned["owner_token"], TaskResult())
-        refresh_notifications(state, config, now=2000)
+            now += TOPICS_PAGE_INTERVAL_SECONDS
+        refresh_notifications(state, config, now=now)
         assert len(state.list_notifications()) == 1
-        q.clock = lambda: 4000
+        now = 4000
         owned = q.claim(waiting["id"])
         q.finish(owned["id"], owned["owner_token"], TaskResult())
         refresh_notifications(state, config, now=4000)

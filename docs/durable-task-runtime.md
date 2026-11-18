@@ -34,16 +34,21 @@ flowchart LR
 
 - Each source has one pending discovery scan, a pinned job/keyword configuration,
   an explicit cursor, and page receipts. Each page transaction commits members,
-  immutable attachment inputs and download tasks together. Four pages per task,
-  20-second HTTP request aborts, strict backward cursors and a process deadline
-  prevent pagination loops. Invalid response shapes cannot become empty success.
+  immutable attachment inputs and download tasks together. Each worker requests
+  one page. All sources share a 60-second minimum between listing attempts.
+  Claim and completion both persist that deadline, covering worker restarts and
+  slow responses. Other work can use the browser during the gap. HTTP requests
+  have a 20-second timeout and each nonempty page must advance the cursor.
 - A historical scan sends its inclusive upper bound on the first topics
   request, rounded up to the following second for the wire cursor. The page
   transaction checks each topic against the exact stored timestamps. Retries
   use the last committed source cursor verbatim. Legacy imports match both
   timestamps at full precision. A matching completed interval keeps its receipt.
 - Discovery coverage is the union of proven contiguous intervals from the
-  earliest known boundary. A later success cannot hide an earlier gap. Download
+  earliest known boundary. New primary scans cover one missing interval. When
+  multiple gaps exist, scheduling takes the newest first, then alternates with
+  the oldest so new slots and historical work both get turns. Pending windows
+  keep their original boundaries, membership and cursor. Download
   settlement does not prevent discovery of the next scheduled interval. A daily
   overlapping scan catches recent edits; creation-time pagination cannot prove
   arbitrary historical edits, which require an explicit audit.
@@ -64,7 +69,9 @@ flowchart LR
 - A topics response carrying business code `1059` delays further list requests
   for that source. It records the affected window, page, committed page count
   and HTTP status. Already-discovered attachments retain their normal eligibility.
-  HTTP 401 and 429 still suspend browser work for the affected source.
+  HTTP 401 and 429 suspend browser work for the affected source. A readable
+  HTTP `Retry-After` on a retryable listing failure extends the task deadline
+  and pauses listings across sources for the requested duration.
 - The supervisor spends at most its wall-clock loop budget dispatching/polling;
   workers can outlive it. Schema/bootstrap work precedes that loop and is intended
   to be rehearsed and performed at the release maintenance boundary. Each worker
@@ -110,13 +117,15 @@ attachments. Completion requires finished discovery, all downloads, all summarie
 and all publications, with accepted-summary projections complete; pending document notifications also hold the completion
 notice. An upgrade suppresses retrospective batch notifications for old windows.
 Incidents deduplicate by source/phase, remind at most every four hours, retain
-waiting faults, and resolve only after the affected tasks succeed. No message
-claims self-healing from an attempted retry alone.
+waiting faults, and resolve after the affected tasks succeed. A transient
+listing incident can also resolve when every affected scan has durably advanced
+past its failed page. Its recovery message describes resumed pagination.
 
 A first scan failure with `api_error_1059` or `api_unavailable` appears immediately
 in local status. An unavailable page or transport holds browser work for that
-source until retry. The first retry is due in five minutes. A repeated failure,
-multiple affected scan tasks, or another five minutes past that deadline makes
+source until retry. The first retry is due in five minutes or after a longer
+server-requested wait. A repeated failure at the same cursor, multiple affected
+scan tasks, or another five minutes past the effective retry deadline makes
 the incident eligible for notification. The message
 includes the window dates, next page and retry status. Resolution waits for an
 in-flight warning's delivery receipt. A superseded warning produces no recovery

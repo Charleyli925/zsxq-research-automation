@@ -112,3 +112,38 @@ reviewed recovery cohort. Compare the checkpoint and oldest outstanding item
 across subsequent scheduled cycles before closing the production incident.
 The exact-cohort workflow and remaining review requirements are in the
 [recovery runbook](recovery-rehearsal-2026-11-17.md#release-and-historical-recovery-sequence).
+
+## Follow-up to the 17:25 warning on the deployed schema 5 release
+
+The overseas window had eight saved pages when page nine returned HTTP 200
+with business code `1059`. At 17:35:05 the scheduled worker resumed. By
+17:35:11 it had committed three more pages and received the same business
+code on page twelve. The previous worker could issue up to four consecutive
+page requests. Its failure streak counted worker outcomes across advancing
+cursors. The provider's internal trigger is unknown.
+
+A private SQLite backup retained the real pending windows, cooldowns, sent
+warnings, membership and page bodies. On disposable copies, the rehearsal
+restored an earlier cursor and replayed the original subsequent pages through
+the task executor. Injected `1059` responses exercised both advancing and
+stationary cursors. Network access and subprocesses were disabled.
+
+| Source | Earlier saved pages | Saved after replay | New warnings while advancing | New warning after two failures on the same page |
+| --- | ---: | ---: | ---: | ---: |
+| Overseas | 8 | 11 | 0 | 1 |
+| Domestic CICC | 6 | 8 | 0 | 1 |
+
+The controlled clock recorded a minimum of 60 seconds between requests. Each
+copy retained its original page receipts and attachment memberships, queued
+one recovery for the previously delivered warning, passed SQLite integrity
+and foreign-key checks, and left the original backup byte-for-byte unchanged.
+The scheduler kept both active window IDs. A separate copy reconstructed
+admission before dispatch. Both sources had two gaps. The first new overseas
+scan covered November 8–18, and the first domestic scan covered November 12–18.
+A second scheduling pass created zero duplicates. Regression tests exercise
+the next turn for the older gap, subsecond endpoints, and shared server-requested
+pauses across process restarts.
+
+```bash
+python -m pytest -q tests/test_pipeline_tasks.py -k 'new_page_resets or retry_after or catchup_schedules or first_failure_grace or interrupted_worker_is_not'
+```
