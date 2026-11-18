@@ -424,9 +424,66 @@ def test_historical_scan_retries_the_exact_page_after_one_1059(tmp_path, monkeyp
         assert coverage(state, "foreign") == end
 
 
+def test_navigation_unavailable_keeps_window_and_source_backoff_until_retry(
+    tmp_path, monkeypatch
+):
+    config = config_fixture(tmp_path)
+    config = replace(
+        config,
+        lark=replace(config.lark, notifications_enabled=True, target_chat_id="test"),
+    )
+    scanner = _script_module("scan_zsxq_download_candidates")
+    navigation = iter(["api_unavailable", None])
+    monkeypatch.setattr(
+        scanner, "navigate_tag_page", lambda *args, **kwargs: next(navigation)
+    )
+    fetch = mock.Mock(
+        return_value={
+            "ok": True,
+            "status": 200,
+            "text": json.dumps({"succeeded": True, "resp_data": {"topics": []}}),
+        }
+    )
+    monkeypatch.setattr(scanner, "fetch_topics_page", fetch)
+
+    def session(*args, **kwargs):
+        return nullcontext(SimpleNamespace(page=object()))
+
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        window = new_scan(
+            state, config, config.sources["foreign"], NOW - timedelta(days=1), NOW
+        )
+        now = int(time.time()) + 2
+        q = TaskQueue(state, clock=lambda: now)
+        scan = q.due({"scan"})[0]["id"]
+        attachment = q.enqueue("attachment", "download", {}, source="foreign")
+        other = q.enqueue("other-source", "scan", {}, source="domestic")
+        task = q.claim(scan)
+        result = run_scan(config, task, session_factory=session)
+        q.finish(scan, task["owner_token"], result)
+        assert result.code == "api_unavailable" and result.retry_after == 300
+        assert f"window={window} phase=tag_navigation" in result.detail
+        fetch.assert_not_called()
+        assert {t["id"] for t in q.due()} == {other}
+        assert q.claim(attachment) is None
+        refresh_notifications(state, config, now=now)
+        assert not state.list_notifications()
+        now += 300
+        task = q.claim(scan)
+        q.finish(
+            scan, task["owner_token"], run_scan(config, task, session_factory=session)
+        )
+        refresh_notifications(state, config, now=now)
+        assert q.get(scan)["state"] == "succeeded" and q.claim(attachment)
+        assert not state.list_notifications()
+        assert coverage(state, "foreign") == NOW
+
+
+@pytest.mark.parametrize("code", ["api_error_1059", "api_unavailable"])
 @pytest.mark.parametrize("second_failure", [True, False], ids=["repeated", "overdue"])
-def test_persistent_or_overdue_1059_alerts_once_and_resets_after_recovery(
-    tmp_path, second_failure
+def test_persistent_or_overdue_scan_failure_alerts_once_and_resets_after_recovery(
+    tmp_path, second_failure, code
 ):
     config = config_fixture(tmp_path)
     config = replace(
@@ -447,7 +504,7 @@ def test_persistent_or_overdue_1059_alerts_once_and_resets_after_recovery(
             q.finish(
                 task_id,
                 owned["owner_token"],
-                TaskResult("retry_wait", "api_error_1059", "", delay),
+                TaskResult("retry_wait", code, "", delay),
             )
 
         fail(scan, 300)

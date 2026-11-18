@@ -28,12 +28,13 @@ QUIET_CODES = {
 
 # Allow one scheduler wake after the first durable five-minute retry is due.
 TOPICS_RETRY_GRACE_SECONDS = 300
+TRANSIENT_SCAN_CODES = {"api_error_1059", "api_unavailable"}
 
 
 def _waiting_for_first_topics_retry(row, now):
     return (
         row["kind"] == "scan"
-        and row["error_code"] == "api_error_1059"
+        and row["error_code"] in TRANSIENT_SCAN_CODES
         and row["state"] in {"retry_wait", "running"}
         and row["failure_count"] == 1
         and now < row["available_at_epoch"] + TOPICS_RETRY_GRACE_SECONDS
@@ -170,7 +171,19 @@ def refresh_notifications(state, config, *, now=None):
             reportable = [
                 row for row in rows if not _waiting_for_first_topics_retry(row, now)
             ]
-            code = (reportable or rows)[0]["error_code"]
+            if not reportable and len(rows) > 1:
+                reportable = rows
+            manual = next(
+                (
+                    r
+                    for r in reportable
+                    if r["state"]
+                    in {"needs_action", "quarantined", "needs_reconciliation"}
+                ),
+                None,
+            )
+            primary = manual or (reportable or rows)[0]
+            code = primary["error_code"]
             notified = 0 if fresh else prior["last_notified_epoch"]
             details = {} if fresh else json.loads(prior["details_json"])
             affected = unfinished.intersection(details.get("task_ids", ()))
@@ -201,18 +214,10 @@ def refresh_notifications(state, config, *, now=None):
                 event = (
                     "incident_open" if fresh or not notified else "incident_reminder"
                 )
-                action = (
-                    "需要核对后恢复"
-                    if any(
-                        r["state"]
-                        in {"needs_action", "quarantined", "needs_reconciliation"}
-                        for r in rows
-                    )
-                    else "已保留进度，按退避时间重试"
-                )
+                action = "需要核对后恢复" if manual else "已保留进度，按退避时间重试"
                 source, kind = scope.rsplit(":", 1)
-                if kind == "scan" and code == "api_error_1059":
-                    action = _topics_retry_action(state, config, reportable[0], now)
+                if kind == "scan" and code in TRANSIENT_SCAN_CODES and not manual:
+                    action = _topics_retry_action(state, config, primary, now)
                     kind = "主题列表扫描"
                 _retire_scope(state, scope, now)
                 notice = enqueue_pipeline_status_notification(

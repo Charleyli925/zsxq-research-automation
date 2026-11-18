@@ -22,6 +22,14 @@ the first 20 entries of the archived successful scan for that window, in order.
 The historical error record contains neither the failed page number nor the
 provider's internal reason for code 1059.
 
+At 15:47:17 the same deployed worker sent a second warning for another
+historical overseas window, ending November 12 at 16:04. Its saved diagnostic
+was `api_unavailable`. The legacy scanner uses this classification for both an
+unavailable tag page and a browser request failure. The run record did not
+identify which occurred. Another overseas window succeeded at 15:52:40. A
+16:11 readback still found both failed windows blocked and all five collisions
+outstanding.
+
 ## Replaying the same window
 
 Two isolated copies of the same SQLite backup used the affected window's 125
@@ -45,6 +53,15 @@ discovery. Publication records kept their fingerprints and foreign keys passed
 validation. Regression cases also exercise repeated 1059s, overdue first
 retries, in-flight notification delivery, HTTP 401/429, inclusive time boundaries
 and a gap of one microsecond between two historical windows.
+
+For the second warning, a separate replay used that window's 126 archived
+topics from the same backup and simulated a page-two transport timeout. One
+page remained committed, and the source kept its five-minute browser cooldown.
+After the retry, the scanner finished all eight page commits and retained the
+503 attachment identities including the five existing collisions. No warning
+or recovery notice entered the outbox. A navigation failure before page one
+is also covered in regression tests. Both failure types surface a persistent
+or overdue incident even if the next attempt cannot run.
 
 ## Full historical recovery on a fresh production copy
 
@@ -76,7 +93,7 @@ inventory, fingerprints, archives and source records are retained privately.
 The public regression fixtures run with the following command.
 
 ```bash
-python -m pytest -q tests/test_pipeline_tasks.py -k '1059 or source_auth_and_throttle or exact_endpoints or subsecond_legacy or incidents_dedupe'
+python -m pytest -q tests/test_pipeline_tasks.py -k '1059 or navigation_unavailable or persistent_or_overdue or source_auth_and_throttle or exact_endpoints or subsecond_legacy or incidents_dedupe'
 ```
 
 For a new private snapshot, run `scripts/rehearse_pipeline_recovery.py` with

@@ -113,9 +113,11 @@ Incidents deduplicate by source/phase, remind at most every four hours, retain
 waiting faults, and resolve only after the affected tasks succeed. No message
 claims self-healing from an attempted retry alone.
 
-A first topics failure with code `1059` appears immediately in local status.
-The first retry is due in five minutes. A repeat failure or another five minutes
-past that deadline makes the incident eligible for notification. The message
+A first scan failure with `api_error_1059` or `api_unavailable` appears immediately
+in local status. An unavailable page or transport holds browser work for that
+source until retry. The first retry is due in five minutes. A repeated failure,
+multiple affected scan tasks, or another five minutes past that deadline makes
+the incident eligible for notification. The message
 includes the window dates, next page and retry status. Resolution waits for an
 in-flight warning's delivery receipt. A superseded warning produces no recovery
 message. The [November 18 rehearsal](recovery-rehearsal-2026-11-18.md) records
