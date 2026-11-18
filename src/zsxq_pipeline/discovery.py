@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 import json
 import time
 from urllib.parse import quote
@@ -13,19 +14,21 @@ from .model import Stage
 from .scheduler import PipelineScheduler
 from .state import PipelineState
 from .tasks import (
+    TOPICS_PAGE_INTERVAL_SECONDS,
     TaskQueue,
     TaskResult,
     diagnostic,
     encoded,
     fingerprint,
+    next_failure_count,
     retry_seconds,
 )
 
 
-def coverage(
+def _proved_intervals(
     state: PipelineState, source: str, *, discovered: bool = True
-) -> datetime | None:
-    """Merge proved intervals; a later disjoint success never hides a gap."""
+) -> tuple[datetime | None, list[tuple[datetime, datetime]]]:
+    """Return the earliest known boundary and the union of proved windows."""
     db = state._connection
     predicate = "w.checkpoint_eligible=1"
     if discovered:
@@ -46,17 +49,40 @@ def coverage(
         )
         for r in rows
     )
-    if not intervals:
-        return None
-    end = intervals[0][0]
-    advanced = False
+    merged = []
     for start, stop, proved in intervals:
-        if start > end:
+        if not proved:
+            continue
+        if merged and start <= merged[-1][1]:
+            left, right = merged[-1]
+            merged[-1] = (left, max(stop, right))
+        else:
+            merged.append((start, stop))
+    earliest = intervals[0][0] if intervals else None
+    return earliest, merged
+
+
+def _continuous_end(earliest, proved):
+    return proved[0][1] if proved and proved[0][0] == earliest else None
+
+
+def coverage(
+    state: PipelineState, source: str, *, discovered: bool = True
+) -> datetime | None:
+    return _continuous_end(*_proved_intervals(state, source, discovered=discovered))
+
+
+def _missing_intervals(start, end, proved):
+    gaps = []
+    for left, right in proved:
+        if left >= end or start >= end:
             break
-        if proved:
-            end = max(end, stop)
-            advanced = True
-    return end if advanced else None
+        if start < left:
+            gaps.append((start, left))
+        start = max(start, right)
+    if start < end:
+        gaps.append((start, end))
+    return gaps
 
 
 def register_candidate(state, window_id, source, candidate, job, workflow):
@@ -153,7 +179,8 @@ def schedule_discovery(state: PipelineState, config, now: datetime) -> list[int]
         target = state._connection.execute(
             "SELECT * FROM discovery_targets WHERE source=?", (source.name,)
         ).fetchone()
-        checkpoint = coverage(state, source.name)
+        earliest, proved = _proved_intervals(state, source.name)
+        checkpoint = _continuous_end(earliest, proved)
         lower = (
             from_iso(target["slot_cursor_iso"])
             if target
@@ -189,22 +216,19 @@ def schedule_discovery(state: PipelineState, config, now: datetime) -> list[int]
         if active:
             continue
         end = from_iso(target["desired_end_iso"])
-        start = checkpoint
-        if start is None:
-            starts = state._connection.execute(
-                "SELECT window_start_iso FROM source_windows WHERE source=?",
-                (source.name,),
-            )
-            start = min(
-                (from_iso(row[0]) for row in starts),
-                default=end
-                - timedelta(
-                    seconds=source.max_catchup_seconds
-                    or config.schedule.max_catchup_seconds
-                ),
-            )
-        if start < end:
-            created.append(new_scan(state, config, source, start, end))
+        start = earliest or end - timedelta(
+            seconds=source.max_catchup_seconds or config.schedule.max_catchup_seconds
+        )
+        gaps = _missing_intervals(start, end, proved)
+        if gaps:
+            with state._write_transaction():
+                gap = gaps[-1]
+                if len(gaps) > 1:
+                    key = "last_gap_choice:" + source.name
+                    oldest = queue.metadata(key) == "newest"
+                    gap = gaps[0] if oldest else gaps[-1]
+                    queue.set_metadata(key, "oldest" if oldest else "newest")
+                created.append(new_scan(state, config, source, *gap))
         # A bounded overlap once per day discovers recent edits without ever
         # moving the primary coverage backward. Historic edits need explicit
         # audits; a creation-time API cannot prove arbitrary late changes.
@@ -274,6 +298,14 @@ def commit_page(
                 window_id,
             ),
         )
+        # A worker may die after this commit and before finishing its task.
+        # The next page must not inherit failure evidence for the old cursor.
+        state._connection.execute(
+            """UPDATE tasks SET failure_count=0,error_code='scan_yield',error_detail=''
+            WHERE identity=? AND kind='scan' AND state='running'
+            AND error_code IN ('api_error_1059','api_unavailable')""",
+            (f"scan:{window_id}",),
+        )
         if complete:
             debts = state.list_window_download_debts(window_id, snapshot["workflow"])
             state.register_source_window(
@@ -285,7 +317,8 @@ def commit_page(
             )
 
 
-def run_scan(config, task, *, session_factory=None, max_pages: int = 4) -> TaskResult:
+def run_scan(config, task, *, session_factory=None, max_pages: int = 1) -> TaskResult:
+    """Honor the caller's page budget and the shared one-page dispatch limit."""
     from .browser import BrowserSession
     from .worker import PipelineWorker
 
@@ -300,6 +333,13 @@ def run_scan(config, task, *, session_factory=None, max_pages: int = 4) -> TaskR
         ).fetchone()
     if row["state"] == "complete":
         return TaskResult()
+    if max_pages < 1:
+        return TaskResult(
+            "retry_wait",
+            "stage_deferred",
+            "No listing page requested",
+            TOPICS_PAGE_INTERVAL_SECONDS,
+        )
     snapshot = json.loads(row["config_json"])
     if fingerprint(snapshot) != row["config_sha256"]:
         return TaskResult("needs_action", "scan_config_corrupt")
@@ -337,49 +377,51 @@ def run_scan(config, task, *, session_factory=None, max_pages: int = 4) -> TaskR
             first_bound = upper.astimezone(timezone(timedelta(hours=8))).strftime(
                 "%Y-%m-%dT%H:%M:%S.000%z"
             )
-            for saved_pages in range(row["page_count"], row["page_count"] + max_pages):
-                context = f"window={window_id} page={saved_pages + 1} saved_pages={saved_pages}"
-                bound = cursor or first_bound
-                url = f"https://api.zsxq.com/v2/hashtags/{tag}/topics?count=20&end_time={quote(bound, safe='')}"
-                payload = scanner.fetch_topics_page(session.page, url)
-                error, topics = scanner.parse_topics_api_payload(payload)
-                if error:
-                    status = payload.get("status")
-                    http = status if type(status) is int else "unknown"
-                    return scan_failure(
-                        config,
-                        task,
-                        error,
-                        f"{context} http={http}",
-                    )
-                next_cursor = str(topics[-1].get("create_time") or "") if topics else ""
-                if topics and (
-                    not next_cursor or from_iso(next_cursor) >= from_iso(bound)
-                ):
-                    return TaskResult(
-                        "needs_action",
-                        "api_pagination_stalled",
-                        "Source cursor did not move backward; saved pages retained",
-                    )
-                complete = not topics or from_iso(next_cursor) < from_iso(
-                    row["window_start_iso"]
+            saved_pages = row["page_count"]
+            context = (
+                f"window={window_id} page={saved_pages + 1} saved_pages={saved_pages}"
+            )
+            bound = cursor or first_bound
+            url = f"https://api.zsxq.com/v2/hashtags/{tag}/topics?count=20&end_time={quote(bound, safe='')}"
+            payload = scanner.fetch_topics_page(session.page, url)
+            error, topics = scanner.parse_topics_api_payload(payload)
+            if error:
+                status = payload.get("status")
+                http = status if type(status) is int else "unknown"
+                return scan_failure(
+                    config,
+                    task,
+                    error,
+                    f"{context} http={http}",
+                    retry_after=_retry_after_seconds(payload.get("retry_after")),
                 )
-                with PipelineState.open(config.runtime.database) as state:
-                    commit_page(
-                        state,
-                        window_id,
-                        topics,
-                        cursor=cursor,
-                        next_cursor=next_cursor,
-                        complete=complete,
-                    )
+            next_cursor = str(topics[-1].get("create_time") or "") if topics else ""
+            if topics and (not next_cursor or from_iso(next_cursor) >= from_iso(bound)):
+                return TaskResult(
+                    "needs_action",
+                    "api_pagination_stalled",
+                    "Source cursor did not move backward; saved pages retained",
+                )
+            complete = not topics or from_iso(next_cursor) < from_iso(
+                row["window_start_iso"]
+            )
+            with PipelineState.open(config.runtime.database) as state:
+                commit_page(
+                    state,
+                    window_id,
+                    topics,
+                    cursor=cursor,
+                    next_cursor=next_cursor,
+                    complete=complete,
+                )
                 if complete:
-                    with PipelineState.open(config.runtime.database) as state:
-                        recover_authenticated_downloads(state, source.name)
+                    recover_authenticated_downloads(state, source.name)
                     return TaskResult()
-                cursor = next_cursor
         return TaskResult(
-            "retry_wait", "scan_yield", "Page budget reached; resume saved cursor", 5
+            "retry_wait",
+            "scan_yield",
+            "Page committed; resume saved cursor",
+            TOPICS_PAGE_INTERVAL_SECONDS,
         )
     except Exception as exc:
         code = str(getattr(exc, "code", "") or "api_unavailable")
@@ -389,8 +431,30 @@ def run_scan(config, task, *, session_factory=None, max_pages: int = 4) -> TaskR
         return scan_failure(config, task, code, detail)
 
 
-def scan_failure(config, task, code, detail):
-    delay = retry_seconds(int(task.get("failure_count", 0)) + 1)
+def _retry_after_seconds(value):
+    if not isinstance(value, str) or not value.strip():
+        return 0
+    value = value.strip()
+    now = int(time.time())
+    # Keep even an oversized upstream pause representable by SQLite and the
+    # timezone-aware notification formatter.
+    limit = int(datetime(9999, 1, 1, tzinfo=timezone.utc).timestamp()) - now
+    if value.isascii() and value.isdigit():
+        digits = value.lstrip("0") or "0"
+        return limit if len(digits) > len(str(limit)) else min(limit, int(digits))
+    try:
+        date = parsedate_to_datetime(value)
+        return max(0, min(limit, int(date.timestamp()) - now)) if date.tzinfo else 0
+    except (ValueError, TypeError, OverflowError, OSError):
+        return 0
+
+
+def scan_failure(config, task, code, detail, *, retry_after=0):
+    delay = retry_seconds(
+        next_failure_count(
+            "scan", task.get("error_code", ""), int(task.get("failure_count", 0)), code
+        )
+    )
     if code == "api_error_1059":
         scope = "topics:" + task["source"]
     elif code in {"need_reauth", "api_status_401", "api_error_401"}:
@@ -410,7 +474,11 @@ def scan_failure(config, task, code, detail):
     else:
         scope = "source:" + task["source"]
     with PipelineState.open(config.runtime.database) as state:
-        TaskQueue(state).cool_down(scope, delay, code)
+        queue = TaskQueue(state)
+        if retry_after:
+            queue.cool_down("topics", retry_after, code)
+        delay = max(delay, retry_after)
+        queue.cool_down(scope, delay, code)
     return TaskResult("retry_wait", code, detail, delay)
 
 

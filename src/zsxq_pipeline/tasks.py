@@ -29,6 +29,10 @@ KINDS = frozenset(
     }
 )
 RESOURCE_LIMITS = {"browser": 1, "compute": 2, "publish": 1, "library": 1, "outbox": 1}
+# All scheduled listing scans use the same provider. Leave the browser free
+# for other work between pages rather than sleeping in a claimed worker.
+TOPICS_PAGE_INTERVAL_SECONDS = 60
+TRANSIENT_SCAN_CODES = frozenset({"api_error_1059", "api_unavailable"})
 RESOURCES = {
     "scan": "browser",
     "download": "browser",
@@ -79,11 +83,21 @@ class TaskResult:
             raise ValueError("retry requires a future deadline")
 
 
+def next_failure_count(kind: str, previous_code: str, count: int, code: str) -> int:
+    if (
+        kind == "scan"
+        and code in TRANSIENT_SCAN_CODES
+        and previous_code not in TRANSIENT_SCAN_CODES
+    ):
+        return 1
+    return count + 1
+
+
 class TaskQueue:
-    def __init__(self, state: PipelineState, *, clock=time.time):
+    def __init__(self, state: PipelineState, *, clock=None):
         self.state = state
         self.db = state._connection
-        self.clock = clock
+        self.clock = time.time if clock is None else clock
 
     def enqueue(
         self,
@@ -146,7 +160,7 @@ class TaskQueue:
             if row["kind"] == "download":
                 scopes.append("download")
             if row["kind"] == "scan":
-                scopes.append("topics:" + row["source"])
+                scopes.extend(("topics", "topics:" + row["source"]))
             if (
                 scopes
                 and self.db.execute(
@@ -170,6 +184,8 @@ class TaskQueue:
                 WHERE id=?""",
                 (token, now + lease_seconds, now, now, now, task_id),
             )
+            if row["kind"] == "scan":
+                self.cool_down("topics", TOPICS_PAGE_INTERVAL_SECONDS, "topics_pacing")
             return self.get(task_id)
 
     def heartbeat(self, task_id: int, token: str, *, lease_seconds: int = 120) -> bool:
@@ -186,36 +202,41 @@ class TaskQueue:
     def finish(self, task_id: int, token: str, result: TaskResult) -> None:
         now = int(self.clock())
         with self.state._write_transaction():
-            changed = self.db.execute(
+            previous = self.db.execute(
+                "SELECT kind,error_code,failure_count FROM tasks WHERE id=? AND state='running' AND owner_token=?",
+                (task_id, token),
+            ).fetchone()
+            if previous is None:
+                raise LeaseLostError("task completion rejected: obsolete claim token")
+            failures = previous["failure_count"]
+            if result.state == "succeeded" or result.code in {
+                "scan_yield",
+                "daily_yield",
+                "reconcile_yield",
+            }:
+                failures = 0
+            elif result.state == "retry_wait" and result.code != "resource_busy":
+                failures = next_failure_count(
+                    previous["kind"], previous["error_code"], failures, result.code
+                )
+            self.db.execute(
                 """UPDATE tasks SET state=?,available_at_epoch=?,error_code=?,error_detail=?,
-                finished_at_epoch=?,updated_at_epoch=?,owner_token=NULL,lease_expires_at_epoch=NULL
+                failure_count=?,finished_at_epoch=?,updated_at_epoch=?,owner_token=NULL,lease_expires_at_epoch=NULL
                 WHERE id=? AND state='running' AND owner_token=?""",
                 (
                     result.state,
                     now + result.retry_after if result.state == "retry_wait" else 0,
                     result.code,
                     diagnostic(result.detail),
+                    failures,
                     now,
                     now,
                     task_id,
                     token,
                 ),
-            ).rowcount
-            if not changed:
-                raise LeaseLostError("task completion rejected: obsolete claim token")
-            if result.state == "succeeded" or result.code in {
-                "scan_yield",
-                "daily_yield",
-                "reconcile_yield",
-            }:
-                self.db.execute(
-                    "UPDATE tasks SET failure_count=0 WHERE id=?", (task_id,)
-                )
-            elif result.state == "retry_wait" and result.code != "resource_busy":
-                self.db.execute(
-                    "UPDATE tasks SET failure_count=failure_count+1 WHERE id=?",
-                    (task_id,),
-                )
+            )
+            if previous["kind"] == "scan":
+                self.cool_down("topics", TOPICS_PAGE_INTERVAL_SECONDS, "topics_pacing")
 
     def recover_dead(self, task_id: int, *, writer_is_dead: bool) -> bool:
         """Caller must prove the task lock free; expiry alone is insufficient."""
@@ -283,6 +304,7 @@ class TaskQueue:
              AND NOT EXISTS (SELECT 1 FROM dependency_cooldowns c WHERE c.available_at_epoch>?
                AND (c.scope='browser' AND t.resource='browser' OR c.scope='download' AND t.kind='download'
                     OR c.scope='topics:'||t.source AND t.kind='scan'
+                    OR c.scope='topics' AND t.kind='scan'
                     OR c.scope='source:'||t.source AND t.resource='browser'))
              """
             + clause
@@ -347,8 +369,9 @@ class TaskQueue:
         with self.state._write_transaction():
             self.db.execute(
                 """INSERT INTO dependency_cooldowns VALUES(?,?,?,?) ON CONFLICT(scope) DO UPDATE
-                SET available_at_epoch=MAX(available_at_epoch,excluded.available_at_epoch),reason_code=excluded.reason_code,
-                    updated_at_epoch=excluded.updated_at_epoch""",
+                SET available_at_epoch=excluded.available_at_epoch,reason_code=excluded.reason_code,
+                    updated_at_epoch=excluded.updated_at_epoch
+                WHERE excluded.available_at_epoch>=dependency_cooldowns.available_at_epoch""",
                 (scope, now + seconds, reason, now),
             )
 
