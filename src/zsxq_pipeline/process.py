@@ -607,6 +607,7 @@ class DigestProcessor:
                         enqueue_terminal_notification(
                             state,
                             event="run_partial",
+                            preserve_errors=bool(self.config.notification_digest_times),
                             chat_id=self.config.target_chat_id,
                             markdown="本轮知识星球研报总结已部分完成；请查看已发布文档和本地运行结果。",
                             scope_key=run_id,

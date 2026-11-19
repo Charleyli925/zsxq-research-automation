@@ -9,6 +9,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from ._time import from_iso
+from .notification_digest import PHASE_LABELS
 from .notify import (
     enqueue_pipeline_status_notification,
     render_batch_complete_notice,
@@ -28,6 +29,7 @@ QUIET_CODES = {
 
 # Allow one scheduler wake after the first durable five-minute retry is due.
 TOPICS_RETRY_GRACE_SECONDS = 300
+ACTION_STATES = {"needs_action", "quarantined", "needs_reconciliation"}
 
 
 def _waiting_for_first_topics_retry(row, now, topics_due):
@@ -114,12 +116,13 @@ def window_complete_ready(state, window_id, progress=None):
     return pending is None
 
 
-def _retire_scope(state, scope, now):
+def _retire_scope(state, scope, now, *, keep_open=False):
     state._connection.execute(
         """UPDATE notification_outbox SET status='superseded',error_code='superseded',
         updated_at_epoch=? WHERE event IN ('incident_open','incident_reminder')
-        AND json_extract(payload_json,'$.scope_key')=? AND status IN ('queued','pending','retry_wait')""",
-        (now, scope),
+        AND json_extract(payload_json,'$.scope_key')=? AND status IN ('queued','pending','retry_wait')
+        AND (event<>'incident_open' OR NOT ?)""",
+        (now, scope, keep_open),
     )
 
 
@@ -128,9 +131,13 @@ def _warning_deliveries(state, scope, incident):
         return set()
     first_notice = json.loads(incident["details_json"]).get("first_notice_id")
     rows = state._connection.execute(
-        """SELECT DISTINCT CASE status WHEN 'digest_pending' THEN 'running' ELSE status END
+        """SELECT DISTINCT CASE
+          WHEN status='digest_pending' THEN 'running'
+          WHEN event='incident_open' AND status IN ('queued','pending') AND attempt_count=0 THEN 'unsent_open'
+          WHEN event='incident_open' AND status='retry_wait' THEN 'retrying_open'
+          ELSE status END
         FROM notification_outbox WHERE event IN ('incident_open','incident_reminder')
-        AND status IN ('sent','running','digest_pending')
+        AND status IN ('sent','running','digest_pending','queued','pending','retry_wait')
         AND json_extract(payload_json,'$.scope_key')=?
         AND CASE WHEN ? IS NULL THEN created_at_epoch>=? ELSE id>=? END""",
         (scope, first_notice, incident["first_seen_epoch"], first_notice),
@@ -185,24 +192,23 @@ def refresh_notifications(state, config, *, now=None):
             ]
             if not reportable and len(rows) > 1:
                 reportable = rows
-            manual = next(
-                (
-                    r
-                    for r in reportable
-                    if r["state"]
-                    in {"needs_action", "quarantined", "needs_reconciliation"}
-                ),
-                None,
-            )
-            primary = manual or (reportable or rows)[0]
-            code = primary["error_code"]
             notified = 0 if fresh else prior["last_notified_epoch"]
             details = {} if fresh else json.loads(prior["details_json"])
-            escalated = digest_enabled and manual is not None and details.get("requires_action") is False
+            codes = {r["error_code"] for r in reportable}
+            manual_codes = {r["error_code"] for r in reportable if r["state"] in ACTION_STATES}
+            # Pre-upgrade incidents already had a notification history. Start
+            # from its recorded reasons without announcing that backlog again.
+            known = set(details.setdefault("alerted_codes", details.get("codes", []) if notified else []))
+            known_manual = set(details.setdefault("alerted_manual_codes", sorted(manual_codes & known)))
+            new_reasons = (codes - known) | (manual_codes - known_manual)
+            changed = digest_enabled and bool(notified and new_reasons)
+            candidates = [r for r in reportable if r["error_code"] in new_reasons] if changed else reportable
+            manual = next((r for r in candidates if r["state"] in ACTION_STATES), None)
+            primary = manual or (candidates or rows)[0]
+            code = primary["error_code"]
             affected = unfinished.intersection(details.get("task_ids", ()))
             affected.update(r["id"] for r in rows)
             details.update(
-                requires_action=manual is not None,
                 codes=sorted({r["error_code"] for r in rows}),
                 task_ids=sorted(affected),
             )
@@ -224,9 +230,9 @@ def refresh_notifications(state, config, *, now=None):
                     encoded(details),
                 ),
             )
-            if enabled and reportable and (not notified or escalated or now - notified >= reminder_seconds):
+            if enabled and reportable and (not notified or changed or now - notified >= reminder_seconds):
                 event = (
-                    "incident_open" if fresh or not notified or escalated else "incident_reminder"
+                    "incident_open" if fresh or not notified or changed else "incident_reminder"
                 )
                 if digest_enabled and event == "incident_reminder" and state._connection.execute(
                     """SELECT 1 FROM notification_outbox WHERE event='incident_open'
@@ -242,17 +248,24 @@ def refresh_notifications(state, config, *, now=None):
                         state, config, primary, now, topics_due
                     )
                     kind = "主题列表扫描"
-                _retire_scope(state, scope, now)
+                _retire_scope(state, scope, now, keep_open=changed)
+                visible_codes = [code, *sorted(codes - {code})] if digest_enabled else [code]
+                diagnostics = "、".join(f"`{reason}`" for reason in visible_codes)
+                details["alerted_codes"] = sorted(known | set(visible_codes))
+                details["alerted_manual_codes"] = sorted(known_manual | manual_codes.intersection(visible_codes))
+                identity = f"{scope}:{generation}:{now // reminder_seconds}"
+                if changed:
+                    signature = encoded([details["alerted_codes"], details["alerted_manual_codes"]])
+                    identity = f"{scope}:{generation}:change:{signature}"
                 notice = enqueue_pipeline_status_notification(
                     state,
                     event=event,
                     requires_action=bool(manual),
                     reason_code=code,
-                    identity=(f"{scope}:{generation}:action:{now}" if escalated
-                              else f"{scope}:{generation}:{now // reminder_seconds}"),
+                    identity=identity,
                     chat_id=config.lark.target_chat_id,
                     scope_key=scope,
-                    markdown=f"## ⚠️ 知识星球研报｜处理受阻\n\n{_source_label(source)} · {kind}，共 {len(affected)} 项。{action}。\n\n诊断码 `{code}`",
+                    markdown=f"## ⚠️ 知识星球研报｜处理受阻\n\n{_source_label(source)} · {kind}，共 {len(affected)} 项。{action}。\n\n诊断码 {diagnostics}",
                 )
                 details.setdefault("first_notice_id", notice.id)
                 state._connection.execute(
@@ -271,25 +284,29 @@ def refresh_notifications(state, config, *, now=None):
             )
             if pending and not resumed:
                 continue
-            _retire_scope(state, scope, now)
-            # A queued warning can be superseded by recovery before delivery.
-            # Only announce recovery to people who received this generation.
             deliveries = _warning_deliveries(state, scope, prior)
-            if "running" in deliveries:
+            if "running" in deliveries or (digest_enabled and "retrying_open" in deliveries):
                 continue
+            _retire_scope(state, scope, now)
             state._connection.execute(
                 "UPDATE incidents SET state='resolved',last_seen_epoch=?,affected_count=0 WHERE scope=?",
                 (now, scope),
             )
-            if enabled and "sent" in deliveries:
+            brief = digest_enabled and "unsent_open" in deliveries
+            if enabled and ("sent" in deliveries or brief):
+                source, phase = scope.rsplit(":", 1)
+                label = "研报系统" if source == "pipeline" else _source_label(source)
                 message = (
-                    f"{_source_label(scope.rsplit(':', 1)[0])}的主题列表已从断点续读，后续页面仍按计划扫描。"
+                    f"{label}的主题列表已从断点续读，后续页面仍按计划扫描。"
                     if resumed
-                    else f"{scope} 的故障任务已处理完成。全流程完成情况另按批次统计。"
+                    else f"{label} · {PHASE_LABELS.get(phase, phase)} 的故障任务已处理完成。全流程完成情况另按批次统计。"
                 )
+                if brief:
+                    codes = json.loads(prior["details_json"]).get("alerted_codes") or [prior["reason_code"]]
+                    message += "\n\n诊断码 " + "、".join(f"`{code}`" for code in codes)
                 enqueue_pipeline_status_notification(
                     state,
-                    event="incident_resolved",
+                    event="incident_brief" if brief else "incident_resolved",
                     identity=f"{scope}:{prior['generation']}",
                     chat_id=config.lark.target_chat_id,
                     scope_key=scope,

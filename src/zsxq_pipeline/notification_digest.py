@@ -13,6 +13,13 @@ from ._time import to_iso_epoch
 
 
 DIGEST_EVENT = "notification_digest"
+ERROR_EVENTS = (
+    "incident_open",
+    "incident_brief",
+    "download_blocked",
+    "run_partial",
+    "run_failed",
+)
 STATUS_LABELS = {
     "download_complete": "下载完成",
     "summary_started": "开始总结",
@@ -20,12 +27,18 @@ STATUS_LABELS = {
     "batch_complete": "批次完成",
     "run_complete": "运行完成",
 }
-# Keep the first alert requiring intervention on the direct delivery path.
-# A row that may already have reached Lark must retain its original remote key.
-ROUTINE = """n.status IN ('queued','pending') AND n.attempt_count=0 AND (
+PHASE_LABELS = {
+    "scan": "列表扫描",
+    "download": "附件下载",
+    "prepare": "摘要准备",
+    "publish": "发布",
+    "reconcile": "数据核对",
+    "daily": "日报",
+}
+# Errors and any row already attempted keep their individual delivery keys.
+ROUTINE = """n.status IN ('queued','pending') AND n.attempt_count=0 AND
     n.event IN ('document_ready','download_complete','summary_started','summary_progress',
-                'batch_complete','run_complete','incident_reminder','incident_resolved')
-    OR (n.event='incident_open' AND json_extract(n.payload_json,'$.requires_action')=0))"""
+                'batch_complete','run_complete','incident_reminder','incident_resolved')"""
 
 
 @dataclass
@@ -115,16 +128,8 @@ def _body(rows, cutoff):
                 if payload.get("reason_code"):
                     status += f"（{payload['reason_code']}）"
             source, _, phase = scope.rpartition(":")
-            phases = {
-                "scan": "列表扫描",
-                "download": "附件下载",
-                "prepare": "摘要准备",
-                "publish": "发布",
-                "reconcile": "数据核对",
-                "daily": "日报",
-            }
             label = "研报系统" if source == "pipeline" else _source_label(source)
-            incidents[scope] = f"{label} · {phases.get(phase, phase)} {status}"
+            incidents[scope] = f"{label} · {PHASE_LABELS.get(phase, phase)} {status}"
 
     parts = [f"## 知识星球研报汇总｜{cutoff:%m-%d %H:%M}"]
     for index, (url, updates) in enumerate(docs.items(), 1):

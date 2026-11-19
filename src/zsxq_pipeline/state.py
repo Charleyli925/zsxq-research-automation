@@ -20,7 +20,7 @@ from typing import Any, Self
 
 from . import SCHEMA_VERSION
 from ._time import from_iso, require_aware, to_iso_epoch, utc_now
-from .notification_digest import DIGEST_EVENT
+from .notification_digest import DIGEST_EVENT, ERROR_EVENTS
 from .model import (
     ArtifactRecord,
     DocumentRecord,
@@ -2009,6 +2009,7 @@ class PipelineState:
         *,
         lease_seconds: int = 300,
         now: datetime | None = None,
+        prioritize_errors: bool = False,
     ) -> NotificationClaim | None:
         """Atomically lease one due notification for a side-effecting sender.
 
@@ -2026,7 +2027,7 @@ class PipelineState:
         _, expiry_iso, expiry_epoch = _timestamp(expiry)
         with self._write_transaction():
             row = self._connection.execute(
-                """
+                f"""
                 SELECT * FROM notification_outbox
                 WHERE (
                   status IN ('queued', 'pending')
@@ -2039,6 +2040,7 @@ class PipelineState:
                   AND (lease_expires_at_epoch IS NULL OR lease_expires_at_epoch <= ?)
                 )
                 ORDER BY
+                  CASE WHEN ? AND event IN ({','.join('?' for _ in ERROR_EVENTS)}) THEN 0 ELSE 1 END,
                   CASE status
                     WHEN 'queued' THEN 0
                     WHEN 'pending' THEN 0
@@ -2049,7 +2051,7 @@ class PipelineState:
                   id
                 LIMIT 1
                 """,
-                (now_epoch, now_epoch, now_epoch),
+                (now_epoch, now_epoch, now_epoch, prioritize_errors, *ERROR_EVENTS),
             ).fetchone()
             if row is None:
                 return None

@@ -18,7 +18,7 @@ from typing import Any, Protocol
 
 from .lark import LarkCommandError
 from .model import NotificationClaim, NotificationRecord, PublicationRecord
-from .notification_digest import prepare_notification_digests
+from .notification_digest import ERROR_EVENTS, prepare_notification_digests
 from .retry import retry_delay
 from .state import PipelineState
 
@@ -37,7 +37,7 @@ PIPELINE_STATUS_EVENTS = frozenset(
         SUMMARY_STARTED_EVENT,
         SUMMARY_PROGRESS_EVENT,
         BATCH_COMPLETE_EVENT,
-        "incident_open", "incident_reminder", "incident_resolved",
+        "incident_open", "incident_brief", "incident_reminder", "incident_resolved",
     }
 )
 _ACTIVE_NOTIFICATION_STATES = frozenset({"queued", "pending", "retry_wait", "running", "digest_pending"})
@@ -157,6 +157,7 @@ def enqueue_terminal_notification(
     chat_id: str,
     markdown: str,
     scope_key: str,
+    preserve_errors: bool = False,
 ) -> NotificationRecord:
     """Queue a run-level terminal message behind all document notices in scope."""
 
@@ -167,7 +168,9 @@ def enqueue_terminal_notification(
     # A newer run conclusion replaces any undelivered older terminal state.
     # Document notices are deliberately excluded: each successfully published
     # document remains useful even when a later batch conclusion supersedes.
-    state.supersede_pending_notifications(events=TERMINAL_EVENTS, superseded_by=key)
+    state.supersede_pending_notifications(
+        events=("run_complete",) if preserve_errors else TERMINAL_EVENTS, superseded_by=key,
+    )
     return state.enqueue_notification(
         key,
         event=event_name,
@@ -489,10 +492,13 @@ class NotificationDrainer:
             now = self.clock()
             with self.state._write_transaction():
                 prepare_notification_digests(self.state, self.digest_times, self.digest_timezone, now)
-                claim = self.state.claim_due_notification(lease_seconds=self.lease_seconds, now=now)
+                claim = self.state.claim_due_notification(
+                    lease_seconds=self.lease_seconds, now=now, prioritize_errors=bool(self.digest_times),
+                )
             if claim is None:
                 break
-            if _is_terminal(claim) and _has_pending_document(self.state, claim):
+            urgent_error = self.digest_times and claim.event in ERROR_EVENTS
+            if not urgent_error and _is_terminal(claim) and _has_pending_document(self.state, claim):
                 self.state.fail_notification(
                     claim,
                     retry_at=now + self.retry_delay,

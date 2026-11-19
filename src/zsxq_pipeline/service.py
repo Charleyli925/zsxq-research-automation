@@ -240,12 +240,12 @@ def supervise(
                             and document_free is not None,
                         )
                 _enqueue_due_documents(state, config)
-                _periodic_tasks(state, config, datetime.now(timezone.utc))
                 from .incidents import refresh_notifications
 
                 if monotonic() - notified_at >= 10:
                     refresh_notifications(state, config)
                     notified_at = monotonic()
+                _periodic_tasks(state, config, datetime.now(timezone.utc))
                 due = queue.due(kinds)
                 for candidate in due:
                     if monotonic() >= deadline:

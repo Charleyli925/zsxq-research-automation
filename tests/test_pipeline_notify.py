@@ -578,8 +578,12 @@ def test_scheduled_digest_folds_updates_per_link_and_chat_and_keeps_urgent_alert
                 scope, event="incident_open", now=now,
                 payload={"scope_key": scope, "requires_action": manual, "markdown": scope, "chat_id": "group"},
             )
-        assert [d.event for d in drainer.drain()] == ["incident_open"]
-        assert notifier.calls == [("group", "cicc:download", "cicc:download")]
+        state.enqueue_notification("reminder", event="incident_reminder", now=now, payload={
+            "scope_key": "foreign:scan", "requires_action": False, "markdown": "重试中", "chat_id": "group",
+        })
+        assert [d.event for d in drainer.drain()] == ["incident_open", "incident_open"]
+        assert notifier.calls == [("group", "foreign:scan", "foreign:scan"),
+                                  ("group", "cicc:download", "cicc:download")]
         now = opening
         assert [d.event for d in drainer.drain()] == ["notification_digest"] * 2
         body = next(body for chat, body, _ in notifier.calls if chat == "group" and "汇总" in body)
@@ -712,3 +716,36 @@ def test_scheduler_wakes_parked_updates_when_digest_times_change(tmp_path):
         assert not notification_drain_due(state, ("12:00",), "Asia/Shanghai", now)
         assert notification_drain_due(state, (), "Asia/Shanghai", now)
         assert [entry.event for entry in drain(())] == ["document_ready"]
+
+
+@pytest.mark.parametrize("event", ["incident_open", "incident_brief", "download_blocked", "run_failed", "run_partial"])
+def test_error_precedes_due_digest_and_does_not_wait_for_report_links(tmp_path, event):
+    now = NOW
+    notifier = FakeNotifier()
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        _digest_document(state, 1, "foreign", "https://feishu.cn/docx/doc", 1, now-timedelta(hours=2))
+        _digest_document(state, 2, "foreign", "https://feishu.cn/docx/later", 1, now)
+        # Simulate an older frozen digest. Even a terminal error has delivery priority.
+        from zsxq_pipeline.notification_digest import prepare_notification_digests
+        with state._write_transaction():
+            prepare_notification_digests(state, ("09:00", "18:00"), "Asia/Shanghai", now)
+        state.enqueue_notification("error", event=event, now=now, payload={
+            "scope_key": "foreign:scan", "requires_action": False, "markdown": "故障", "chat_id": "group",
+            "terminal": event in {"run_failed", "run_partial"},
+        })
+        drainer = NotificationDrainer(state, notifier, clock=lambda: now, digest_times=("09:00","18:00"))
+        assert [d.event for d in drainer.drain(max_items=1)] == [event]
+        assert notifier.calls == [("group", "故障", "error")]
+        assert [d.event for d in drainer.drain()] == ["notification_digest"]
+
+
+def test_later_run_conclusion_keeps_pending_independent_errors_in_digest_mode(tmp_path):
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        for event, scope in [("run_partial", "a"), ("run_failed", "b"), ("run_complete", "c")]:
+            enqueue_terminal_notification(state, event=event, chat_id="group", markdown=event,
+                                          scope_key=scope, preserve_errors=True)
+        assert [(n.event, n.status) for n in state.list_notifications()] == [
+            ("run_partial", "queued"), ("run_failed", "queued"), ("run_complete", "queued"),
+        ]
