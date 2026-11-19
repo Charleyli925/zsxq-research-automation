@@ -708,7 +708,11 @@ class PipelineWorker:
         )
         with PipelineState.open(self.config.runtime.database) as state:
             state.migrate()
-            deliveries = NotificationDrainer(state, LarkNotifier(lark_config), clock=self.clock).drain(max_items=max_items)
+            deliveries = NotificationDrainer(
+                state, LarkNotifier(lark_config), clock=self.clock,
+                digest_times=self.config.lark.notification_digest_times,
+                digest_timezone=self.config.schedule.timezone,
+            ).drain(max_items=max_items)
             # Compatibility output is an observer, never a second outbox.
             audit_path = self.config.runtime.root / "notification_messages.jsonl"
             export_notification_audit(state, audit_path)

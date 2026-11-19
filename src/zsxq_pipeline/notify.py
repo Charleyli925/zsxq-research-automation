@@ -18,6 +18,7 @@ from typing import Any, Protocol
 
 from .lark import LarkCommandError
 from .model import NotificationClaim, NotificationRecord, PublicationRecord
+from .notification_digest import prepare_notification_digests
 from .retry import retry_delay
 from .state import PipelineState
 
@@ -39,7 +40,7 @@ PIPELINE_STATUS_EVENTS = frozenset(
         "incident_open", "incident_reminder", "incident_resolved",
     }
 )
-_ACTIVE_NOTIFICATION_STATES = frozenset({"queued", "pending", "retry_wait", "running"})
+_ACTIVE_NOTIFICATION_STATES = frozenset({"queued", "pending", "retry_wait", "running", "digest_pending"})
 
 
 class NotificationError(RuntimeError):
@@ -120,6 +121,8 @@ def enqueue_pipeline_status_notification(
     markdown: str,
     scope_key: str,
     terminal: bool = False,
+    requires_action: bool | None = None,
+    reason_code: str = "",
 ) -> NotificationRecord:
     """Queue one low-frequency pipeline status with a durable cohort identity.
 
@@ -135,10 +138,15 @@ def enqueue_pipeline_status_notification(
     normalized_identity = str(identity).strip()
     if not normalized_identity:
         raise NotificationError("pipeline status identity is required")
+    payload = _payload(chat_id=chat_id, markdown=markdown, scope_key=scope_key, terminal=terminal)
+    if requires_action is not None:
+        payload["requires_action"] = requires_action
+    if reason_code:
+        payload["reason_code"] = reason_code
     return state.enqueue_notification(
         notification_idempotency_key(event_name, normalized_identity),
         event=event_name,
-        payload=_payload(chat_id=chat_id, markdown=markdown, scope_key=scope_key, terminal=terminal),
+        payload=payload,
     )
 
 
@@ -456,6 +464,8 @@ class NotificationDrainer:
         retry_delay: timedelta = timedelta(minutes=5),
         lease_seconds: int = 120,
         clock: Callable[[], datetime] = _now,
+        digest_times: tuple[str, ...] = (),
+        digest_timezone: str = "Asia/Shanghai",
     ) -> None:
         if retry_delay.total_seconds() <= 0:
             raise ValueError("retry_delay must be positive")
@@ -466,6 +476,8 @@ class NotificationDrainer:
         self.retry_delay = retry_delay
         self.lease_seconds = int(lease_seconds)
         self.clock = clock
+        self.digest_times = digest_times
+        self.digest_timezone = digest_timezone
 
     def drain(self, *, max_items: int = 100) -> tuple[NotificationDelivery, ...]:
         """Deliver due rows in order; a failure never rolls back publication."""
@@ -475,7 +487,9 @@ class NotificationDrainer:
         delivered: list[NotificationDelivery] = []
         for _ in range(int(max_items)):
             now = self.clock()
-            claim = self.state.claim_due_notification(lease_seconds=self.lease_seconds, now=now)
+            with self.state._write_transaction():
+                prepare_notification_digests(self.state, self.digest_times, self.digest_timezone, now)
+                claim = self.state.claim_due_notification(lease_seconds=self.lease_seconds, now=now)
             if claim is None:
                 break
             if _is_terminal(claim) and _has_pending_document(self.state, claim):

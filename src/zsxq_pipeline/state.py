@@ -20,6 +20,7 @@ from typing import Any, Self
 
 from . import SCHEMA_VERSION
 from ._time import from_iso, require_aware, to_iso_epoch, utc_now
+from .notification_digest import DIGEST_EVENT
 from .model import (
     ArtifactRecord,
     DocumentRecord,
@@ -2103,6 +2104,13 @@ class PipelineState:
                 """,
                 (now_iso, now_epoch, int(claim.id)),
             )
+            if claim.event == DIGEST_EVENT:
+                self._connection.execute(
+                    """UPDATE notification_outbox SET status='sent',error_code='',error_detail='',
+                       updated_at_iso=?,updated_at_epoch=? WHERE status IN ('digest_pending','failed')
+                       AND json_extract(payload_json,'$.digest_id')=?""",
+                    (now_iso, now_epoch, claim.id),
+                )
             row = self._connection.execute("SELECT * FROM notification_outbox WHERE id=?", (int(claim.id),)).fetchone()
         assert row is not None
         return _row_notification(row, created=False)
@@ -2146,6 +2154,13 @@ class PipelineState:
                     int(claim.id),
                 ),
             )
+            if claim.event == DIGEST_EVENT and next_status == "failed":
+                self._connection.execute(
+                    """UPDATE notification_outbox SET status='failed',error_code=?,error_detail=?,
+                       updated_at_iso=?,updated_at_epoch=? WHERE status='digest_pending'
+                       AND json_extract(payload_json,'$.digest_id')=?""",
+                    (error_code, error_detail, now_iso, now_epoch, claim.id),
+                )
             row = self._connection.execute("SELECT * FROM notification_outbox WHERE id=?", (int(claim.id),)).fetchone()
         assert row is not None
         return _row_notification(row, created=False)

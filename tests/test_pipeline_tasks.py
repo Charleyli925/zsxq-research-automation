@@ -1195,3 +1195,36 @@ def test_separate_prepare_publish_workers_and_completion_notification_order(
                 task["id"], owned["owner_token"], service.execute_task(config, owned)
             )
         assert window_complete_ready(state, window)
+
+
+def test_digest_mode_escalates_action_and_defers_repeated_incidents(tmp_path):
+    config = config_fixture(tmp_path)
+    config = replace(config, lark=replace(
+        config.lark, notifications_enabled=True, target_chat_id="test",
+        notification_digest_times=("09:00", "18:00"),
+    ))
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        now = int(time.time())
+        queue = TaskQueue(state, clock=lambda: now)
+        task_id = queue.enqueue("test-prepare", "prepare", {}, source="foreign")
+        owned = queue.claim(task_id)
+        queue.finish(task_id, owned["owner_token"], TaskResult("retry_wait", "model_busy", "", 1))
+        refresh_notifications(state, config, now=now)
+        (first,) = state.list_notifications()
+        assert first.payload["requires_action"] is False
+        now += 60
+        owned = queue.claim(task_id)
+        queue.finish(task_id, owned["owner_token"], TaskResult("needs_action", "need_reauth", ""))
+        refresh_notifications(state, config, now=now)
+        notices = state.list_notifications()
+        assert [(n.event, n.status) for n in notices] == [
+            ("incident_open", "superseded"), ("incident_open", "queued"),
+        ]
+        assert notices[-1].payload["requires_action"] is True
+        refresh_notifications(state, config, now=now + 4*3600)
+        assert len(state.list_notifications()) == 2
+        claim = state.claim_due_notification()
+        state.complete_notification(claim)
+        refresh_notifications(state, config, now=now + 24*3600)
+        assert [n.event for n in state.list_notifications()][-1] == "incident_reminder"

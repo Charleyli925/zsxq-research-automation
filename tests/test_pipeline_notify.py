@@ -542,3 +542,173 @@ def test_unknown_document_history_does_not_claim_a_total(tmp_path):
         publication = _publication(state)
         assert document_entry_total(state, publication) is None
         assert "累计" not in render_document_notice(publication, title="report", count=1)
+
+
+def _digest_document(state, index, source, url, count, at, *, chat="group", title=""):
+    sha = f"{index:064x}"
+    state.record_remote_write(
+        sha, "daily", str(index), remote_reference=url, target_document=url, now=at,
+        details={"entry_count": count, "entries": [{"source": source}], "title": title},
+    )
+    publication = state.complete_publication(sha, "daily", str(index), target_document=url, now=at)
+    return state.enqueue_notification(
+        f"document-{index}", event="document_ready", publication_id=publication.id, now=at,
+        payload={"markdown": f"[打开文档]({url})", "chat_id": chat, "scope_key": source},
+    )
+
+
+def test_scheduled_digest_folds_updates_per_link_and_chat_and_keeps_urgent_alerts(tmp_path):
+    opening = NOW.replace(hour=1, minute=0, second=0)  # 09:00 in Shanghai
+    now = opening - timedelta(seconds=1)
+    notifier = FakeNotifier()
+    url = "https://feishu.cn/docx/foreign"
+    domestic = "https://feishu.cn/docx/domestic"
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        drainer = NotificationDrainer(
+            state, notifier, clock=lambda: now, digest_times=("09:00", "18:00"),
+        )
+        _digest_document(state, 1, "foreign", url, 4, now)
+        _digest_document(state, 2, "foreign", url, 2, now)
+        _digest_document(state, 3, "unified-tick", domestic, 1, now,
+                         title="知识星球研报总结（2026-08-10） 1 篇")
+        _digest_document(state, 4, "foreign", url, 1, now, chat="other")
+        for scope, manual in [("foreign:scan", False), ("cicc:download", True)]:
+            state.enqueue_notification(
+                scope, event="incident_open", now=now,
+                payload={"scope_key": scope, "requires_action": manual, "markdown": scope, "chat_id": "group"},
+            )
+        assert [d.event for d in drainer.drain()] == ["incident_open"]
+        assert notifier.calls == [("group", "cicc:download", "cicc:download")]
+        now = opening
+        assert [d.event for d in drainer.drain()] == ["notification_digest"] * 2
+        body = next(body for chat, body, _ in notifier.calls if chat == "group" and "汇总" in body)
+        assert body.count(url) == 1 and body.count(domestic) == 1
+        assert f"[海外研报]({url}) · 新增 6 篇" in body
+        assert f"[知识星球研报总结（2026-08-10）]({domestic}) · 新增 1 篇" in body
+        assert "unified-tick" not in body
+        assert "海外研报 · 列表扫描" in body and "08-10 09:00" in body
+        assert len({n.payload["digest_id"] for n in state.list_notifications()
+                    if n.event == "document_ready"}) == 2
+        # A second writer can commit in the same second, after this slot is frozen.
+        _digest_document(state, 5, "foreign", url, 3, now)
+        assert not drainer.drain()
+        now = opening + timedelta(hours=9)
+        assert len(drainer.drain()) == 1 and "新增 3 篇" in notifier.calls[-1][1]
+        now += timedelta(days=1)
+        assert not drainer.drain()
+        assert {n.status for n in state.list_notifications()} == {"sent"}
+
+
+def test_digest_retries_frozen_members_after_restart_and_catches_up_once(tmp_path):
+    path = tmp_path / "pipeline.sqlite3"
+    due = NOW.replace(hour=10, minute=0, second=0)  # 18:00 in Shanghai
+    now = due
+    notifier = FakeNotifier(error=RuntimeError("offline"))
+    url = "https://feishu.cn/docx/foreign"
+    def drainer(state):
+        return NotificationDrainer(state, notifier, clock=lambda: now, digest_times=("18:00",))
+    with PipelineState.open(path) as state:
+        state.migrate()
+        _digest_document(state, 1, "foreign", url, 1, due - timedelta(hours=2))
+        assert drainer(state).drain()[0].status == "retry_wait"
+        first = notifier.calls[0]
+        (member,) = state.list_notifications(statuses=("digest_pending",))
+        assert member.attempt_count == 0
+        # A process crash after freezing work must not allow the individual post.
+        _digest_document(state, 2, "foreign", url, 7, due + timedelta(hours=1))
+    notifier.error = None
+    now = due + timedelta(days=3, minutes=1)
+    with PipelineState.open(path) as state:
+        assert [d.event for d in drainer(state).drain()] == ["notification_digest"]
+        assert notifier.calls == [first, first]
+        assert not drainer(state).drain()
+        now += timedelta(days=1)
+        assert len(drainer(state).drain()) == 1 and "新增 7 篇" in notifier.calls[-1][1]
+        assert {n.status for n in state.list_notifications()} == {"sent"}
+
+
+def test_digest_keeps_attempted_legacy_key_and_propagates_permission_failure(tmp_path):
+    now = NOW
+    notifier = FakeNotifier()
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        url = "https://feishu.cn/docx/doc"
+        _digest_document(state, 1, "foreign", url, 1, now)
+        claim = state.claim_due_notification(now=now)
+        state.fail_notification(claim, retry_at=now + timedelta(minutes=1), now=now)
+        _digest_document(state, 2, "foreign", url, 3, now)
+        drainer = NotificationDrainer(state, notifier, clock=lambda: now, digest_times=("18:00",))
+        now += timedelta(minutes=2)
+        assert [d.idempotency_key for d in drainer.drain()] == [claim.idempotency_key]
+        now += timedelta(days=1)
+        notifier.error = RuntimeError("permission denied")
+        assert drainer.drain()[0].status == "failed"
+        member = next(n for n in state.list_notifications() if n.idempotency_key == "document-2")
+        assert member.status == "failed" and member.payload["digest_id"]
+        assert not drainer.drain()
+
+
+def test_digest_link_limit_carries_every_link_into_a_later_slot(tmp_path):
+    now = NOW
+    notifier = FakeNotifier()
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        urls = [f"https://feishu.cn/docx/doc-{n:03d}" for n in range(24)]
+        for n, url in enumerate(urls):
+            _digest_document(state, n+1, "foreign", url, 1, now-timedelta(days=3))
+        drainer = NotificationDrainer(state, notifier, clock=lambda: now, digest_times=("09:00",))
+        assert len(drainer.drain()) == 1 and len(state.list_notifications(statuses=("queued",))) == 4
+        now += timedelta(days=1)
+        assert len(drainer.drain()) == 1
+        combined = "\n".join(body for _, body, _ in notifier.calls)
+        assert all(combined.count(url) == 1 for url in urls)
+
+
+def test_digest_lease_reclaims_same_remote_key_after_send_before_ack(tmp_path):
+    from zsxq_pipeline.notification_digest import notification_drain_due
+
+    path = tmp_path / "pipeline.sqlite3"
+    now = NOW
+    times = ("09:00", "18:00")
+    remote = {}
+    attempts = []
+
+    class InterruptedSender:
+        def notify_once(self, chat, body, *, idempotency_key):
+            attempts.append(idempotency_key)
+            remote.setdefault(idempotency_key, body)
+            if len(attempts) == 1:
+                raise SystemExit("process terminated before SQLite acknowledgment")
+
+    with PipelineState.open(path) as state:
+        state.migrate()
+        _digest_document(state, 1, "foreign", "https://feishu.cn/docx/doc", 1, now-timedelta(hours=1))
+        with pytest.raises(SystemExit):
+            NotificationDrainer(state, InterruptedSender(), clock=lambda: now, digest_times=times).drain()
+        assert not notification_drain_due(state, times, "Asia/Shanghai", now)
+    now += timedelta(minutes=3)
+    with PipelineState.open(path) as state:
+        assert notification_drain_due(state, times, "Asia/Shanghai", now)
+        deliveries = NotificationDrainer(state, InterruptedSender(), clock=lambda: now, digest_times=times).drain()
+        assert len(deliveries) == 1 and deliveries[0].status == "sent"
+        assert set(attempts) == set(remote) and len(attempts) == 2 and len(remote) == 1
+        assert not notification_drain_due(state, times, "Asia/Shanghai", now)
+
+
+def test_scheduler_wakes_parked_updates_when_digest_times_change(tmp_path):
+    from zsxq_pipeline.notification_digest import notification_drain_due
+
+    now = NOW
+    with PipelineState.open(tmp_path / "pipeline.sqlite3") as state:
+        state.migrate()
+        _digest_document(state, 1, "foreign", "https://feishu.cn/docx/doc", 1, now)
+        def drain(times):
+            return NotificationDrainer(state, FakeNotifier(), clock=lambda: now, digest_times=times).drain()
+        assert not drain(("18:00",))
+        assert not notification_drain_due(state, ("18:00",), "Asia/Shanghai", now)
+        assert notification_drain_due(state, ("12:00",), "Asia/Shanghai", now)
+        assert not drain(("12:00",))
+        assert not notification_drain_due(state, ("12:00",), "Asia/Shanghai", now)
+        assert notification_drain_due(state, (), "Asia/Shanghai", now)
+        assert [entry.event for entry in drain(())] == ["document_ready"]

@@ -104,7 +104,7 @@ def window_complete_ready(state, window_id, progress=None):
     pending = state._connection.execute(
         """SELECT 1 FROM notification_outbox n JOIN publications p ON p.id=n.publication_id
         JOIN json_each(p.details_json,'$.entries') e
-        WHERE n.event='document_ready' AND n.status IN ('queued','pending','retry_wait','running')
+        WHERE n.event='document_ready' AND n.status IN ('queued','pending','retry_wait','running','digest_pending')
         AND json_extract(e.value,'$.summary_sha256') IN (
           SELECT a.content_sha256 FROM window_download_members m
           JOIN stage_attempts s ON s.document_id=m.document_id AND s.stage='summary' AND s.state='succeeded'
@@ -128,8 +128,9 @@ def _warning_deliveries(state, scope, incident):
         return set()
     first_notice = json.loads(incident["details_json"]).get("first_notice_id")
     rows = state._connection.execute(
-        """SELECT DISTINCT status FROM notification_outbox
-        WHERE event IN ('incident_open','incident_reminder') AND status IN ('sent','running')
+        """SELECT DISTINCT CASE status WHEN 'digest_pending' THEN 'running' ELSE status END
+        FROM notification_outbox WHERE event IN ('incident_open','incident_reminder')
+        AND status IN ('sent','running','digest_pending')
         AND json_extract(payload_json,'$.scope_key')=?
         AND CASE WHEN ? IS NULL THEN created_at_epoch>=? ELSE id>=? END""",
         (scope, first_notice, incident["first_seen_epoch"], first_notice),
@@ -141,6 +142,8 @@ def refresh_notifications(state, config, *, now=None):
     now = int(time.time() if now is None else now)
     queue = TaskQueue(state)
     enabled = config.lark.notifications_enabled and bool(config.lark.target_chat_id)
+    digest_enabled = bool(config.lark.notification_digest_times)
+    reminder_seconds = 86400 if digest_enabled else 14400
     # Retire old queued per-window failure messages on upgrade. Sent messages
     # and in-flight delivery receipts stay intact.
     if not queue.metadata("incident_outbox_migrated"):
@@ -195,9 +198,11 @@ def refresh_notifications(state, config, *, now=None):
             code = primary["error_code"]
             notified = 0 if fresh else prior["last_notified_epoch"]
             details = {} if fresh else json.loads(prior["details_json"])
+            escalated = digest_enabled and manual is not None and details.get("requires_action") is False
             affected = unfinished.intersection(details.get("task_ids", ()))
             affected.update(r["id"] for r in rows)
             details.update(
+                requires_action=manual is not None,
                 codes=sorted({r["error_code"] for r in rows}),
                 task_ids=sorted(affected),
             )
@@ -219,10 +224,17 @@ def refresh_notifications(state, config, *, now=None):
                     encoded(details),
                 ),
             )
-            if enabled and reportable and (not notified or now - notified >= 14400):
+            if enabled and reportable and (not notified or escalated or now - notified >= reminder_seconds):
                 event = (
-                    "incident_open" if fresh or not notified else "incident_reminder"
+                    "incident_open" if fresh or not notified or escalated else "incident_reminder"
                 )
+                if digest_enabled and event == "incident_reminder" and state._connection.execute(
+                    """SELECT 1 FROM notification_outbox WHERE event='incident_open'
+                    AND json_extract(payload_json,'$.scope_key')=?
+                    AND status IN ('queued','pending','retry_wait','running','digest_pending') LIMIT 1""",
+                    (scope,),
+                ).fetchone():
+                    continue
                 action = "需要核对后恢复" if manual else "已保留进度，按退避时间重试"
                 source, kind = scope.rsplit(":", 1)
                 if kind == "scan" and code in TRANSIENT_SCAN_CODES and not manual:
@@ -234,7 +246,10 @@ def refresh_notifications(state, config, *, now=None):
                 notice = enqueue_pipeline_status_notification(
                     state,
                     event=event,
-                    identity=f"{scope}:{generation}:{now // 14400}",
+                    requires_action=bool(manual),
+                    reason_code=code,
+                    identity=(f"{scope}:{generation}:action:{now}" if escalated
+                              else f"{scope}:{generation}:{now // reminder_seconds}"),
                     chat_id=config.lark.target_chat_id,
                     scope_key=scope,
                     markdown=f"## ⚠️ 知识星球研报｜处理受阻\n\n{_source_label(source)} · {kind}，共 {len(affected)} 项。{action}。\n\n诊断码 `{code}`",

@@ -85,6 +85,7 @@ class LarkConfig:
     notifications_enabled: bool
     target_chat_id: str
     parent_position: str
+    notification_digest_times: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,27 +256,29 @@ def _boolean(table: Mapping[str, Any], field: str, *, table_name: str, default: 
     return value
 
 
-def _schedule_times(table: Mapping[str, Any], *, table_name: str) -> tuple[str, ...]:
+def _schedule_times(
+    table: Mapping[str, Any], *, table_name: str, field: str = "schedule_times"
+) -> tuple[str, ...]:
     """Parse unique 24-hour ``HH:MM`` source slots without locale fallback."""
 
-    raw = table.get("schedule_times", [])
+    raw = table.get(field, [])
     if raw is None:
         return ()
     if not isinstance(raw, list):
-        raise ConfigError(f"{table_name}.schedule_times must be an array of HH:MM values")
+        raise ConfigError(f"{table_name}.{field} must be an array of HH:MM values")
     slots: list[str] = []
     for value in raw:
         text = str(value).strip()
         try:
             parsed = datetime.strptime(text, "%H:%M")
         except ValueError as exc:
-            raise ConfigError(f"{table_name}.schedule_times contains invalid time {text!r}; use HH:MM") from exc
+            raise ConfigError(f"{table_name}.{field} contains invalid time {text!r}; use HH:MM") from exc
         canonical = parsed.strftime("%H:%M")
         if canonical != text:
-            raise ConfigError(f"{table_name}.schedule_times contains invalid time {text!r}; use zero-padded HH:MM")
+            raise ConfigError(f"{table_name}.{field} contains invalid time {text!r}; use zero-padded HH:MM")
         slots.append(canonical)
     if len(set(slots)) != len(slots):
-        raise ConfigError(f"{table_name}.schedule_times must not contain duplicate slots")
+        raise ConfigError(f"{table_name}.{field} must not contain duplicate slots")
     return tuple(sorted(slots))
 
 
@@ -472,6 +475,7 @@ def _parse_lark(raw: Any) -> LarkConfig:
             "docs_identity",
             "notification_identity",
             "notifications_enabled",
+            "notification_digest_times",
             "target_chat_id",
             "parent_position",
         },
@@ -489,6 +493,7 @@ def _parse_lark(raw: Any) -> LarkConfig:
         docs_identity=docs_identity,
         notification_identity=notification_identity,
         notifications_enabled=_boolean(table, "notifications_enabled", table_name="lark", default=True),
+        notification_digest_times=_schedule_times(table, table_name="lark", field="notification_digest_times"),
         target_chat_id=str(table.get("target_chat_id", "")).strip(),
         parent_position=str(table.get("parent_position", "my_library")).strip() or "my_library",
     )
