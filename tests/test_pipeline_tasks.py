@@ -1195,3 +1195,98 @@ def test_separate_prepare_publish_workers_and_completion_notification_order(
                 task["id"], owned["owner_token"], service.execute_task(config, owned)
             )
         assert window_complete_ready(state, window)
+
+
+def test_digest_mode_escalates_action_and_defers_repeated_incidents(tmp_path):
+    config = config_fixture(tmp_path)
+    config = replace(config, lark=replace(
+        config.lark, notifications_enabled=True, target_chat_id="test",
+        notification_digest_times=("09:00", "18:00"),
+    ))
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        now = int(time.time())
+        queue = TaskQueue(state, clock=lambda: now)
+        task_id = queue.enqueue("test-prepare", "prepare", {}, source="foreign")
+        owned = queue.claim(task_id)
+        queue.finish(task_id, owned["owner_token"], TaskResult("retry_wait", "model_busy", "", 1))
+        refresh_notifications(state, config, now=now)
+        (first,) = state.list_notifications()
+        assert first.payload["requires_action"] is False
+        now += 60
+        owned = queue.claim(task_id)
+        queue.finish(task_id, owned["owner_token"], TaskResult("needs_action", "need_reauth", ""))
+        refresh_notifications(state, config, now=now)
+        notices = state.list_notifications()
+        assert [(n.event, n.status) for n in notices] == [
+            ("incident_open", "queued"), ("incident_open", "queued"),
+        ]
+        assert notices[-1].payload["requires_action"] is True
+        refresh_notifications(state, config, now=now + 4*3600)
+        assert len(state.list_notifications()) == 2
+        for _ in notices:
+            state.complete_notification(state.claim_due_notification())
+        refresh_notifications(state, config, now=now + 24*3600)
+        assert [n.event for n in state.list_notifications()][-1] == "incident_reminder"
+
+
+def test_new_fault_reason_in_an_open_scope_alerts_once_and_receives_a_distinct_receipt(tmp_path):
+    config = config_fixture(tmp_path)
+    config = replace(config, lark=replace(
+        config.lark, notifications_enabled=True, target_chat_id="test", notification_digest_times=("18:00",),
+    ))
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        now = int(time.time())
+        queue = TaskQueue(state, clock=lambda: now)
+        existing = queue.enqueue("old", "prepare", {}, source="foreign")
+        claimed = queue.claim(existing)
+        queue.finish(existing, claimed["owner_token"], TaskResult("quarantined", "no_usable_text", ""))
+        refresh_notifications(state, config, now=now)
+        first = state.claim_due_notification()
+        state.complete_notification(first)
+        second = queue.enqueue("new", "prepare", {}, source="foreign")
+        claimed = queue.claim(second)
+        queue.finish(second, claimed["owner_token"], TaskResult("retry_wait", "service_unavailable", "", 1))
+        refresh_notifications(state, config, now=now)
+        change = state.claim_due_notification()
+        assert change.event == "incident_open" and change.payload["requires_action"] is False
+        assert change.payload["reason_code"] == "service_unavailable"
+        assert "no_usable_text" in change.payload["markdown"] and change.idempotency_key != first.idempotency_key
+        state.complete_notification(change)
+        refresh_notifications(state, config, now=now+1)
+        assert len(state.list_notifications()) == 2
+        now += 2
+        claimed = queue.claim(second)
+        queue.finish(second, claimed["owner_token"], TaskResult("needs_action", "service_unavailable", ""))
+        refresh_notifications(state, config, now=now)
+        escalated = state.claim_due_notification()
+        assert escalated.event == "incident_open" and escalated.payload["requires_action"] is True
+        assert escalated.idempotency_key not in {change.idempotency_key, first.idempotency_key}
+
+
+def test_confirmed_incident_that_recovers_before_delivery_sends_one_immediate_brief(tmp_path):
+    from zsxq_pipeline.notify import NotificationDrainer
+    config = config_fixture(tmp_path)
+    config = replace(config, lark=replace(
+        config.lark, notifications_enabled=True, target_chat_id="test", notification_digest_times=("18:00",),
+    ))
+    with PipelineState.open(config.runtime.database) as state:
+        state.migrate()
+        now = int(time.time())
+        q = TaskQueue(state, clock=lambda: now)
+        tid = q.enqueue("temporary", "prepare", {}, source="foreign")
+        task = q.claim(tid)
+        q.finish(tid, task["owner_token"], TaskResult("retry_wait", "provider_down", "", 1))
+        refresh_notifications(state, config, now=now)
+        now += 2
+        task = q.claim(tid)
+        q.finish(tid, task["owner_token"], TaskResult())
+        refresh_notifications(state, config, now=now)
+        sink = mock.Mock()
+        drainer = NotificationDrainer(state, sink, digest_times=("18:00",))
+        assert [d.event for d in drainer.drain()] == ["incident_brief"]
+        body = sink.notify_once.call_args.args[1]
+        assert "provider_down" in body and "故障已解除" in body
+        refresh_notifications(state, config, now=now+1)
+        assert not drainer.drain()

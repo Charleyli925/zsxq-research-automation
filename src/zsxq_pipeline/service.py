@@ -23,6 +23,7 @@ from .download import (
 )
 from .lock import held_lock
 from .model import Stage
+from .notification_digest import notification_drain_due
 from .process import DigestProcessor, ProcessConfig, ProcessRequest
 from .projections import run_projection
 from .state import PipelineState
@@ -111,12 +112,8 @@ def _periodic_tasks(state, config, now):
     queue = TaskQueue(state)
     stamp = int(now.timestamp())
     db = state._connection
-    if (
-        config.lark.notifications_enabled
-        and db.execute(
-            "SELECT 1 FROM notification_outbox WHERE status IN ('queued','retry_wait') AND COALESCE(available_at_epoch,0)<=? LIMIT 1",
-            (stamp,),
-        ).fetchone()
+    if config.lark.notifications_enabled and notification_drain_due(
+        state, config.lark.notification_digest_times, config.schedule.timezone, now
     ):
         queue.enqueue(f"outbox:{stamp // 60}", "outbox", {})
     if config.pipeline.research_library_database:
@@ -243,12 +240,12 @@ def supervise(
                             and document_free is not None,
                         )
                 _enqueue_due_documents(state, config)
-                _periodic_tasks(state, config, datetime.now(timezone.utc))
                 from .incidents import refresh_notifications
 
                 if monotonic() - notified_at >= 10:
                     refresh_notifications(state, config)
                     notified_at = monotonic()
+                _periodic_tasks(state, config, datetime.now(timezone.utc))
                 due = queue.due(kinds)
                 for candidate in due:
                     if monotonic() >= deadline:

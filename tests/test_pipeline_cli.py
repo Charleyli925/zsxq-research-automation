@@ -273,3 +273,19 @@ def test_download_source_cft_startup_options_are_typed(tmp_path):
     assert source.cft_headless is False
     assert source.cft_background is True
     assert source.cft_window_size == "1280,800"
+
+
+def test_lark_digest_times_reach_direct_process_and_reject_invalid_slots(tmp_path):
+    config_file = tmp_path / "pipeline.toml"
+    _write_config(config_file, tmp_path / "runtime", tmp_path / "legacy")
+    original = config_file.read_text()
+    assert load_pipeline_config(config_file).lark.notification_digest_times == ()
+    config_file.write_text(original + '\n[lark]\nnotification_digest_times=["18:00","09:00"]\n')
+    config = load_pipeline_config(config_file)
+    assert config.lark.notification_digest_times == ("09:00", "18:00")
+    direct = ProcessConfig.from_pipeline_config(config)
+    assert direct.notification_digest_times == config.lark.notification_digest_times
+    assert direct.notification_timezone == config.schedule.timezone
+    config_file.write_text(original + '\n[lark]\nnotification_digest_times=["24:00"]\n')
+    with pytest.raises(ConfigError, match="lark.notification_digest_times"):
+        load_pipeline_config(config_file)

@@ -94,6 +94,9 @@ timeout_seconds = 90
 docs_identity = "user"
 notification_identity = "bot"
 notifications_enabled = true
+# Group routine updates at the first scheduler wake after these local times.
+# Omit this setting or use [] for immediate delivery.
+notification_digest_times = ["09:00", "18:00"]
 target_chat_id = ""
 parent_position = "my_library"
 

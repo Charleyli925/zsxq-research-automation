@@ -222,6 +222,8 @@ class ProcessConfig:
     max_files_per_document: int = 20
     preflight_path: Path | None = None
     codex_routing_config_path: Path | None = None
+    notification_digest_times: tuple[str, ...] = ()
+    notification_timezone: str = "Asia/Shanghai"
 
     def __post_init__(self) -> None:
         root = _absolute(self.runtime_root)
@@ -326,6 +328,8 @@ class ProcessConfig:
             lark_parent_position=config.lark.parent_position,
             target_chat_id=config.lark.target_chat_id,
             notifications_enabled=config.lark.notifications_enabled,
+            notification_digest_times=config.lark.notification_digest_times,
+            notification_timezone=config.schedule.timezone,
             summary_max_workers=config.pipeline.summary_max_workers,
             doc_group_size=config.pipeline.doc_group_size,
             doc_group_threshold=config.pipeline.doc_group_threshold,
@@ -603,13 +607,14 @@ class DigestProcessor:
                         enqueue_terminal_notification(
                             state,
                             event="run_partial",
+                            preserve_errors=bool(self.config.notification_digest_times),
                             chat_id=self.config.target_chat_id,
                             markdown="本轮知识星球研报总结已部分完成；请查看已发布文档和本地运行结果。",
                             scope_key=run_id,
                         )
             if not request.local_only:
                 if self.config.notifications_enabled and not request.no_notify and not request.defer_notification_drain:
-                    notifications = NotificationDrainer(state, self.notifier, clock=self.clock).drain()
+                    notifications = self._drain_notifications(state)
                 export_notification_audit(state, self.config.notification_audit_path)
         _write_json(self.config.usage_path, {"run_id": run_id, "usage": [dict(value) for value in self._usage]})
         status = "success" if not failures else ("partial" if (summaries or quarantined) else "failed")
@@ -639,13 +644,20 @@ class DigestProcessor:
         with PipelineState.open(self.config.database) as state:
             state.migrate()
             deliveries = (
-                NotificationDrainer(state, self.notifier, clock=self.clock).drain()
+                self._drain_notifications(state)
                 if self.config.notifications_enabled and not request.no_notify
                 else ()
             )
             export_notification_audit(state, self.config.notification_audit_path)
         _write_json(self.config.usage_path, {"run_id": run_id, "usage": []})
         return deliveries
+
+    def _drain_notifications(self, state: PipelineState) -> tuple[NotificationDelivery, ...]:
+        return NotificationDrainer(
+            state, self.notifier, clock=self.clock,
+            digest_times=self.config.notification_digest_times,
+            digest_timezone=self.config.notification_timezone,
+        ).drain()
 
     def _materialize_batch(self, request: ProcessRequest) -> Path:
         if request.batch_file is None:
